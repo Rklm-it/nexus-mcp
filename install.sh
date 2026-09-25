@@ -132,7 +132,15 @@ fi
 rm -rf "$BASE/vgx3d"
 
 log "venv и зависимости"
-[ -d "$BASE/venv" ] || python3 -m venv "$BASE/venv"
+# Проверяем pip, а не каталог: оборванный запуск или venv без ensurepip
+# (нет python3.X-venv) оставляет каталог без pip — такой пересоздаём.
+if [ ! -x "$BASE/venv/bin/pip" ]; then
+    PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    apt-get install -y -qq "python${PYV}-venv" >/dev/null 2>&1 || true
+    rm -rf "$BASE/venv"
+    python3 -m venv "$BASE/venv" \
+        || die "python3 -m venv не прошёл — поставьте пакет: apt-get install python${PYV}-venv"
+fi
 "$BASE/venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
 timeout 600 "$BASE/venv/bin/pip" install -q -r "$APP/requirements.txt" \
     || die "pip install не прошёл: доступ к pypi.org с этой машины?"
