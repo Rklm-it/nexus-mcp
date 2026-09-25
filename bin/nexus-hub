@@ -65,7 +65,7 @@ header() {
     chat="$(curl -fsS --connect-timeout 2 -m 4 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
     if [ -z "$chat" ]; then claude="$BAD чат не отвечает"
     elif echo "$chat" | grep -q '"logged_in":true'; then claude="$OK вошёл в подписку"
-    else claude="$WARN не вошёл — пункт 7"; fi
+    else claude="$WARN не вошёл — пункт 8"; fi
     sim="$(hubpy sim | tail -1)"
     case "$sim" in "ключ не задан") sim="$D${sim}$N" ;; баланс*) sim="$OK $sim" ;; *) sim="$WARN $sim" ;; esac
     [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ] && acts="${G}включены${N}" || acts="${D}выключены${N}"
@@ -86,25 +86,26 @@ menu() {
  ${B}Панели${N}
    1  Список панелей                 ${s}+ маршруты реле${N}
    2  Добавить панель                ${s}с проверкой, что отвечает${N}
-   3  Удалить панель
+   3  Переименовать панель           ${s}ноды на реле связь не теряют${N}
+   4  Удалить панель
  ${B}Ноды${N}
-   4  Ноды всех панелей              ${s}статус и heartbeat${N}
-   5  Положить ключ хаба на ноду     ${s}напрямую или через живую ноду${N}
-   6  Проверить SSH до ноды
+   5  Ноды всех панелей              ${s}статус и heartbeat${N}
+   6  Положить ключ хаба на ноду     ${s}напрямую или через живую ноду${N}
+   7  Проверить SSH до ноды
  ${B}Claude и приложение${N}
-   7  Вход Claude в подписку
-   8  Строка подключения приложения
-   9  Плановый аудит                 ${s}время сводки уведомлением${N}
+   8  Вход Claude в подписку
+   9  Строка подключения приложения
+  10  Плановый аудит                 ${s}время сводки уведомлением${N}
  ${B}SIM-проверки (bschekbot)${N}
-  10  Ключ bschekbot                 ${s}ввод скрыт${N}
-  11  Дневной потолок трат
+  11  Ключ bschekbot                 ${s}ввод скрыт${N}
+  12  Дневной потолок трат
  ${B}Обслуживание${N}
-  12  Действия из чата: вкл / выкл
-  13  Сменить секреты                ${s}коннектор, пробник, чат${N}
-  14  Ссылка коннектора claude.ai
-  15  Журналы                        ${s}хаб / чат / Caddy / установка${N}
-  16  Перезапустить хаб и чат
-  17  Обновить хаб
+  13  Действия из чата: вкл / выкл
+  14  Сменить секреты                ${s}коннектор, пробник, чат${N}
+  15  Ссылка коннектора claude.ai
+  16  Журналы                        ${s}хаб / чат / Caddy / установка${N}
+  17  Перезапустить хаб и чат
+  18  Обновить хаб
    0  Выход
 EOF
 }
@@ -131,6 +132,16 @@ a_panel_add() {
     case "$chk" in ✓*) ;; *) yes_no "Панель не прошла проверку. Всё равно добавить?" || return ;; esac
     if [ -n "$gate" ]; then nexus-mcp-panels add "$name" "$url" "$token" --gate "$gate"
     else nexus-mcp-panels add "$name" "$url" "$token"; fi
+}
+
+a_panel_rename() {
+    title "Переименовать панель"
+    nexus-mcp-panels list 2>&1 | sed 's/^/  /'
+    echo "${D}Прежнее имя останется адресом реле — ноды на /relay/<старое> связь не теряют.${N}"
+    local old new
+    old="$(ask "Текущее имя:")"; [ -n "$old" ] || return
+    new="$(ask "Новое имя (латиница, цифры, - и _):")"; [ -n "$new" ] || return
+    nexus-mcp-panels rename "$old" "$new" && restart_hub
 }
 
 a_panel_remove() {
@@ -162,7 +173,7 @@ a_key_to_node() {
         ssh-copy-id -i "$KEY.pub" -p "$port" -o ProxyJump="$jump" -o ConnectTimeout=15 "$user@$ip" <&3
     else
         ssh-copy-id -i "$KEY.pub" -p "$port" -o ConnectTimeout=15 "$user@$ip" <&3
-    fi && ok "ключ положен — проверка: пункт 6"
+    fi && ok "ключ положен — проверка: пункт 7"
 }
 
 a_ssh_check() {
@@ -172,7 +183,7 @@ a_ssh_check() {
     ssh -i "$KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "root@$ip" 'echo "  хост: $(hostname) · агент: $(cat /opt/vpn-cell/agent/VERSION 2>/dev/null || echo нет)"' \
         && ok "хаб заходит на $ip своим ключом" \
-        || bad "не заходит: Permission denied — ключа нет (пункт 5); timeout — путь до ноды режется"
+        || bad "не заходит: Permission denied — ключа нет (пункт 6); timeout — путь до ноды режется"
 }
 
 a_login() { title "Вход Claude в подписку"; nexus-chat-login <&3; }
@@ -230,8 +241,8 @@ a_actions() {
 a_rotate() {
     title "Сменить секреты"
     echo "Новые: секрет коннектора claude.ai, токен домашнего пробника, токен чата."
-    echo "${Y}После смены:${N} коннектор в claude.ai — новая ссылка (пункт 14), приложение —"
-    echo "новая строка (пункт 8), пробник — новый --token. Ключ к нодам не меняется."
+    echo "${Y}После смены:${N} коннектор в claude.ai — новая ссылка (пункт 15), приложение —"
+    echo "новая строка (пункт 9), пробник — новый --token. Ключ к нодам не меняется."
     yes_no "Сменить?" || return
     envset NEXUS_MCP_SECRET "$(gen 40)"; envset NEXUS_PROBE_TOKENS "$(gen 32)"; envset NEXUS_CHAT_TOKEN "$(gen 48)"
     restart_hub
@@ -275,11 +286,11 @@ while true; do
     menu
     c="$(ask "Пункт:")"
     case "$c" in
-        1) a_panels ;; 2) a_panel_add ;; 3) a_panel_remove ;;
-        4) a_nodes ;; 5) a_key_to_node ;; 6) a_ssh_check ;;
-        7) a_login ;; 8) a_app_line ;; 9) a_audit ;;
-        10) a_bsbord_key ;; 11) a_bsbord_cap ;;
-        12) a_actions ;; 13) a_rotate ;; 14) a_connector ;; 15) a_logs ;; 16) restart_hub ;; 17) a_update ;;
+        1) a_panels ;; 2) a_panel_add ;; 3) a_panel_rename ;; 4) a_panel_remove ;;
+        5) a_nodes ;; 6) a_key_to_node ;; 7) a_ssh_check ;;
+        8) a_login ;; 9) a_app_line ;; 10) a_audit ;;
+        11) a_bsbord_key ;; 12) a_bsbord_cap ;;
+        13) a_actions ;; 14) a_rotate ;; 15) a_connector ;; 16) a_logs ;; 17) restart_hub ;; 18) a_update ;;
         0|q|й|"") echo; exit 0 ;;
         *) bad "нет такого пункта" ;;
     esac

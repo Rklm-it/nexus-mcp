@@ -39,7 +39,7 @@ def test_snippet_has_only_agent_paths_and_right_rewrites():
     assert "header_up Host panel.example.ru" in text
     assert "nexus_gate" not in text and "g123" not in text   # секретов панелей в маршрутах нет
     assert "header_up -Cookie" in text
-    assert "пропущена панель «Bad Name»" in text and "@relay_Bad" not in text
+    assert "пропущено имя «Bad Name»" in text and "@relay_Bad" not in text
     assert "/admin" not in text
 
 
@@ -152,3 +152,51 @@ def test_update_via_relay_swaps_brain_url(tmp_path):
                            capture_output=True, text=True, timeout=30,
                            env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"})
     assert "brain=https://panel.example.ru" in plain.stdout
+
+
+def test_rename_install_panel_keeps_relay_for_old_name(hub_settings, tmp_path):
+    """Панель из установки (окружение, «main») → JonyX-VPS: в списке новое имя,
+    а /relay/main остаётся — нода на реле (eng41s2) связь не теряет."""
+    from nexus_mcp import panels
+
+    hub_settings.panels_file = tmp_path / "panels.json"
+    hub_settings.brain_url = "https://cagesub.jonyx.online"
+    hub_settings.brain_admin_token = "tok"
+    hub_settings.brain_gate = "g"
+    assert [p["name"] for p in panels.all_panels()] == ["main"]
+
+    v = panels.rename("main", "JonyX-VPS")
+    assert v["aliases"] == ["main"]
+    names = [p["name"] for p in panels.all_panels()]
+    assert names == ["JonyX-VPS"]                       # «main» из окружения больше не подставляется
+    assert panels.resolve("JonyX-VPS")["token"] == "tok"
+
+    text = relay.caddy_snippet()
+    assert "@relay_JonyX-VPS" in text and "@relay_main" in text
+    assert text.count("reverse_proxy https://cagesub.jonyx.online") == 2
+    assert "g" not in [ln.strip() for ln in text.splitlines()]   # gate не утёк в маршрут
+
+    # Регистр в пути реле не различается — такие имена конфликтуют.
+    with pytest.raises(panels.PanelConfigError, match="занято"):
+        panels.add("jonyx-vps", "https://other.example", "t2")
+    with pytest.raises(panels.PanelConfigError, match="занято"):
+        panels.add("MAIN", "https://other.example", "t2")
+    # Ещё раз переименовать — прежние имена копятся, ни одно не теряется.
+    panels.rename("JonyX-VPS", "JonyX")
+    assert panels.resolve("JonyX").get("aliases") == ["main", "JonyX-VPS"]
+
+
+def test_caddy_accepts_mixed_case_names(tmp_path):
+    caddy = shutil.which("caddy") or os.environ.get("CADDY_BIN")
+    if not caddy:
+        if os.environ.get("CI"):
+            pytest.fail("в CI нужен Caddy")
+        pytest.skip("нет caddy локально")
+    (tmp_path / "relay.caddy").write_text(relay.caddy_snippet(
+        [{"name": "JonyX-VPS", "url": "https://panel.example.ru", "aliases": ["main"]}]))
+    (tmp_path / "Caddyfile").write_text(
+        "{\n  admin off\n  auto_https off\n}\n:18999 {\n"
+        f"  import {tmp_path}/relay.caddy\n  handle {{\n    respond 404\n  }}\n}}\n")
+    r = subprocess.run([caddy, "validate", "--config", str(tmp_path / "Caddyfile"), "--adapter", "caddyfile"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-500:]

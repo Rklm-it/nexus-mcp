@@ -27,7 +27,10 @@ from pathlib import Path
 
 from nexus_mcp import config
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+# Заглавные можно (JonyX-VPS): имя уходит в путь реле /relay/<имя>, а путь
+# в Caddy сопоставляется без учёта регистра — поэтому имена, различающиеся
+# только регистром, запрещены (add/rename это проверяют).
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 
 class PanelConfigError(Exception):
@@ -53,7 +56,12 @@ def all_panels() -> list[dict]:
     """Все панели: из файла + старая одиночная из окружения (как `main`)."""
     panels = _read_file()
     s = config.settings
-    if s.brain_url and s.brain_admin_token and not any(p["name"] == "main" for p in panels):
+    # Панель из установки (окружение) — «main», пока её не переименовали:
+    # rename переносит её в файл под новым именем с тем же адресом, и тогда
+    # запись из окружения больше не подставляется.
+    env_url = (s.brain_url or "").rstrip("/")
+    if s.brain_url and s.brain_admin_token and not any(
+            p["name"] == "main" or p["url"].rstrip("/") == env_url for p in panels):
         panels.insert(0, {"name": "main", "url": s.brain_url, "token": s.brain_admin_token,
                           "gate": s.brain_gate, "basic_auth": s.brain_basic_auth})
     for p in panels:
@@ -82,7 +90,7 @@ def resolve(name: str = "") -> dict:
 def public_view(p: dict) -> dict:
     """Для вывода: без токена и пароля."""
     return {"name": p["name"], "url": p["url"], "gate": bool(p.get("gate")),
-            "basic_auth": bool(p.get("basic_auth"))}
+            "basic_auth": bool(p.get("basic_auth")), "aliases": list(p.get("aliases") or [])}
 
 
 # ── Команда управления ─────────────────────────────────────────────────────
@@ -104,6 +112,9 @@ def add(name: str, url: str, token: str, basic_auth: str = "", gate: str = "") -
         raise PanelConfigError(f"«{url}» — не адрес панели (https://домен[/vip])")
     if not token:
         raise PanelConfigError("нужен токен панели (VPN_ADMIN_TOKEN из её .env)")
+    busy = _taken(name, all_panels(), but=name)
+    if busy:
+        raise PanelConfigError(f"имя «{name}» уже занято: {busy} (регистр букв не различается)")
     panels = [p for p in _read_file() if p["name"] != name]
     entry = {"name": name, "url": url.rstrip("/"), "token": token}
     if gate:
@@ -112,6 +123,39 @@ def add(name: str, url: str, token: str, basic_auth: str = "", gate: str = "") -
         entry["basic_auth"] = basic_auth
     panels.append(entry)
     _write(panels)
+    return public_view(entry)
+
+
+def _taken(name: str, panels: list[dict], but: str = "") -> str | None:
+    for p in panels:
+        if p["name"].lower() == name.lower() and p["name"] != but:
+            return p["name"]
+        if any(a.lower() == name.lower() for a in p.get("aliases", [])) and p["name"] != but:
+            return f"{p['name']} (прежнее имя)"
+    return None
+
+
+def rename(old: str, new: str) -> dict:
+    """Переименовать панель. Старое имя остаётся псевдонимом реле: ноды,
+    которые ходят к панели через /relay/<старое>, не теряют связь."""
+    if not NAME_RE.match(new):
+        raise PanelConfigError("новое имя: латиница, цифры, - и _, до 32 символов, с буквы или цифры")
+    everything = all_panels()
+    src = next((p for p in everything if p["name"] == old), None)
+    if src is None:
+        raise PanelConfigError(f"панели «{old}» нет. Есть: {', '.join(p['name'] for p in everything)}")
+    busy = _taken(new, everything, but=old)
+    if busy:
+        raise PanelConfigError(f"имя «{new}» уже занято: {busy} (регистр букв не различается)")
+    file_panels = [p for p in _read_file() if p["name"] != old]
+    entry = {k: v for k, v in src.items() if k in ("url", "token", "gate", "basic_auth", "aliases") and v}
+    entry["name"] = new
+    aliases = [a for a in entry.get("aliases", []) if a.lower() != new.lower()]
+    if old.lower() != new.lower() and old not in aliases:
+        aliases.append(old)
+    entry["aliases"] = aliases
+    file_panels.append(entry)
+    _write(file_panels)
     return public_view(entry)
 
 
@@ -145,22 +189,35 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--basic", default="", help="user:pass, если /api панели за basic_auth, а gate не задан")
     r = sub.add_parser("remove")
     r.add_argument("name")
+    rn = sub.add_parser("rename", help="переименовать; старое имя остаётся адресом реле")
+    rn.add_argument("old")
+    rn.add_argument("new")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "list":
             for p in all_panels():
                 v = public_view(p)
                 how = "gate" if v["gate"] else ("basic_auth" if v["basic_auth"] else "")
-                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}")
+                al = f"  прежние имена: {', '.join(v['aliases'])}" if v["aliases"] else ""
+                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}{al}")
         elif args.cmd == "add":
             v = add(args.name, args.url, args.token, args.basic, args.gate)
             print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
             _refresh_relay()
+        elif args.cmd == "rename":
+            v = rename(args.old, args.new)
+            print(f"переименована: {args.old} → {v['name']} (ноды на реле /relay/{args.old} связь не теряют)")
+            _refresh_relay()
         elif args.cmd == "remove":
+            gone = next((p for p in _read_file() if p["name"] == args.name), None)
             if not remove(args.name):
                 print(f"панели «{args.name}» в файле нет", file=sys.stderr)
                 return 1
             print(f"удалена {args.name}")
+            env_url = (config.settings.brain_url or "").rstrip("/")
+            if gone and env_url and gone["url"].rstrip("/") == env_url:
+                print("⚠ это панель из установки: без записи в файле она вернётся под именем main — "
+                      "чтобы убрать совсем, сотрите NEXUS_BRAIN_URL в /etc/nexus-mcp.env", file=sys.stderr)
             _refresh_relay()
     except PanelConfigError as e:
         print(f"ошибка: {e}", file=sys.stderr)

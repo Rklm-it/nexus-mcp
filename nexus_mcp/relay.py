@@ -42,7 +42,7 @@ from nexus_mcp import config, panels
 RELAY_PATHS = ("/api/v1/agent/*", "/api/v1/traffic/report", "/install/*", "/health")
 SNIPPET = Path(os.environ.get("NEXUS_RELAY_CADDY", "/etc/caddy-nexus-mcp/relay.caddy"))
 CADDYFILE = Path("/etc/caddy-nexus-mcp/Caddyfile")
-_NAME = re.compile(r"^[a-z0-9_-]{1,32}$")
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 
 class RelayError(Exception):
@@ -114,10 +114,13 @@ def caddy_snippet(items: list[dict] | None = None) -> str:
     """Маршруты реле для всех панелей хаба — кусок сайта в Caddyfile."""
     blocks = ["# Сгенерировано nexus_mcp.relay — не править руками: nexus-mcp-panels пересоберёт."]
     for p in items if items is not None else panels.all_panels():
-        if not _NAME.match(p.get("name", "")):
-            blocks.append(f"# пропущена панель «{p.get('name')}»: имя не годится для пути")
-            continue
-        blocks.append(_block(p))
+        # Прежние имена (после rename) — те же маршруты: ноды на /relay/<старое>
+        # не теряют связь с панелью.
+        for name in [p.get("name", "")] + list(p.get("aliases") or []):
+            if not _NAME.match(name):
+                blocks.append(f"# пропущено имя «{name}»: не годится для пути")
+                continue
+            blocks.append(_block({**p, "name": name}))
     return "\n\n".join(blocks) + "\n"
 
 

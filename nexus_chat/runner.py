@@ -88,7 +88,7 @@ def describe_action(tool: str, inp: dict) -> str:
         tail = f" · {dpi}" if tool != "sim_geo" and dpi else ""
         return f"{where}: {what} · {scope}{tail} · {price}"
     if tool == "panel_action":
-        panel = inp.get("panel") or "main"
+        panel = inp.get("panel") or "единственная"
         params = inp.get("params")
         tail = f" {json.dumps(params, ensure_ascii=False)}" if params else ""
         return f"Панель {panel}: POST {inp.get('path', '?')}{tail}"

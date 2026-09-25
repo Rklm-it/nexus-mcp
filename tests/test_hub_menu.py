@@ -44,8 +44,8 @@ ENV = ("NEXUS_MCP_SECRET=secretsecretsecretsecretsecret1234\nNEXUS_CHAT_TOKEN=ch
 
 def test_menu_changes_settings(tmp_path):
     (tmp_path / "env").write_text(ENV)
-    # 12: включить действия; 9: аудит; 11: потолок; 9: плохое время — отказ; 0: выход
-    r, env = _run(tmp_path, "12\nд\n\n9\n09:00,21:00\n\n11\n150\n\n9\n25:99\n\n0\n")
+    # 13: включить действия; 10: аудит; 12: потолок; 10: плохое время — отказ; 0: выход
+    r, env = _run(tmp_path, "13\nд\n\n10\n09:00,21:00\n\n12\n150\n\n10\n25:99\n\n0\n")
     assert r.returncode == 0, r.stderr
     assert "NEXUS_ALLOW_ACTIONS=1" in env
     assert "NEXUS_CHAT_AUDIT_AT=09:00,21:00" in env
@@ -55,9 +55,9 @@ def test_menu_changes_settings(tmp_path):
 
 def test_secrets_are_shown_only_on_yes_and_rotated(tmp_path):
     (tmp_path / "env").write_text(ENV)
-    r, _ = _run(tmp_path, "8\nн\n\n0\n")
+    r, _ = _run(tmp_path, "9\nн\n\n0\n")
     assert "chat_old_token" not in r.stdout + r.stderr          # «нет» — секрет не на экране
-    r, env = _run(tmp_path, "13\nд\n\n0\n")
+    r, env = _run(tmp_path, "14\nд\n\n0\n")
     assert "chat_old_token" not in env and "probe_old" not in env and "secretsecretsecret" not in env
     assert "NEXUS_CHAT_TOKEN=" in env and "NEXUS_MCP_SECRET=" in env
 
