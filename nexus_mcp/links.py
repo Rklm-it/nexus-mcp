@@ -1,40 +1,26 @@
 """Ссылки подписки → клиентские xray-конфиги для сквозной проверки.
 
-Конфиг собирается ТЕМ ЖЕ кодом, что отдаёт JSON-подписку клиентам,
-`brain/app/services/xray_json.py`. Второй сборщик разошёлся бы с первым
-молча (инвариант 25): проверка зеленела бы на конфиге, которого у клиента
-нет. Модуль грузится по пути к файлу, а не через `import app...`: пакет
-`app` при импорте запечатывает сборку (инвариант 1) и тянет всё brain.
+Конфиг собирается ТЕМ ЖЕ кодом, что отдаёт JSON-подписку клиентам:
+`nexus_mcp/xray_json.py` — побайтовая копия `brain/app/services/xray_json.py`
+панели. Второй сборщик разошёлся бы с первым молча (инвариант 25): проверка
+зеленела бы на конфиге, которого у клиента нет. Копия, а не клон панели:
+репозиторий панели приватный, хабу к нему доступа нет. Совпадение с
+оригиналом держит сторож в тестах — правите сборщик в панели, копируйте сюда.
 """
 
 from __future__ import annotations
 
 import base64
-import importlib.util
 import socket
-from functools import lru_cache
-from types import ModuleType
 from urllib.parse import unquote, urlparse
 
 import httpx
 
-from nexus_mcp import config
+from nexus_mcp import config, xray_json
 
 
 class LinksError(Exception):
     pass
-
-
-@lru_cache(maxsize=1)
-def xray_json() -> ModuleType:
-    path = config.settings.repo_dir / "brain" / "app" / "services" / "xray_json.py"
-    if not path.exists():
-        raise LinksError(f"нет {path}: нужен клон vgx3d (NEXUS_REPO_DIR) — его кладёт install.sh")
-    spec = importlib.util.spec_from_file_location("nexus_xray_json", path)
-    mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def decode_subscription(body: str) -> list[str]:
@@ -105,4 +91,4 @@ def links_for_node(links: list[str], node: dict) -> list[str]:
 
 
 def config_for(uri: str) -> dict | None:
-    return xray_json().uri_to_config(uri)
+    return xray_json.uri_to_config(uri)

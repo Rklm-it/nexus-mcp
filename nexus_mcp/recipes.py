@@ -15,9 +15,11 @@ CELL_DIR = "/opt/vpn-cell"
 XRAY_CONFIG = "/usr/local/etc/xray/config.json"
 SERVICES = ("vpn-cell", "xray", "hysteria-server")
 
-# Отметка конца cell-update.sh. Код выхода 0 без неё — не успех: скрипт мог
-# оборваться посреди установки (инварианты 32 и 44).
-UPDATE_DONE_MARK = "Обновление завершено!"
+# Отметка конца скрипта обновления. Код выхода 0 без неё — не успех: скрипт
+# мог оборваться посреди установки (инварианты 32 и 44). Общая часть обоих
+# скриптов: панельного («═══ Обновление завершено ═══») и cell/cell-update.sh
+# («Обновление завершено! ✅»).
+UPDATE_DONE_MARK = "Обновление завершено"
 
 
 class RecipeError(ValueError):
@@ -191,20 +193,21 @@ journalctl -u vpn-cell --since "-1min" --no-pager -o cat | grep -iE "heartbeat|�
 """
 
 
-def update_agent(repo_raw: str, repo_url: str, brain_url: str | None) -> str:
-    """Обновить агент штатным cell-update.sh.
+def update_agent(brain_url: str) -> str:
+    """Обновить агент скриптом панели — тем же путём, что «Обновить агент»
+    в самой панели: `<панель>/install/cell-update.sh` (без пароля, тарбол
+    агента берётся оттуда же, CELL_BRAIN_URL скрипт прописывает сам). Не из
+    GitHub: репозиторий панели приватный, хабу к нему доступа нет.
 
     Скрипт сперва скачивается целиком и только потом выполняется: `bash <(curl)`
     при обрыве выполнил бы половину установки и вышел с нулём (инвариант 32).
     """
-    raw = _url(repo_raw)
-    repo = shlex.quote(repo_url)
-    extra = f" --brain-url {shlex.quote(_url(brain_url))}" if brain_url else ""
+    src = shlex.quote(_url(brain_url) + "/install/cell-update.sh")
     return f"""set +e
 F=/tmp/nexus-cell-update.sh
 rm -f $F
-curl -fsSL --connect-timeout 15 -m 120 -o $F {shlex.quote(raw + '/cell/cell-update.sh')} || {{ echo "DOWNLOAD_FAILED: скрипт обновления не скачался"; exit 4; }}
-bash $F --repo {repo}{extra} 2>&1 | sed -r 's/\\x1B\\[[0-9;]*m//g' | tail -60
+curl -fsSL --connect-timeout 15 -m 120 -o $F {src} || {{ echo "DOWNLOAD_FAILED: скрипт обновления не скачался с панели"; exit 4; }}
+bash $F 2>&1 | sed -r 's/\\x1B\\[[0-9;]*m//g' | tail -60
 echo "rc=${{PIPESTATUS[0]}}"
 """
 

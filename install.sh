@@ -16,10 +16,11 @@
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
 # [--no-caddy] [--no-xray]. Из скачанной копии: bash install.sh <те же флаги>.
 #
-# Что делает: код в /opt/nexus-mcp/app, разреженный клон vgx3d в
-# /opt/nexus-mcp/vgx3d (сборщик конфигов подписки), venv, SSH-ключ хаба,
-# секреты, /etc/nexus-mcp.env, systemd, xray для сквозной проверки, Caddy с
+# Что делает: код в /opt/nexus-mcp/app, venv, SSH-ключ хаба, секреты,
+# /etc/nexus-mcp.env, systemd, xray для сквозной проверки, Caddy с
 # сертификатом Let's Encrypt для домена (нужен свободный 80 порт).
+# Репозиторий панели (vgx3d, приватный) хабу не нужен: сборщик конфигов
+# лежит копией в самом хабе, агент нода берёт с панели.
 # =============================================================================
 {
 set -euo pipefail
@@ -38,10 +39,11 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+# Без доступа к репо git должен отказать сразу, а не молча ждать логина.
+export GIT_TERMINAL_PROMPT=0
 
 DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
-VGX3D_URL="https://github.com/Rklm-it/vgx3d.git"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
 
 while [[ $# -gt 0 ]]; do
@@ -53,11 +55,10 @@ while [[ $# -gt 0 ]]; do
         --brain-gate)  BRAIN_GATE="$2"; shift 2 ;;
         --repo)        REPO_URL="$2"; shift 2 ;;
         --token)       GH_TOKEN="$2"; shift 2 ;;
-        --vgx3d)       VGX3D_URL="$2"; shift 2 ;;
         --branch)      BRANCH="$2"; shift 2 ;;
         --no-caddy)    WITH_CADDY=0; shift ;;
         --no-xray)     WITH_XRAY=0; shift ;;
-        -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,22p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
+        -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,23p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
         *) die "неизвестный параметр: $1" ;;
     esac
 done
@@ -127,17 +128,8 @@ else
 fi
 [ -f "$APP/requirements.txt" ] || die "в $APP нет requirements.txt — не та копия?"
 
-# Клон панели: из него хаб берёт xray_json.py — тот же сборщик клиентских
-# конфигов, что у подписки (второй сборщик разошёлся бы молча).
-log "Клон vgx3d (сборщик конфигов подписки)"
-if [ -d "$BASE/vgx3d/.git" ]; then
-    git -C "$BASE/vgx3d" pull -q --ff-only || warn "vgx3d не обновился — работаем со старой копией"
-else
-    timeout 300 git clone -q --depth 1 --filter=blob:none --sparse "$VGX3D_URL" "$BASE/vgx3d" \
-        && git -C "$BASE/vgx3d" sparse-checkout set brain/app/services cell \
-        || { rm -rf "$BASE/vgx3d"; timeout 600 git clone -q --depth 1 "$VGX3D_URL" "$BASE/vgx3d"; } \
-        || die "vgx3d не склонировался — сквозная проверка без него не соберёт конфиги"
-fi
+# Прежние версии клонировали сюда vgx3d — больше не нужен.
+rm -rf "$BASE/vgx3d"
 
 log "venv и зависимости"
 [ -d "$BASE/venv" ] || python3 -m venv "$BASE/venv"
@@ -179,7 +171,6 @@ NEXUS_ALLOW_ACTIONS=$ALLOW
 NEXUS_SSH_KEY=$ETC/id_ed25519
 NEXUS_INVENTORY=$ETC/nodes.json
 NEXUS_STATE_DIR=$STATE
-NEXUS_REPO_DIR=$BASE/vgx3d
 NEXUS_XRAY=/usr/local/bin/xray
 NEXUS_MCP_HOST=127.0.0.1
 NEXUS_MCP_PORT=8765

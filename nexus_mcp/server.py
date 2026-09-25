@@ -443,7 +443,8 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
 
     restart — перезапустить service (vpn-cell | xray | hysteria-server);
     set_brain_url — прописать адрес панели в .env агента и перезапустить его;
-    update_agent — обновить агент штатным cell-update.sh (и прописать адрес панели).
+    update_agent — обновить агент скриптом панели <панель>/install/cell-update.sh
+    (он же прописывает адрес панели в .env агента).
     brain_url по умолчанию — адрес панели, к которой относится нода.
     """
     s = config.settings
@@ -458,12 +459,12 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
         url = brain_url or _node_panel_url(n)
         if action == "restart":
             script, timeout = recipes.restart(service), 60
+        elif action in ("set_brain_url", "update_agent") and not url:
+            return {"ok": False, "error": "no_brain_url", "detail": "адрес панели не задан"}
         elif action == "set_brain_url":
-            if not url:
-                return {"ok": False, "error": "no_brain_url", "detail": "адрес панели не задан"}
             script, timeout = recipes.set_brain_url(url), 60
         elif action == "update_agent":
-            script, timeout = recipes.update_agent(s.repo_raw, s.repo_url, url or None), 900
+            script, timeout = recipes.update_agent(url), 900
         else:
             return {"ok": False, "error": "unknown_action", "detail": f"есть: {', '.join(ACTIONS)}"}
     except (InventoryError, recipes.RecipeError) as e:

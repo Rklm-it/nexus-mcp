@@ -65,19 +65,6 @@ class Settings:
     test_sub_url: str = field(default_factory=lambda: _env("NEXUS_TEST_SUB_URL"))
     xray_bin: str = field(default_factory=lambda: _env("NEXUS_XRAY"))
 
-    # Репозиторий, из которого нода обновляет агент.
-    repo_url: str = field(
-        default_factory=lambda: _env("NEXUS_REPO_URL", "https://github.com/Rklm-it/vgx3d.git"))
-    repo_raw: str = field(
-        default_factory=lambda: _env(
-            "NEXUS_REPO_RAW", "https://raw.githubusercontent.com/Rklm-it/vgx3d/main"))
-
-    # Клон vgx3d (панели): оттуда берётся brain/app/services/xray_json.py —
-    # тот же сборщик клиентских конфигов, что у подписки. Установщик кладёт
-    # туда разреженный клон; в разработке — соседний каталог ../vgx3d.
-    repo_dir: Path = field(
-        default_factory=lambda: Path(_env("NEXUS_REPO_DIR", "/opt/nexus-mcp/vgx3d")))
-
     host: str = field(default_factory=lambda: _env("NEXUS_MCP_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(_env("NEXUS_MCP_PORT", "8765")))
     # Публичные имена хаба — для защиты от DNS rebinding в MCP-транспорте.

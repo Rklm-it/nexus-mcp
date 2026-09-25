@@ -140,20 +140,37 @@ def test_set_brain_url_rewrites_env(tmp_path):
 
 
 def test_update_script_is_downloaded_before_run():
-    s = recipes.update_agent("https://raw.githubusercontent.com/o/r/main", "https://github.com/o/r.git",
-                             "https://panel.example.ru")
+    s = recipes.update_agent("https://panel.example.ru/")
     # Инвариант 32: не `bash <(curl …)`, а скачать целиком и потом выполнить.
     assert "<(curl" not in s
     assert s.index("curl -fsSL") < s.index("bash $F")
-    assert "--brain-url https://panel.example.ru" in s
+    # Скрипт — с панели (открытый путь, как у «Обновить агент» в панели),
+    # не из GitHub: репозиторий панели приватный.
+    assert "https://panel.example.ru/install/cell-update.sh" in s
+    assert "github" not in s
     assert subprocess.run(["bash", "-n"], input=s, text=True).returncode == 0
 
 
-def test_update_done_mark_matches_cell_update_script(vgx3d):
-    """Отметка конца — из настоящего cell-update.sh; разойдутся — хаб будет
-    считать успешное обновление оборванным (или наоборот)."""
-    text = (vgx3d / "cell" / "cell-update.sh").read_text(encoding="utf-8")
-    assert recipes.UPDATE_DONE_MARK in text
+def test_update_agent_rejects_bad_panel_url():
+    with pytest.raises(recipes.RecipeError):
+        recipes.update_agent("https://p.ru; rm -rf /")
+
+
+def test_update_done_mark_matches_update_scripts(vgx3d):
+    """Отметка конца — из настоящих скриптов обновления: панельного (его хаб
+    и запускает) и cell/cell-update.sh. Разойдутся — хаб будет считать
+    успешное обновление оборванным (или наоборот)."""
+    panel = (vgx3d / "brain/app/api/v1/cell_update.py").read_text(encoding="utf-8")
+    assert '@router.get("/install/cell-update.sh"' in panel
+    assert recipes.UPDATE_DONE_MARK in panel
+    assert recipes.UPDATE_DONE_MARK in (vgx3d / "cell/cell-update.sh").read_text(encoding="utf-8")
+
+
+def test_xray_json_copy_matches_panel(vgx3d):
+    """Сборщик конфигов в хабе — побайтовая копия панельного (инвариант 25).
+    Упало — скопируйте brain/app/services/xray_json.py в nexus_mcp/."""
+    hub = Path(__file__).resolve().parents[1] / "nexus_mcp" / "xray_json.py"
+    assert hub.read_bytes() == (vgx3d / "brain/app/services/xray_json.py").read_bytes()
 
 
 def test_recipe_paths_match_cell_installer(vgx3d):
@@ -397,7 +414,7 @@ VLESS = ("vless://11111111-2222-3333-4444-555555555555@203.0.113.7:443?type=tcp&
          "&pbk=abc&sid=01&sni=www.example.com&fp=chrome&flow=xtls-rprx-vision#DE%20Reality")
 
 
-def test_config_built_by_brain_code(vgx3d):
+def test_config_built_by_brain_code():
     cfg = links.config_for(VLESS)
     out = cfg["outbounds"][0]
     assert out["protocol"] == "vless"
@@ -447,7 +464,7 @@ def test_update_without_finish_mark_is_not_success(hub_settings, monkeypatch):
     hub_settings.inventory_file.write_text(json.dumps({"nodes": [{"name": "n", "ip": "1.2.3.4", "panel": "main"}]}))
 
     async def fake_run(node, script, timeout=45):
-        assert "--brain-url https://p.ru" in script
+        assert "https://p.ru/install/cell-update.sh" in script
         return ssh.SshResult(True, 0, "качаем…\nrc=0\n", "", 10.0)
 
     monkeypatch.setattr(ssh, "run_script", fake_run)

@@ -42,7 +42,5 @@ def hub_settings(tmp_path, monkeypatch):
     s.brain_admin_token = ""
     s.test_sub_url = ""
     s.allow_actions = False
-    if VGX3D is not None:
-        s.repo_dir = VGX3D
     monkeypatch.setattr(config, "settings", s)
     return s
