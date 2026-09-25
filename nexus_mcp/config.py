@@ -41,6 +41,10 @@ class Settings:
     # user:pass, если /api закрыт basic_auth в Caddy панели.
     brain_basic_auth: str = field(default_factory=lambda: _env("NEXUS_BRAIN_BASIC_AUTH"))
 
+    # Панели (несколько на одном хабе) — см. panels.py.
+    panels_file: Path = field(
+        default_factory=lambda: Path(_env("NEXUS_PANELS", "/etc/nexus-mcp/panels.json")))
+
     # Файл с нодами и поправками (ssh-порт, пользователь, ноды вне панели).
     inventory_file: Path = field(
         default_factory=lambda: Path(_env("NEXUS_INVENTORY", "/etc/nexus-mcp/nodes.json")))

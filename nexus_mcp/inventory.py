@@ -38,39 +38,36 @@ class InventoryError(Exception):
     """Ни панель, ни файл не дали списка нод — с причиной."""
 
 
-def _brain_headers() -> dict:
-    return {"X-Admin-Token": config.settings.brain_admin_token}
+def _brain_headers(panel: dict) -> dict:
+    return {"X-Admin-Token": panel.get("token") or ""}
 
 
-def _brain_auth() -> tuple[str, str] | None:
-    ba = config.settings.brain_basic_auth
+def _brain_auth(panel: dict) -> tuple[str, str] | None:
+    ba = panel.get("basic_auth") or ""
     if ba and ":" in ba:
         user, _, pw = ba.partition(":")
         return user, pw
     return None
 
 
-async def brain_get(path: str, timeout: float = 15.0) -> Any:
-    """GET к панели. Ошибка — с кодом и текстом ответа, а не голым «failed»."""
-    s = config.settings
-    if not s.brain_url or not s.brain_admin_token:
-        raise InventoryError("панель не настроена: нет NEXUS_BRAIN_URL / NEXUS_BRAIN_ADMIN_TOKEN")
-    async with httpx.AsyncClient(timeout=timeout, auth=_brain_auth()) as c:
-        r = await c.get(s.brain_url + path, headers=_brain_headers())
+async def _brain(method: str, panel: dict, path: str, timeout: float) -> Any:
+    """Запрос к панели. Ошибка — с кодом и текстом ответа, а не голым «failed»."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout, auth=_brain_auth(panel)) as c:
+            r = await c.request(method, panel["url"] + path, headers=_brain_headers(panel))
+    except httpx.HTTPError as e:
+        raise InventoryError(f"панель {panel['name']} не ответила на {path}: {type(e).__name__}: {e}") from e
     if r.status_code >= 400:
-        raise InventoryError(f"панель ответила {r.status_code} на {path}: {r.text[:200]}")
+        raise InventoryError(f"панель {panel['name']} ответила {r.status_code} на {path}: {r.text[:200]}")
     return r.json()
 
 
-async def brain_post(path: str, timeout: float = 60.0) -> Any:
-    s = config.settings
-    if not s.brain_url or not s.brain_admin_token:
-        raise InventoryError("панель не настроена: нет NEXUS_BRAIN_URL / NEXUS_BRAIN_ADMIN_TOKEN")
-    async with httpx.AsyncClient(timeout=timeout, auth=_brain_auth()) as c:
-        r = await c.post(s.brain_url + path, headers=_brain_headers())
-    if r.status_code >= 400:
-        raise InventoryError(f"панель ответила {r.status_code} на {path}: {r.text[:200]}")
-    return r.json()
+async def brain_get(path: str, panel: dict, timeout: float = 15.0) -> Any:
+    return await _brain("GET", panel, path, timeout)
+
+
+async def brain_post(path: str, panel: dict, timeout: float = 60.0) -> Any:
+    return await _brain("POST", panel, path, timeout)
 
 
 def _load_file() -> dict:
@@ -120,25 +117,42 @@ def _from_brain(row: dict) -> dict:
     }
 
 
-def merge(brain_rows: list[dict], file_data: dict) -> list[dict]:
-    """Панель + файл → единый список. Поправки файла сильнее полей панели
-    только там, где панель ничего не знает (ssh_*), и в `ip` — если его явно
-    переопределили (нода переехала, а панель ещё нет)."""
+def merge(by_panel: dict[str, list[dict]], file_data: dict) -> list[dict]:
+    """Панели + файл → единый список.
+
+    При одной панели имя ноды — как в панели. При нескольких — `панель/имя`:
+    одинаковые имена в разных панелях не должны схлопнуться в одну ноду.
+    Поправки файла сильнее полей панели только там, где панель ничего не знает
+    (ssh_*), и в `ip` — если его явно переопределили.
+    """
+    multi = len(by_panel) > 1
     defaults = {"ssh_user": config.settings.ssh_user, "ssh_port": 22}
     defaults.update(file_data.get("defaults") or {})
     nodes: dict[str, dict] = {}
-    for row in brain_rows:
-        n = _from_brain(row)
-        nodes[n["name"]] = n
+    for pname, rows in by_panel.items():
+        for row in rows:
+            n = _from_brain(row)
+            n["panel"] = pname
+            n["short_name"] = n["name"]
+            if multi:
+                n["name"] = f"{pname}/{n['short_name']}"
+            nodes[n["name"]] = n
     for extra in file_data.get("nodes") or []:
         name = extra.get("name")
         if not name:
             continue
-        if name in nodes:
-            nodes[name].update({k: v for k, v in extra.items() if k != "name"})
+        key = f"{extra['panel']}/{name}" if multi and extra.get("panel") else name
+        target = nodes.get(key)
+        if target is None and multi:
+            same = [n for n in nodes.values() if n.get("short_name") == name]
+            target = same[0] if len(same) == 1 else None
+        fields = {k: v for k, v in extra.items() if k not in ("name", "panel")}
+        if target is not None:
+            target.update(fields)
         else:
-            nodes[name] = {"name": name, "source": "file", "active": True,
-                           "panel_online": None, "heartbeat_fresh": None, **extra}
+            nodes[key] = {"name": key, "short_name": name, "source": "file", "active": True,
+                          "panel": extra.get("panel"), "panel_online": None,
+                          "heartbeat_fresh": None, **fields}
     out = []
     for n in nodes.values():
         for k, v in defaults.items():
@@ -153,27 +167,58 @@ def merge(brain_rows: list[dict], file_data: dict) -> list[dict]:
 async def load_nodes() -> tuple[list[dict], list[str]]:
     """(ноды, предупреждения). Недоступная панель — предупреждение, не отказ:
     для того хаб и существует, чтобы работать, когда панель слепа."""
+    import asyncio
+
+    from nexus_mcp import panels
+
     warnings: list[str] = []
-    brain_rows: list[dict] = []
-    if config.settings.brain_url:
+    try:
+        plist = panels.all_panels()
+    except panels.PanelConfigError as e:
+        plist, _ = [], warnings.append(str(e))
+
+    async def one(p: dict):
         try:
-            brain_rows = await brain_get("/api/v1/servers")
-        except (InventoryError, httpx.HTTPError) as e:
-            warnings.append(f"список из панели не получен: {e}")
-    file_data = _load_file()
-    nodes = merge(brain_rows, file_data)
+            return p["name"], await brain_get("/api/v1/servers", p)
+        except InventoryError as e:
+            warnings.append(f"список из панели {p['name']} не получен: {e}")
+            return p["name"], []
+
+    by_panel = dict(await asyncio.gather(*[one(p) for p in plist]))
+    nodes = merge(by_panel, _load_file())
     if not nodes:
-        hint = "; ".join(warnings) or "панель не настроена"
+        hint = "; ".join(warnings) or "панели не настроены"
         raise InventoryError(
             f"нод нет: {hint}; файл {config.settings.inventory_file} пуст или отсутствует")
     return nodes, warnings
 
 
 async def find_node(name_or_ip: str) -> dict:
+    """Нода по имени (`имя` или `панель/имя`), IP или id. Одинаковое имя в
+    двух панелях — отказ со списком, а не первая попавшаяся."""
     nodes, _ = await load_nodes()
     key = (name_or_ip or "").strip().lower()
-    for n in nodes:
-        if key in (n["name"].lower(), str(n.get("ip", "")).lower(), str(n.get("id", "")).lower()):
-            return n
+    exact = [n for n in nodes if key in (n["name"].lower(), str(n.get("ip", "")).lower(),
+                                         str(n.get("id", "")).lower())]
+    if len(exact) == 1:
+        return exact[0]
+    short = [n for n in nodes if str(n.get("short_name", "")).lower() == key]
+    if len(short) == 1:
+        return short[0]
+    if len(exact) + len(short) > 1:
+        variants = ", ".join(n["name"] for n in (exact or short))
+        raise InventoryError(f"«{name_or_ip}» есть в нескольких панелях: {variants} — укажите панель/имя")
     names = ", ".join(n["name"] for n in nodes[:30])
     raise InventoryError(f"нода «{name_or_ip}» не найдена. Есть: {names}")
+
+
+def node_panel(node: dict) -> dict | None:
+    """Панель, к которой относится нода (для ручек панели и адреса heartbeat)."""
+    from nexus_mcp import panels
+
+    if not node.get("panel"):
+        return None
+    try:
+        return panels.resolve(node["panel"])
+    except panels.PanelConfigError:
+        return None

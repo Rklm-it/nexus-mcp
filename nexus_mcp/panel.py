@@ -18,8 +18,8 @@ from typing import Any
 
 import httpx
 
-from nexus_mcp import config
-from nexus_mcp.inventory import InventoryError, _brain_auth, _brain_headers
+from nexus_mcp import panels
+from nexus_mcp.inventory import _brain_auth, _brain_headers
 
 # Что можно читать. Всё — админские ресурсы панели; публичные ручки
 # (подписка, вебхуки платежей, бот) сюда не входят: у них свои секреты в пути.
@@ -135,24 +135,26 @@ def _shrink(data: Any) -> Any:
 
 
 async def request(method: str, path: str, params: dict | None = None,
-                  timeout: float = 30.0) -> Any:
-    s = config.settings
-    if not s.brain_url or not s.brain_admin_token:
-        raise InventoryError("панель не настроена: нет NEXUS_BRAIN_URL / NEXUS_BRAIN_ADMIN_TOKEN")
+                  timeout: float = 30.0, panel_name: str = "") -> Any:
+    try:
+        p = panels.resolve(panel_name)
+    except panels.PanelConfigError as e:
+        raise PanelError(str(e)) from e
     clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
     try:
-        async with httpx.AsyncClient(timeout=timeout, auth=_brain_auth()) as c:
-            r = await c.request(method, s.brain_url + path, params=clean, headers=_brain_headers())
+        async with httpx.AsyncClient(timeout=timeout, auth=_brain_auth(p)) as c:
+            r = await c.request(method, p["url"] + path, params=clean, headers=_brain_headers(p))
     except httpx.HTTPError as e:
-        raise PanelError(f"панель не ответила на {path}: {type(e).__name__}: {e}") from e
+        raise PanelError(f"панель {p['name']} не ответила на {path}: {type(e).__name__}: {e}") from e
     if r.status_code >= 400:
         detail = r.text[:400]
         hint = ""
         if r.status_code == 401 and "basic" in r.headers.get("www-authenticate", "").lower():
-            hint = " — /api закрыт basic_auth Caddy: задайте NEXUS_BRAIN_BASIC_AUTH=user:pass"
+            hint = (" — /api закрыт basic_auth Caddy: nexus-mcp-panels add "
+                    f"{p['name']} <url> <токен> --basic user:pass")
         elif r.status_code == 403:
             hint = " — токен не принят или фича выключена лицензией"
-        raise PanelError(f"панель ответила {r.status_code} на {method} {path}: {detail}{hint}")
+        raise PanelError(f"панель {p['name']} ответила {r.status_code} на {method} {path}: {detail}{hint}")
     try:
         data = r.json()
     except ValueError:
@@ -160,9 +162,11 @@ async def request(method: str, path: str, params: dict | None = None,
     return _shrink(redact(data))
 
 
-async def get(path: str, params: dict | None = None, timeout: float = 30.0) -> Any:
-    return await request("GET", check_read_path(path), params, timeout)
+async def get(path: str, params: dict | None = None, timeout: float = 30.0,
+              panel_name: str = "") -> Any:
+    return await request("GET", check_read_path(path), params, timeout, panel_name)
 
 
-async def post_action(path: str, params: dict | None = None, timeout: float = 120.0) -> Any:
-    return await request("POST", check_action_path(path), params, timeout)
+async def post_action(path: str, params: dict | None = None, timeout: float = 120.0,
+                      panel_name: str = "") -> Any:
+    return await request("POST", check_action_path(path), params, timeout, panel_name)

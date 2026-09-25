@@ -100,7 +100,7 @@ def test_basic_auth_refusal_names_the_fix(hub_settings, monkeypatch):
     hub_settings.brain_admin_token = "A"
     _mock(monkeypatch, lambda req: httpx.Response(
         401, text="Unauthorized", headers={"www-authenticate": 'Basic realm="x"'}))
-    with pytest.raises(panel.PanelError, match="NEXUS_BRAIN_BASIC_AUTH"):
+    with pytest.raises(panel.PanelError, match="--basic user:pass"):
         asyncio.run(panel.get("/api/v1/admin/dashboard"))
 
 
@@ -118,7 +118,7 @@ def test_panel_not_configured_is_a_reason(hub_settings):
     from nexus_mcp import server
 
     r = asyncio.run(server.panel_health())
-    assert r["ok"] is False and "NEXUS_BRAIN_URL" in r["detail"]
+    assert r["ok"] is False and "nexus-mcp-panels add" in r["detail"]
 
 
 def test_panel_action_gated(hub_settings, monkeypatch):

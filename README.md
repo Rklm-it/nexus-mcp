@@ -54,6 +54,9 @@ bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it
 - `--no-caddy` — если TLS отдаёт ваш собственный прокси на `127.0.0.1:8765`;
 - нужен свободный 80 порт: через него Caddy получает сертификат.
 
+Ссылка коннектора в любой момент — `nexus-mcp-info --url`. Ещё панели —
+`nexus-mcp-panels add <имя> <url> <токен>` (см. DEPLOY.md, «Несколько панелей»).
+
 Код встаёт в `/opt/nexus-mcp/app`. Рядом кладётся разреженный клон панели
 `/opt/nexus-mcp/vgx3d` (5 МБ): из него хаб берёт `xray_json.py`, тот же
 сборщик клиентских конфигов, что у подписки. Пошагово, с проверками и разбором
@@ -116,6 +119,7 @@ python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ро�
 | `probes_list`, `probe_check` | точки обзора и одиночная проба (tcp / banner / tls / http) |
 | `panel_reachability`, `check_from_russia` | вердикт самой панели и проверка с check-host |
 | `fix_playbook` | что делать при симптоме: наш журнал и опыт владельцев VPN-сервисов, со ссылками и степенью доверия |
+| `panels_list` | панели хаба (без токенов); при нескольких у инструментов панели параметр `panel`, ноды называются `панель/имя` |
 | `panel_health` | проверка всей панели одной ручкой: ядро, контейнеры, боты, ноды, мониторинг, платежи |
 | `panel_overview`, `panel_findings`, `panel_regions`, `panel_versions` | главный экран, центр состояния, регионы и операторы, версии агентов |
 | `panel_users`, `panel_user_diagnose` | поиск юзеров; почему у юзера нет пинга (проверка каждой ссылки его подписки) |

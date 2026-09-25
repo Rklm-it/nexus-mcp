@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from urllib.parse import urlparse
 
-from nexus_mcp import config, links, playbook, recipes, ssh
+from nexus_mcp import config, inventory, links, playbook, recipes, ssh
 from nexus_mcp.probes import HUB, registry
 
 CRIT, WARN, INFO, OK = "crit", "warn", "info", "ok"
@@ -205,7 +205,7 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
                    with_ssh: bool = True) -> dict:
     probes = probes or [HUB]
     report: dict = {"node": {k: node.get(k) for k in (
-        "name", "ip", "ssh_host", "country", "panel_online", "heartbeat_age_s",
+        "name", "panel", "ip", "ssh_host", "country", "panel_online", "heartbeat_age_s",
         "agent_version", "rf_status", "source")}}
     findings: list[dict] = panel_findings(node)
 
@@ -237,7 +237,8 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
         if ssh_res.ok:
             ov = recipes.parse_overview(ssh_res.stdout)
             report["node_overview"] = ov
-            findings += node_findings(ov, config.settings.brain_url)
+            p = inventory.node_panel(node)
+            findings += node_findings(ov, p["url"] if p else "")
         else:
             report["ssh"] = ssh_res.as_dict()
             findings.append(finding(CRIT if ssh_res.failure != "no_key" else WARN, f"ssh_{ssh_res.failure}",

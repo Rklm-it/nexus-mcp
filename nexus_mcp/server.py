@@ -18,7 +18,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from nexus_mcp import audit, config, diagnose, inventory, panel, playbook, recipes, ssh
+from nexus_mcp import audit, config, diagnose, inventory, panels, playbook, recipes, ssh
+from nexus_mcp import panel as panel_api
 from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, ProbeError, registry
 
@@ -35,6 +36,8 @@ INSTRUCTIONS = """\
 состояния. Дальше panel_users / panel_user_diagnose (почему у юзера нет пинга),
 panel_inbound_diagnose, panel_logs, panel_payments, panel_get для любой админской ручки.
 Секреты в ответах панели замаскированы — так и задумано.
+Панелей может быть несколько (panels_list): тогда у инструментов панели указывай
+panel=<имя>, а ноды называются «панель/имя».
 
 Как разбирать ноды:
 1. nodes_list(only_problems=True) — какие ноды красные/без heartbeat.
@@ -53,6 +56,12 @@ ours (проверено у нас) > measured > repeated > anecdote. Автор
 """
 
 mcp = MCPServer(name="nexus-nodes", instructions=INSTRUCTIONS, version="1.0.0")
+
+
+def _node_panel_url(n: dict) -> str:
+    """Адрес панели, к которой относится нода: туда она шлёт heartbeat."""
+    p = inventory.node_panel(n)
+    return p["url"] if p else ""
 
 
 def _err(e: Exception) -> dict:
@@ -169,7 +178,7 @@ async def node_run(node: str, recipe: str, service: str = "vpn-cell", lines: int
         elif recipe == "capture":
             script = recipes.capture(client_ip, seconds)
         elif recipe == "brain_path":
-            script = recipes.brain_path(config.settings.brain_url)
+            script = recipes.brain_path(_node_panel_url(n))
         else:
             return {"ok": False, "error": "unknown_recipe", "detail": f"есть: {', '.join(READ_RECIPES)}"}
     except (InventoryError, recipes.RecipeError) as e:
@@ -226,7 +235,8 @@ async def panel_reachability(node: str) -> dict:
         n = await inventory.find_node(node)
         if not n.get("id"):
             return {"ok": False, "error": "not_in_panel", "detail": "ноды нет в панели"}
-        return {"ok": True, **(await inventory.brain_get(f"/api/v1/servers/{n['id']}/reachability", timeout=40))}
+        return {"ok": True, "panel": n.get("panel"), **(await inventory.brain_get(
+            f"/api/v1/servers/{n['id']}/reachability", panels.resolve(n["panel"]), timeout=40))}
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -239,7 +249,8 @@ async def check_from_russia(node: str) -> dict:
         n = await inventory.find_node(node)
         if not n.get("id"):
             return {"ok": False, "error": "not_in_panel", "detail": "ноды нет в панели"}
-        return {"ok": True, **(await inventory.brain_post(f"/api/v1/admin/nodes/{n['id']}/rf-check", timeout=90))}
+        return {"ok": True, "panel": n.get("panel"), **(await inventory.brain_post(
+            f"/api/v1/admin/nodes/{n['id']}/rf-check", panels.resolve(n["panel"]), timeout=90))}
     except Exception as e:  # noqa: BLE001
         return _err(e)
 
@@ -266,123 +277,157 @@ async def audit_tail(n: int = 30) -> dict:
 async def _panel(call, *args, **kwargs) -> dict:
     try:
         data = await call(*args, **kwargs)
-    except (panel.PanelError, InventoryError) as e:
+    except (panel_api.PanelError, InventoryError) as e:
         return _err(e)
     return {"ok": True, "data": data}
 
 
 @mcp.tool()
-async def panel_health(fresh: bool = False) -> dict:
+async def panels_list() -> dict:
+    """Панели, к которым подключён хаб (без токенов). Имя — параметр panel у
+    инструментов панели; ноды при нескольких панелях называются «панель/имя»."""
+    try:
+        return {"ok": True, "panels": [panels.public_view(p) for p in panels.all_panels()]}
+    except panels.PanelConfigError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def panel_health(fresh: bool = False, panel: str = "") -> dict:
     """Проверка всей панели одной ручкой: ядро, контейнеры, боты, ноды,
     мониторинг, платежи — то же, что видит приложение администратора.
-    fresh=True — мимо 20-секундного кэша."""
-    return await _panel(panel.get, "/api/v1/admin/app/health", {"fresh": fresh or None})
+    fresh=True — мимо 20-секундного кэша.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/app/health", {"fresh": fresh or None}, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_overview() -> dict:
+async def panel_overview(panel: str = "") -> dict:
     """Цифры главного экрана: юзеры (всего/активные/заблокированные), онлайн,
-    выручка, версия панели."""
-    return await _panel(panel.get, "/api/v1/admin/app/overview")
+    выручка, версия панели.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/app/overview", panel_name=panel)
 
 
 @mcp.tool()
-async def panel_findings(fresh: bool = False) -> dict:
+async def panel_findings(fresh: bool = False, panel: str = "") -> dict:
     """Находки центра состояния (что панель сама считает проблемой) с
-    объяснениями. Требует фичу monitoring_pro в лицензии."""
-    return await _panel(panel.get, "/api/v1/admin/monitoring/overview", {"fresh": fresh or None})
+    объяснениями. Требует фичу monitoring_pro в лицензии.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/monitoring/overview", {"fresh": fresh or None}, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_regions(hours: int = 6) -> dict:
-    """Регионы и операторы клиентов: у кого из провайдеров проблемы."""
-    return await _panel(panel.get, "/api/v1/admin/monitoring/regions", {"hours": hours})
+async def panel_regions(hours: int = 6, panel: str = "") -> dict:
+    """Регионы и операторы клиентов: у кого из провайдеров проблемы.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/monitoring/regions", {"hours": hours}, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_versions() -> dict:
-    """Версии панели и агентов на всех нодах — кто отстал."""
-    return await _panel(panel.get, "/api/v1/admin/nodes/versions")
+async def panel_versions(panel: str = "") -> dict:
+    """Версии панели и агентов на всех нодах — кто отстал.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/nodes/versions", panel_name=panel)
 
 
 @mcp.tool()
-async def panel_users(search: str = "", status: str = "", limit: int = 20) -> dict:
+async def panel_users(search: str = "", status: str = "", limit: int = 20, panel: str = "") -> dict:
     """Найти юзеров: search — ник, имя, telegram_id или часть UUID;
-    status — active | inactive | paid_inactive."""
-    return await _panel(panel.get, "/api/v1/admin/users",
-                        {"search": search, "status": status, "limit": max(1, min(limit, 100))})
+    status — active | inactive | paid_inactive.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/users",
+                        {"search": search, "status": status, "limit": max(1, min(limit, 100))}, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_user_diagnose(user_id: str) -> dict:
+async def panel_user_diagnose(user_id: str, panel: str = "") -> dict:
     """Почему у юзера нет пинга: панель проверяет каждую ссылку его подписки
-    и объясняет. user_id — UUID из panel_users."""
-    return await _panel(panel.get, f"/api/v1/admin/users/{user_id}/diagnose-links", timeout=90)
+    и объясняет. user_id — UUID из panel_users.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, f"/api/v1/admin/users/{user_id}/diagnose-links", timeout=90, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_inbound_diagnose(inbound_id: str) -> dict:
-    """Разбор инбаунда: конфиг в панели против того, что реально на ноде."""
-    return await _panel(panel.get, f"/api/v1/admin/inbounds/{inbound_id}/diagnose", timeout=90)
+async def panel_inbound_diagnose(inbound_id: str, panel: str = "") -> dict:
+    """Разбор инбаунда: конфиг в панели против того, что реально на ноде.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, f"/api/v1/admin/inbounds/{inbound_id}/diagnose", timeout=90, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_logs(source: str = "brain", service: str = "", lines: int = 150) -> dict:
+async def panel_logs(source: str = "brain", service: str = "", lines: int = 150, panel: str = "") -> dict:
     """Логи через панель. source="brain" — сервисы панели (service: brain | bot |
     admin-bot | dealer-bot | support-bot | postgres | redis); source=<имя ноды> —
-    логи ноды (service: vpn-cell | xray | hysteria-server; идёт через панель,
-    поэтому для красной ноды используйте node_logs по SSH)."""
+    логи ноды через ЕЁ панель (service: vpn-cell | xray | hysteria-server; идёт через панель,
+    поэтому для красной ноды используйте node_logs по SSH).
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
     lines = max(10, min(lines, 500))
     if source == "brain":
-        return await _panel(panel.get, "/api/v1/admin/logs/brain",
-                            {"service": service or "brain", "lines": lines})
+        return await _panel(panel_api.get, "/api/v1/admin/logs/brain",
+                            {"service": service or "brain", "lines": lines}, panel_name=panel)
     try:
         n = await inventory.find_node(source)
     except InventoryError as e:
         return _err(e)
     if not n.get("id"):
         return {"ok": False, "error": "not_in_panel", "detail": "ноды нет в панели — node_logs по SSH"}
-    return await _panel(panel.get, f"/api/v1/admin/logs/node/{n['id']}",
-                        {"service": service or "vpn-cell", "lines": lines}, timeout=60)
+    return await _panel(panel_api.get, f"/api/v1/admin/logs/node/{n['id']}",
+                        {"service": service or "vpn-cell", "lines": lines}, timeout=60,
+                        panel_name=n.get("panel") or "")
 
 
 @mcp.tool()
-async def panel_payments(limit: int = 25, status: str = "") -> dict:
-    """Последние платежи (status — фильтр, например pending | paid | failed)."""
-    return await _panel(panel.get, "/api/v1/admin/payments",
-                        {"limit": max(1, min(limit, 100)), "status": status})
+async def panel_payments(limit: int = 25, status: str = "", panel: str = "") -> dict:
+    """Последние платежи (status — фильтр, например pending | paid | failed).
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.get, "/api/v1/admin/payments",
+                        {"limit": max(1, min(limit, 100)), "status": status}, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_get(path: str, params: dict | None = None) -> dict:
+async def panel_get(path: str, params: dict | None = None, panel: str = "") -> dict:
     """Любая админская GET-ручка панели, когда нет готового инструмента.
 
     path — например "/api/v1/admin/dashboard", "/api/v1/servers/<id>",
     "/api/v1/admin/expiring", "/api/v1/admin/users/<id>/connection-log".
     Разрешены /api/v1/admin/*, /api/v1/servers*, /api/v1/inbounds*,
     /api/v1/outbounds*, /api/v1/users*, /api/v1/traffic*, /health.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
     """
-    return await _panel(panel.get, path, params or {}, timeout=60)
+    return await _panel(panel_api.get, path, params or {}, timeout=60, panel_name=panel)
 
 
 @mcp.tool()
-async def panel_action(path: str, confirm: bool = False, params: dict | None = None) -> dict:
+async def panel_action(path: str, confirm: bool = False, params: dict | None = None, panel: str = "") -> dict:
     """Действие в панели из короткого списка (проверить/перезапустить/обновить
     ноду, прогон центра состояния, пересинхронизация). Только с согласия
-    человека: NEXUS_ALLOW_ACTIONS=1 на хабе и confirm=true."""
+    человека: NEXUS_ALLOW_ACTIONS=1 на хабе и confirm=true.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
     if not config.settings.allow_actions:
         return {"ok": False, "error": "actions_disabled",
                 "detail": "действия выключены на хабе (NEXUS_ALLOW_ACTIONS=1 чтобы включить)"}
     try:
-        panel.check_action_path(path)
-    except panel.PanelError as e:
+        panel_api.check_action_path(path)
+    except panel_api.PanelError as e:
         return _err(e)
     if not confirm:
         return {"ok": False, "error": "need_confirm",
                 "detail": "действие меняет панель или ноду: спросите человека и повторите с confirm=true"}
-    res = await _panel(panel.post_action, path, params or {})
-    audit.record("panel_action", {"path": path, "params": params}, res.get("ok", False),
-                 res.get("detail", ""))
+    res = await _panel(panel_api.post_action, path, params or {}, panel_name=panel)
+    audit.record("panel_action", {"path": path, "params": params, "panel": panel}, res.get("ok", False),
+                 res.get("detail", ""), panel_name=panel)
     return res
 
 
@@ -399,7 +444,7 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
     restart — перезапустить service (vpn-cell | xray | hysteria-server);
     set_brain_url — прописать адрес панели в .env агента и перезапустить его;
     update_agent — обновить агент штатным cell-update.sh (и прописать адрес панели).
-    brain_url по умолчанию — адрес панели из настроек хаба.
+    brain_url по умолчанию — адрес панели, к которой относится нода.
     """
     s = config.settings
     if not s.allow_actions:
@@ -410,7 +455,7 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
                 "detail": "действие меняет ноду: спросите человека и повторите с confirm=true"}
     try:
         n = await inventory.find_node(node)
-        url = brain_url or s.brain_url
+        url = brain_url or _node_panel_url(n)
         if action == "restart":
             script, timeout = recipes.restart(service), 60
         elif action == "set_brain_url":

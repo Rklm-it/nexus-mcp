@@ -370,7 +370,7 @@ def test_merge_panel_and_file(hub_settings):
              "last_heartbeat_at": None, "api_host": None, "is_active": True}]
     file_data = {"defaults": {"ssh_port": 2222},
                  "nodes": [{"name": "de-1", "ssh_user": "admin"}, {"name": "extra", "ip": "2.2.2.2"}]}
-    nodes = {n["name"]: n for n in inventory.merge(rows, file_data)}
+    nodes = {n["name"]: n for n in inventory.merge({"main": rows}, file_data)}
     assert nodes["de-1"]["ssh_port"] == 2222 and nodes["de-1"]["ssh_user"] == "admin"
     assert nodes["de-1"]["ssh_host"] == "1.1.1.1" and nodes["de-1"]["heartbeat_fresh"] is False
     assert nodes["extra"]["source"] == "file"
@@ -379,7 +379,7 @@ def test_merge_panel_and_file(hub_settings):
 def test_ssh_goes_to_management_address():
     """Инвариант 37: SSH — на адрес управления (api_host), если он задан."""
     rows = [{"id": "u", "name": "n", "ip_address": "1.1.1.1", "api_host": "10.9.9.9"}]
-    assert inventory.merge(rows, {})[0]["ssh_host"] == "10.9.9.9"
+    assert inventory.merge({"main": rows}, {})[0]["ssh_host"] == "10.9.9.9"
 
 
 def test_heartbeat_age_handles_naive_utc():
@@ -437,7 +437,14 @@ def test_update_without_finish_mark_is_not_success(hub_settings, monkeypatch):
 
     hub_settings.allow_actions = True
     hub_settings.brain_url = "https://p.ru"
-    hub_settings.inventory_file.write_text(json.dumps({"nodes": [{"name": "n", "ip": "1.2.3.4"}]}))
+    hub_settings.brain_admin_token = "A"
+
+    async def no_servers(path, panel, timeout=15.0):
+        return []
+
+    monkeypatch.setattr(inventory, "brain_get", no_servers)
+    # Нода из файла, но относится к панели main — адрес heartbeat берётся у неё.
+    hub_settings.inventory_file.write_text(json.dumps({"nodes": [{"name": "n", "ip": "1.2.3.4", "panel": "main"}]}))
 
     async def fake_run(node, script, timeout=45):
         assert "--brain-url https://p.ru" in script

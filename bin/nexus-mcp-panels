@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Панели хаба: nexus-mcp-panels list | add <имя> <url> <токен> [--basic u:p] | remove <имя>
+set -a
+# shellcheck disable=SC1091
+. /etc/nexus-mcp.env
+set +a
+cd /opt/nexus-mcp/app && exec /opt/nexus-mcp/venv/bin/python -m nexus_mcp.panels "$@"

@@ -47,7 +47,15 @@ bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it
 - **ставит** зависимости, xray для проверок, Caddy с сертификатом Let's Encrypt
   (порт **80** должен быть свободен), сервисы `nexus-mcp` и `nexus-mcp-caddy`.
 
-В конце он печатает три вещи, **сохраните их**:
+В конце он печатает всё нужное дальше. **Потеряли — не страшно**, в любой
+момент на хабе:
+
+```bash
+nexus-mcp-info          # ссылка коннектора, ключ хаба, команда пробника, панели
+nexus-mcp-info --url    # только ссылка коннектора
+```
+
+Что там:
 1. адрес коннектора `https://…/mcp/<секрет>`;
 2. публичный ключ хаба `ssh-ed25519 AAAA… nexus-mcp@…`;
 3. команду для домашнего пробника.
@@ -57,6 +65,26 @@ bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it
 systemctl status nexus-mcp nexus-mcp-caddy --no-pager | grep Active
 curl -s https://<адрес хаба>/healthz        # {"ok":true,"service":"nexus-mcp"}
 ```
+
+## Несколько панелей
+
+Один хаб и один коннектор на все панели. Первая добавляется установкой
+(`--brain-url`, это панель `main`), остальные — командой на хабе:
+
+```bash
+nexus-mcp-panels add vip   https://panel.example.ru/vip <VPN_ADMIN_TOKEN VIP-контура>
+nexus-mcp-panels add shop2 https://p2.example.com <её VPN_ADMIN_TOKEN> [--basic user:pass]
+nexus-mcp-panels list
+nexus-mcp-panels remove shop2
+```
+
+Хаб подхватывает изменения сразу, перезапуск не нужен. Ноды всех панелей
+видны вместе, а при нескольких панелях называются `панель/имя` (`shop2/de-1`).
+Инструментам панели Claude передаёт `panel=<имя>`.
+
+⚠️ Хаб хранит токены всех панелей и SSH-ключ ко всем их нодам. Свои панели
+держите на одном хабе. Панели **чужих клиентов** — на отдельных хабах с
+отдельными коннекторами: взлом одного хаба не должен открывать всех.
 
 ## Шаг 3. Ключ хаба на ноды
 
@@ -117,7 +145,7 @@ systemctl restart nexus-mcp
 
 claude.ai → **Settings → Connectors → Add custom connector**:
 - Name: `Nexus nodes`
-- URL: адрес коннектора из шага 2
+- URL: адрес коннектора — `nexus-mcp-info --url` на хабе
 
 Новый коннектор появляется в **новых** сессиях. Для проверки скажите
 Claude: «проверь панель и красные ноды через nexus». Он вызовет `panel_health`,

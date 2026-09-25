@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Ссылка коннектора для claude.ai и всё, что нужно после установки хаба.
+# Можно звать когда угодно:  nexus-mcp-info        — всё
+#                            nexus-mcp-info --url  — только ссылка коннектора
+set -uo pipefail
+ENVF=/etc/nexus-mcp.env
+[ -r "$ENVF" ] || { echo "нет $ENVF — хаб не установлен, или запустите под root" >&2; exit 1; }
+envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+
+DOMAIN="$(envget NEXUS_MCP_PUBLIC_HOSTS)"
+PORT="$(envget NEXUS_MCP_PUBLIC_PORT)"
+SECRET="$(envget NEXUS_MCP_SECRET)"
+PROBE="$(envget NEXUS_PROBE_TOKENS | cut -d, -f1)"
+if [ -z "$DOMAIN" ]; then
+    HUB="https://<домен вашего прокси>"
+elif [ -z "$PORT" ] || [ "$PORT" = "443" ]; then
+    HUB="https://$DOMAIN"
+else
+    HUB="https://$DOMAIN:$PORT"
+fi
+
+if [ "${1:-}" = "--url" ]; then
+    echo "$HUB/mcp/$SECRET"
+    exit 0
+fi
+
+echo
+echo "1) Коннектор для claude.ai — Settings → Connectors → Add custom connector:"
+echo "     $HUB/mcp/$SECRET"
+if [ -n "$DOMAIN" ]; then
+    if curl -fsS --connect-timeout 5 -m 10 "$HUB/healthz" >/dev/null 2>&1; then
+        echo "   ✓ хаб отвечает по https"
+    else
+        echo "   ✗ по https хаб не отвечает: journalctl -u nexus-mcp-caddy -n 30 (сертификат, порт 80)"
+    fi
+fi
+echo
+echo "2) Ключ хаба — на каждую ноду, в /root/.ssh/authorized_keys:"
+echo "     $(cat /etc/nexus-mcp/id_ed25519.pub 2>/dev/null || echo 'нет /etc/nexus-mcp/id_ed25519.pub')"
+echo "   Быстро: ssh-copy-id -i /etc/nexus-mcp/id_ed25519.pub root@<IP ноды>"
+echo
+echo "3) Домашний пробник (компьютер или роутер дома):"
+echo "     python3 probe.py --hub $HUB --token $PROBE --name <провайдер-дом>"
+echo "   probe.py: /opt/nexus-mcp/app/probe/probe.py"
+echo
+echo "4) Панели хаба (добавить ещё: nexus-mcp-panels add <имя> <url> <токен>):"
+if command -v nexus-mcp-panels >/dev/null 2>&1; then
+    nexus-mcp-panels list | sed 's/^/     /'
+fi
+echo
+echo "Настройки: $ENVF → systemctl restart nexus-mcp"

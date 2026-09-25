@@ -282,26 +282,14 @@ EOF
 fi
 
 # ── Итог ─────────────────────────────────────────────────────────────────────
-PUB="$(cat "$ETC/id_ed25519.pub")"
-if [ "$PORT" = "443" ]; then HUB_URL="https://$DOMAIN"; else HUB_URL="https://$DOMAIN:$PORT"; fi
-[ "$WITH_CADDY" = "1" ] || HUB_URL="https://<ваш-домен>"
+install -m 0755 "$APP/bin/nexus-mcp-info" /usr/local/bin/nexus-mcp-info
+install -m 0755 "$APP/bin/nexus-mcp-panels" /usr/local/bin/nexus-mcp-panels
 echo
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Хаб установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
-echo
-echo "1) Коннектор в claude.ai (Настройки → Коннекторы → Добавить свой):"
-echo "     $HUB_URL/mcp/$SECRET"
-echo
-echo "2) Ключ хаба — добавить на КАЖДУЮ ноду (в /root/.ssh/authorized_keys):"
-echo "     $PUB"
-echo
-echo "3) Домашний пробник (на компьютере или роутере дома):"
-echo "     python3 probe.py --hub $HUB_URL --token $PROBE_TOKEN --name <провайдер-дом>"
-echo "   probe.py: $APP/probe/probe.py"
-echo
-echo "Настройки: $ENVF (подписка тестового юзера — NEXUS_TEST_SUB_URL;"
-echo "действия с нодами — NEXUS_ALLOW_ACTIONS=1), затем systemctl restart nexus-mcp"
+/usr/local/bin/nexus-mcp-info || true
+echo "Показать это снова в любой момент: nexus-mcp-info   (только ссылку: nexus-mcp-info --url)"
 echo
 FINISHED=1
 }
