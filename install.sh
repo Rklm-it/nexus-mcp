@@ -6,13 +6,15 @@
 # режется, разбор 22.09.2026). Проверка перед установкой — README, раздел
 # «Куда ставить».
 #
-# Репозиторий приватный, поэтому два способа:
-#   1) из скачанной копии:
-#        git clone https://<PAT>@github.com/Rklm-it/nexus-mcp.git && cd nexus-mcp
-#        bash install.sh --domain mcp.example.ru --brain-url https://panel.example.ru \
-#          --brain-token <X-Admin-Token>
-#   2) только скриптом: bash install.sh --token <PAT> --domain … (клонирует сам)
-# Прочее: [--port 9443] [--no-caddy] [--no-xray]
+# Одной командой (репозиторий приватный — нужен токен GitHub на чтение):
+#   T=<github_pat_…>
+#   curl -fsSL -H "Authorization: Bearer $T" -H "Accept: application/vnd.github.raw" \
+#     https://api.github.com/repos/Rklm-it/nexus-mcp/contents/install.sh \
+#     | bash -s -- --token "$T" --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN>
+#
+# Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
+# 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
+# [--no-caddy] [--no-xray]. Из скачанной копии: bash install.sh <те же флаги>.
 #
 # Что делает: код в /opt/nexus-mcp/app, разреженный клон vgx3d в
 # /opt/nexus-mcp/vgx3d (сборщик конфигов подписки), venv, SSH-ключ хаба,
@@ -37,7 +39,7 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 
-DOMAIN=""; PORT="443"; BRAIN_URL=""; BRAIN_TOKEN=""; WITH_CADDY=1; WITH_XRAY=1
+DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; WITH_CADDY=1; WITH_XRAY=1
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
 VGX3D_URL="https://github.com/Rklm-it/vgx3d.git"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
@@ -45,7 +47,7 @@ BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --domain)      DOMAIN="$2"; shift 2 ;;
-        --port)        PORT="$2"; shift 2 ;;
+        --port)        PORT="$2"; PORT_SET=1; shift 2 ;;
         --brain-url)   BRAIN_URL="${2%/}"; shift 2 ;;
         --brain-token) BRAIN_TOKEN="$2"; shift 2 ;;
         --repo)        REPO_URL="$2"; shift 2 ;;
@@ -54,17 +56,15 @@ while [[ $# -gt 0 ]]; do
         --branch)      BRANCH="$2"; shift 2 ;;
         --no-caddy)    WITH_CADDY=0; shift ;;
         --no-xray)     WITH_XRAY=0; shift ;;
-        -h|--help)     sed -n 2,24p "$0"; FINISHED=1; exit 0 ;;
+        -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,22p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
         *) die "неизвестный параметр: $1" ;;
     esac
 done
 
 [ "$(id -u)" = "0" ] || die "нужен root"
-if [ "$WITH_CADDY" = "1" ] && [ -z "$DOMAIN" ]; then
-    die "нужен --domain (A-запись на IP этой машины) — коннектор claude.ai ходит только по https. Или --no-caddy, если TLS даёт ваш прокси."
-fi
 
 port_busy() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q . || return 1; }
+envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 
 # ── 1. Пакеты ────────────────────────────────────────────────────────────────
 log "Пакеты: git, python3-venv, openssh-client, curl"
@@ -72,6 +72,26 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null 2>&1 || warn "apt-get update не прошёл — пробуем с тем, что есть"
 apt-get install -y -qq git python3 python3-venv openssh-client curl unzip ca-certificates >/dev/null \
     || die "apt-get install не прошёл"
+
+# ── Адрес и порт хаба ────────────────────────────────────────────────────────
+# Повторный запуск (обновление) берёт прежние — иначе сменился бы URL коннектора.
+[ -n "$DOMAIN" ] || DOMAIN="$(envget NEXUS_MCP_PUBLIC_HOSTS)"
+if [ "$PORT_SET" = "0" ] && [ -n "$(envget NEXUS_MCP_PUBLIC_PORT)" ]; then
+    PORT="$(envget NEXUS_MCP_PUBLIC_PORT)"; PORT_SET=1
+fi
+if [ "$WITH_CADDY" = "1" ]; then
+    if [ -z "$DOMAIN" ]; then
+        PUBIP="$(curl -fsS -4 --connect-timeout 5 -m 10 https://api.ipify.org 2>/dev/null || true)"
+        [[ "$PUBIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || die "не узнал внешний IP (api.ipify.org не ответил) — укажите --domain"
+        DOMAIN="${PUBIP//./-}.sslip.io"
+        log "Домен не задан — беру $DOMAIN (sslip.io отвечает этим IP, DNS настраивать не нужно)"
+    fi
+    if [ "$PORT_SET" = "0" ] && port_busy 443 && ! ss -ltnpH 'sport = :443' | grep -q caddy; then
+        PORT=9443
+        warn "443 занят ($(ss -ltnpH 'sport = :443' | head -1 | awk '{print $NF}')) — хаб встанет на $PORT"
+    fi
+fi
 
 # ── 2. Код ───────────────────────────────────────────────────────────────────
 mkdir -p "$BASE" "$ETC" "$STATE"
@@ -81,7 +101,11 @@ APP="$BASE/app"
 # Репозиторий хаба приватный. Три пути: запуск из уже скачанной копии (скрипт
 # лежит рядом с nexus_mcp/), клон с токеном (--token, fine-grained PAT на
 # чтение этого репо) или обновление уже стоящего.
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+# Под `curl | bash` BASH_SOURCE пуст — тогда копии рядом нет, клонируем.
+SELF_DIR=""
+if [ -f "${BASH_SOURCE[0]:-}" ]; then
+    SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+fi
 AUTH_URL="$REPO_URL"
 if [ -n "$GH_TOKEN" ]; then
     AUTH_URL="$(printf '%s' "$REPO_URL" | sed "s#https://#https://x-access-token:${GH_TOKEN}@#")"
@@ -129,7 +153,6 @@ chmod 600 "$ETC/id_ed25519"
 [ -f "$ETC/nodes.json" ] || echo '{"defaults": {"ssh_user": "root", "ssh_port": 22}, "nodes": []}' > "$ETC/nodes.json"
 
 # ── 4. Настройки ─────────────────────────────────────────────────────────────
-envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 gen() { head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
 SECRET="$(envget NEXUS_MCP_SECRET)"; [ -n "$SECRET" ] || SECRET="$(gen 40)"
 PROBE_TOKEN="$(envget NEXUS_PROBE_TOKENS)"; [ -n "$PROBE_TOKEN" ] || PROBE_TOKEN="$(gen 32)"
@@ -158,6 +181,7 @@ NEXUS_XRAY=/usr/local/bin/xray
 NEXUS_MCP_HOST=127.0.0.1
 NEXUS_MCP_PORT=8765
 NEXUS_MCP_PUBLIC_HOSTS=$DOMAIN
+NEXUS_MCP_PUBLIC_PORT=$PORT
 EOF
 umask 022
 

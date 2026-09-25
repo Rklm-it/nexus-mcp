@@ -42,26 +42,25 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 ## Установка
 
-Репозиторий приватный: на хабе нужен токен GitHub на чтение этого репо
-(fine-grained PAT → Repository access: `nexus-mcp` → Contents: Read-only).
+Одной командой на VPS под root (репо приватный — нужен fine-grained токен
+GitHub с доступом `nexus-mcp` → Contents: Read-only):
 
 ```bash
-git clone https://<PAT>@github.com/Rklm-it/nexus-mcp.git /root/nexus-mcp && cd /root/nexus-mcp
-bash install.sh --domain mcp.example.ru \
-  --brain-url https://panel.example.ru --brain-token <X-Admin-Token панели>
+T=<github_pat_…>
+curl -fsSL -H "Authorization: Bearer $T" -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/Rklm-it/nexus-mcp/contents/install.sh \
+  | bash -s -- --token "$T" --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN>
 ```
 
-Или одним скриптом: `bash install.sh --token <PAT> --domain …` — клонирует сам и не
-оставляет токен в `.git/config`.
-
-- `--domain` — A-запись на IP хаба. Коннектор claude.ai ходит только по https,
-  сертификат выпускает Caddy. Нужен свободный 80 порт.
-- Если 443 занят (например, xray на ноде), добавьте `--port 9443`.
-- `--no-caddy` — если TLS отдаёт ваш собственный прокси на `127.0.0.1:8765`.
+- адрес хаба по умолчанию — `<IP>.sslip.io`; свой домен — `--domain mcp.example.ru`;
+- порт сам уходит на 9443, если 443 занят (нода с xray); вручную — `--port`;
+- `--no-caddy` — если TLS отдаёт ваш собственный прокси на `127.0.0.1:8765`;
+- нужен свободный 80 порт: через него Caddy получает сертификат.
 
 Код встаёт в `/opt/nexus-mcp/app`. Рядом кладётся разреженный клон панели
 `/opt/nexus-mcp/vgx3d` (5 МБ): из него хаб берёт `xray_json.py`, тот же
-сборщик клиентских конфигов, что у подписки.
+сборщик клиентских конфигов, что у подписки. Пошагово, с проверками и разбором
+отказов — [DEPLOY.md](./DEPLOY.md).
 
 В конце установщик печатает:
 1. **адрес коннектора**: `https://<домен>/mcp/<секрет>`;
