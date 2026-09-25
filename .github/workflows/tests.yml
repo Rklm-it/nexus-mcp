@@ -23,7 +23,7 @@ jobs:
           fi
           git clone -q --depth 1 --filter=blob:none --sparse \
             "https://x-access-token:${VGX3D_TOKEN}@github.com/Rklm-it/vgx3d.git" ../vgx3d
-          git -C ../vgx3d sparse-checkout set brain/app cell
+          git -C ../vgx3d sparse-checkout set brain/app cell admin_app/android/app/src/main/kotlin/ru/nexusflow/admin/chat
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

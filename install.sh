@@ -14,11 +14,12 @@
 #
 # Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
-# [--no-caddy] [--no-xray] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
+# [--no-caddy] [--no-xray] [--no-chat] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
 #
 # Что делает: код в /opt/nexus-mcp/app, venv, SSH-ключ хаба, секреты,
 # /etc/nexus-mcp.env, systemd, xray для сквозной проверки, Caddy с
-# сертификатом Let's Encrypt для домена (нужен свободный 80 порт).
+# сертификатом Let's Encrypt для домена (нужен свободный 80 порт), чат с
+# Claude для приложения Nexus Admin (nexus-chat; вход в подписку — nexus-chat-login).
 # Репозиторий панели (vgx3d, приватный) хабу не нужен: сборщик конфигов
 # лежит копией в самом хабе, агент нода берёт с панели.
 # =============================================================================
@@ -42,7 +43,7 @@ trap 'exit 130' INT TERM
 # Без доступа к репо git должен отказать сразу, а не молча ждать логина.
 export GIT_TERMINAL_PROMPT=0
 
-DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1
+DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1; WITH_CHAT=1
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
 FOREGROUND=0; ARGS=("$@")
@@ -60,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --branch)      BRANCH="$2"; shift 2 ;;
         --no-caddy)    WITH_CADDY=0; shift ;;
         --no-xray)     WITH_XRAY=0; shift ;;
+        --no-chat)     WITH_CHAT=0; shift ;;
         --foreground)  FOREGROUND=1; shift ;;
         -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,23p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
         *) die "неизвестный параметр: $1" ;;
@@ -191,6 +193,18 @@ if ! timeout 900 "$BASE/venv/bin/pip" install "${PIP[@]}" -r "$APP/requirements.
         | { grep -E --line-buffered '^(Collecting|Successfully|ERROR)' || true; }; then
     die "pip install не прошёл (15 минут): доступ к pypi.org с этой машины?"
 fi
+if [ "$WITH_CHAT" = "1" ]; then
+    # Claude Agent SDK везёт Claude Code внутри колеса (~230 МБ): Node не нужен.
+    log "Чат с Claude для приложения: claude-agent-sdk"
+    if ! timeout 900 "$BASE/venv/bin/pip" install "${PIP[@]}" -r "$APP/requirements-chat.txt" 2>&1 \
+            | { grep -E --line-buffered '^(Collecting|Successfully|ERROR)' || true; }; then
+        warn "claude-agent-sdk не встал — хаб работает, чат нет. Повторите установку или --no-chat"
+        WITH_CHAT=0
+    elif ! "$BASE/venv/bin/python" -c "import claude_agent_sdk" 2>/dev/null; then
+        warn "claude-agent-sdk не импортируется (Python $(python3 -V 2>&1 | cut -d' ' -f2); нужен 3.10+) — чат выключен"
+        WITH_CHAT=0
+    fi
+fi
 
 # ── 3. SSH-ключ хаба ─────────────────────────────────────────────────────────
 if [ ! -f "$ETC/id_ed25519" ]; then
@@ -210,6 +224,11 @@ PROBE_TOKEN="$(envget NEXUS_PROBE_TOKENS)"; [ -n "$PROBE_TOKEN" ] || PROBE_TOKEN
 TEST_SUB="$(envget NEXUS_TEST_SUB_URL)"
 ALLOW="$(envget NEXUS_ALLOW_ACTIONS)"; [ -n "$ALLOW" ] || ALLOW=0
 BASIC="$(envget NEXUS_BRAIN_BASIC_AUTH)"
+CHAT_TOKEN="$(envget NEXUS_CHAT_TOKEN)"; [ -n "$CHAT_TOKEN" ] || CHAT_TOKEN="$(gen 48)"
+CHAT_MODEL="$(envget NEXUS_CHAT_MODEL)"
+CHAT_EFFORT="$(envget NEXUS_CHAT_EFFORT)"
+CHAT_AUDIT="$(envget NEXUS_CHAT_AUDIT_AT)"
+CHAT_TZ="$(envget NEXUS_CHAT_TZ)"; [ -n "$CHAT_TZ" ] || CHAT_TZ="Europe/Moscow"
 
 log "Пишу $ENVF"
 umask 077
@@ -231,6 +250,12 @@ NEXUS_MCP_HOST=127.0.0.1
 NEXUS_MCP_PORT=8765
 NEXUS_MCP_PUBLIC_HOSTS=$DOMAIN
 NEXUS_MCP_PUBLIC_PORT=$PORT
+NEXUS_CHAT_TOKEN=$CHAT_TOKEN
+NEXUS_CHAT_PORT=8766
+NEXUS_CHAT_MODEL=$CHAT_MODEL
+NEXUS_CHAT_EFFORT=$CHAT_EFFORT
+NEXUS_CHAT_AUDIT_AT=$CHAT_AUDIT
+NEXUS_CHAT_TZ=$CHAT_TZ
 EOF
 umask 022
 
@@ -282,6 +307,47 @@ else
     die "хаб не поднялся — лог выше"
 fi
 
+# ── Чат с Claude для приложения ──────────────────────────────────────────────
+if [ "$WITH_CHAT" = "1" ]; then
+    log "systemd-юнит nexus-chat"
+    mkdir -p "$STATE/chat/home" "$STATE/chat/work"
+    # Токен подписки — отдельным файлом: его читает только чат, не хаб.
+    [ -f "$ETC/claude.env" ] || { umask 077; : > "$ETC/claude.env"; umask 022; }
+    chmod 600 "$ETC/claude.env"
+    cat > /etc/systemd/system/nexus-chat.service <<EOF
+[Unit]
+Description=Nexus chat — Claude для приложения администратора
+After=network-online.target nexus-mcp.service
+Wants=nexus-mcp.service
+
+[Service]
+EnvironmentFile=$ENVF
+EnvironmentFile=-$ETC/claude.env
+Environment=HOME=$STATE/chat/home
+Environment=DISABLE_AUTOUPDATER=1
+Environment=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+WorkingDirectory=$APP
+ExecStart=$BASE/venv/bin/python -m nexus_chat
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable nexus-chat >/dev/null 2>&1
+    systemctl restart nexus-chat
+    sleep 3
+    if curl -fsS --connect-timeout 5 -m 8 http://127.0.0.1:8766/chat/healthz >/dev/null; then
+        log "чат отвечает на 127.0.0.1:8766"
+    else
+        journalctl -u nexus-chat -n 30 --no-pager >&2 || true
+        warn "чат не поднялся — лог выше; хаб работает без него"
+    fi
+else
+    systemctl disable --now nexus-chat >/dev/null 2>&1 || true
+fi
+
 # ── 7. Caddy (TLS) ───────────────────────────────────────────────────────────
 if [ "$WITH_CADDY" = "1" ]; then
     if port_busy 80; then
@@ -306,8 +372,15 @@ if [ "$WITH_CADDY" = "1" ]; then
     https_port $PORT
 }
 $DOMAIN:$PORT {
-    reverse_proxy 127.0.0.1:8765 {
-        flush_interval -1
+    handle /chat/* {
+        reverse_proxy 127.0.0.1:8766 {
+            flush_interval -1
+        }
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8765 {
+            flush_interval -1
+        }
     }
 }
 EOF
@@ -341,6 +414,7 @@ fi
 # ── Итог ─────────────────────────────────────────────────────────────────────
 install -m 0755 "$APP/bin/nexus-mcp-info" /usr/local/bin/nexus-mcp-info
 install -m 0755 "$APP/bin/nexus-mcp-panels" /usr/local/bin/nexus-mcp-panels
+install -m 0755 "$APP/bin/nexus-chat-login" /usr/local/bin/nexus-chat-login
 echo
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Хаб установлен${NC}"

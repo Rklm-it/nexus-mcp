@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Вход Claude на хабе в подписку владельца (Pro/Max) — для чата в приложении.
+#
+#   nexus-chat-login            — получить токен (ссылка → браузер → код) и сохранить
+#   nexus-chat-login <токен>    — сохранить готовый токен (из `claude setup-token` на ПК)
+#   nexus-chat-login --status   — вошёл ли чат и отвечает ли Claude
+#   nexus-chat-login --logout   — стереть токен
+#
+# Токен живёт в /etc/nexus-mcp/claude.env (600) и читается только сервисом
+# nexus-chat, не хабом.
+set -uo pipefail
+ETC=/etc/nexus-mcp
+TOKF="$ETC/claude.env"
+BASE=/opt/nexus-mcp
+HOMEDIR=/var/lib/nexus-mcp/chat/home
+
+die() { echo "✗ $*" >&2; exit 1; }
+[ "$(id -u)" = "0" ] || die "нужен root"
+
+CLI="$("$BASE/venv/bin/python" -c 'import os, claude_agent_sdk as m; print(os.path.join(os.path.dirname(m.__file__), "_bundled", "claude"))' 2>/dev/null || true)"
+[ -n "$CLI" ] && [ -x "$CLI" ] || die "claude-agent-sdk не установлен — перезапустите установку хаба (без --no-chat)"
+mkdir -p "$HOMEDIR"
+
+check() {
+    # Живой запрос одним словом: единственный способ узнать, что токен
+    # принимают, а не только что он сохранён. Причина отказа — на экран.
+    local tok="$1" out
+    echo "… проверяю: короткий запрос к Claude"
+    out="$(cd "$HOMEDIR" && env -i PATH=/usr/bin:/bin HOME="$HOMEDIR" CLAUDE_CODE_OAUTH_TOKEN="$tok" \
+        DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+        timeout 120 "$CLI" -p "Ответь одним словом: работает" --max-turns 1 --tools "" 2>&1)"
+    local rc=$?
+    if [ $rc -eq 0 ] && [ -n "$out" ]; then
+        echo "✓ Claude ответил: $(echo "$out" | head -1)"
+        return 0
+    fi
+    echo "✗ Claude не ответил (код $rc):"
+    echo "$out" | tail -5 | sed 's/^/    /'
+    return 1
+}
+
+status() {
+    local h
+    h="$(curl -fsS --connect-timeout 3 -m 5 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
+    if [ -z "$h" ]; then
+        echo "✗ сервис nexus-chat не отвечает: systemctl status nexus-chat; journalctl -u nexus-chat -n 50"
+    elif echo "$h" | grep -q '"logged_in":true'; then
+        echo "✓ чат запущен, токен подписки задан"
+    else
+        echo "✗ чат запущен, но токена подписки нет: nexus-chat-login"
+    fi
+}
+
+save() {
+    local tok="$1"
+    case "$tok" in
+        sk-ant-*) ;;
+        *) die "это не похоже на токен Claude (ожидается sk-ant-…)" ;;
+    esac
+    check "$tok" || die "токен не сохранён: Claude его не принял (причина выше)"
+    umask 077
+    printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$tok" > "$TOKF"
+    chmod 600 "$TOKF"
+    systemctl restart nexus-chat
+    sleep 2
+    status
+}
+
+case "${1:-}" in
+    --status)
+        status
+        if grep -q '^CLAUDE_CODE_OAUTH_TOKEN=.' "$TOKF" 2>/dev/null; then
+            check "$(grep '^CLAUDE_CODE_OAUTH_TOKEN=' "$TOKF" | tail -1 | cut -d= -f2-)" || true
+        fi
+        exit 0 ;;
+    --logout)
+        : > "$TOKF"; systemctl restart nexus-chat; echo "✓ токен стёрт"; exit 0 ;;
+    -h|--help)
+        sed -n 2,11p "$0"; exit 0 ;;
+    "") ;;
+    *)  save "$1"; exit $? ;;
+esac
+
+# Ввод — только с терминала, проверка открытием (инвариант 27 vgx3d).
+exec 3</dev/tty 2>/dev/null || die "нет терминала: передайте токен аргументом — nexus-chat-login <токен>"
+cat <<'TXT'
+Вход в подписку Claude для чата приложения.
+
+Сейчас Claude Code покажет ссылку. Откройте её в браузере (можно на
+телефоне), войдите в свой аккаунт claude.ai, подтвердите и вставьте код
+обратно сюда. В конце он напечатает долгоживущий токен (sk-ant-oat01-…).
+TXT
+echo
+(cd "$HOMEDIR" && HOME="$HOMEDIR" DISABLE_AUTOUPDATER=1 "$CLI" setup-token <&3) || true
+echo
+printf 'Вставьте токен, который напечатал Claude Code (sk-ant-…): '
+read -r TOKEN <&3 || die "токен не введён"
+TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+[ -n "$TOKEN" ] || die "пустой токен"
+save "$TOKEN"

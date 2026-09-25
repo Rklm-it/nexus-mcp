@@ -48,4 +48,18 @@ if command -v nexus-mcp-panels >/dev/null 2>&1; then
     nexus-mcp-panels list | sed 's/^/     /'
 fi
 echo
-echo "Настройки: $ENVF → systemctl restart nexus-mcp"
+CHAT_TOKEN="$(envget NEXUS_CHAT_TOKEN)"
+if [ -n "$CHAT_TOKEN" ] && systemctl is-enabled nexus-chat >/dev/null 2>&1; then
+    echo "5) Чат с Claude в приложении Nexus Admin — «Claude» → «Подключить хаб», вставить строку:"
+    echo "     $HUB/chat#$CHAT_TOKEN"
+    H="$(curl -fsS --connect-timeout 3 -m 5 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
+    if [ -z "$H" ]; then
+        echo "   ✗ чат не отвечает: journalctl -u nexus-chat -n 50"
+    elif echo "$H" | grep -q '"logged_in":true'; then
+        echo "   ✓ Claude вошёл в подписку"
+    else
+        echo "   ✗ Claude не вошёл в подписку: выполните nexus-chat-login"
+    fi
+    echo
+fi
+echo "Настройки: $ENVF → systemctl restart nexus-mcp nexus-chat"
