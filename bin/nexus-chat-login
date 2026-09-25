@@ -21,6 +21,19 @@ CLI="$("$BASE/venv/bin/python" -c 'import os, claude_agent_sdk as m; print(os.pa
 [ -n "$CLI" ] && [ -x "$CLI" ] || die "claude-agent-sdk не установлен — перезапустите установку хаба (без --no-chat)"
 mkdir -p "$HOMEDIR"
 
+# Claude не обслуживает часть стран (в т.ч. РФ): с такого IP и вход, и ответы
+# получают 403 forbidden. Без этой проверки человек доходит до кода из браузера
+# и видит голое «OAuth error 403» — и ищет ошибку не там.
+region_check() {
+    local body
+    body="$(curl -s -m 15 --connect-timeout 10 -X POST https://api.anthropic.com/v1/messages \
+        -H 'content-type: application/json' -d '{}' 2>/dev/null || true)"
+    if echo "$body" | grep -q '"forbidden"'; then
+        die "Claude недоступен с этого сервера ($(curl -s -m 8 https://api.ipify.org 2>/dev/null || echo 'IP не узнал')): api.anthropic.com отвечает 403 forbidden — страна сервера не обслуживается. Чат нужно поднимать на сервере в стране, где Claude доступен (DEPLOY.md, шаг 8)."
+    fi
+    [ -n "$body" ] || echo "! api.anthropic.com не ответил за 15 с — проверьте сеть сервера" >&2
+}
+
 check() {
     # Живой запрос одним словом: единственный способ узнать, что токен
     # принимают, а не только что он сохранён. Причина отказа — на экран.
@@ -65,6 +78,11 @@ save() {
     sleep 2
     status
 }
+
+case "${1:-}" in
+    -h|--help|--logout) ;;
+    *) region_check ;;
+esac
 
 case "${1:-}" in
     --status)

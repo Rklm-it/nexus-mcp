@@ -55,6 +55,10 @@ if [ -n "$CHAT_TOKEN" ] && systemctl is-enabled nexus-chat >/dev/null 2>&1; then
     H="$(curl -fsS --connect-timeout 3 -m 5 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
     if [ -z "$H" ]; then
         echo "   ✗ чат не отвечает: journalctl -u nexus-chat -n 50"
+    elif curl -s -m 10 -X POST https://api.anthropic.com/v1/messages -H 'content-type: application/json' \
+            -d '{}' 2>/dev/null | grep -q '"forbidden"'; then
+        echo "   ✗ Claude недоступен с этого сервера (403 forbidden — страна не обслуживается):"
+        echo "     чат нужно поднимать на сервере в стране, где Claude доступен"
     elif echo "$H" | grep -q '"logged_in":true'; then
         echo "   ✓ Claude вошёл в подписку"
     else

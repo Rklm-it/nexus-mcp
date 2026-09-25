@@ -232,6 +232,13 @@ systemctl daemon-reload && systemctl enable --now nexus-probe
 «Разрешить». Встроенных инструментов Claude Code (шелл, файлы) в чате нет:
 на хабе лежит ключ ко всем нодам.
 
+⚠ **Сервер должен стоять в стране, где Claude доступен.** Anthropic не
+обслуживает часть стран, в т.ч. РФ: с такого IP и вход, и ответы получают
+`403 forbidden` («Request not allowed»). Проверка:
+`curl -s -X POST https://api.anthropic.com/v1/messages -d '{}'` — `forbidden`
+значит «не отсюда», `authentication_error` — сеть в порядке.
+`nexus-chat-login` проверяет это сам.
+
 **1. Войти в подписку** — один раз, на хабе:
 ```bash
 nexus-chat-login
