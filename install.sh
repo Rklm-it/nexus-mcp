@@ -14,7 +14,7 @@
 #
 # Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
-# [--no-caddy] [--no-xray]. Из скачанной копии: bash install.sh <те же флаги>.
+# [--no-caddy] [--no-xray] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
 #
 # Что делает: код в /opt/nexus-mcp/app, venv, SSH-ключ хаба, секреты,
 # /etc/nexus-mcp.env, systemd, xray для сквозной проверки, Caddy с
@@ -45,6 +45,8 @@ export GIT_TERMINAL_PROMPT=0
 DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
+FOREGROUND=0; ARGS=("$@")
+UNIT=nexus-mcp-install; LOG=/var/log/nexus-mcp-install.log
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --branch)      BRANCH="$2"; shift 2 ;;
         --no-caddy)    WITH_CADDY=0; shift ;;
         --no-xray)     WITH_XRAY=0; shift ;;
+        --foreground)  FOREGROUND=1; shift ;;
         -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,23p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
         *) die "неизвестный параметр: $1" ;;
     esac
@@ -65,15 +68,55 @@ done
 
 [ "$(id -u)" = "0" ] || die "нужен root"
 
+# ── Фоном: обрыв SSH не убивает установку ────────────────────────────────────
+# Установка идёт юнитом systemd, лог — в $LOG, здесь только показ лога.
+# Оборвалось SSH или нажали Ctrl+C — установка продолжается; та же команда
+# ещё раз снова показывает лог идущей установки, а не запускает вторую.
+if [ -z "${NEXUS_INSTALL_BG:-}" ] && [ "$FOREGROUND" = "0" ] && command -v systemd-run >/dev/null 2>&1; then
+    if [ "$(systemctl show -p SubState --value "$UNIT" 2>/dev/null)" = "running" ]; then
+        warn "Установка уже идёт — показываю её лог"
+    else
+        SELF=""
+        [ -f "${BASH_SOURCE[0]:-}" ] && SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+        if [ -z "$SELF" ]; then
+            # Под `bash <(curl …)` файла скрипта нет — берём копию той же ветки.
+            SELF=/root/nexus-mcp-install.sh
+            timeout 90 curl -fsSL --connect-timeout 15 -o "$SELF" \
+                "https://raw.githubusercontent.com/Rklm-it/nexus-mcp/$BRANCH/install.sh" \
+                || die "не скачал install.sh с GitHub — запустите с --foreground"
+        fi
+        systemctl stop "$UNIT" >/dev/null 2>&1 || true
+        systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+        : > "$LOG"; chmod 600 "$LOG"
+        BG_ENV=(--setenv=NEXUS_INSTALL_BG=1 --setenv=HOME=/root)
+        [ -n "$GH_TOKEN" ] && BG_ENV+=("--setenv=GH_TOKEN=$GH_TOKEN")
+        systemd-run --quiet --unit "$UNIT" --description "Nexus MCP: установка" \
+            -p RemainAfterExit=yes -p "StandardOutput=append:$LOG" -p "StandardError=append:$LOG" \
+            "${BG_ENV[@]}" /bin/bash "$SELF" "${ARGS[@]}" \
+            || die "systemd-run не запустил установку — запустите с --foreground"
+    fi
+    echo -e "${CYAN}Установка идёт в фоне. Обрыв SSH ей не мешает; лог: tail -f $LOG${NC}"
+    tail -n +1 -f "$LOG" & TAILPID=$!
+    trap 'kill $TAILPID 2>/dev/null; echo; warn "Установка продолжается в фоне. Лог: tail -f $LOG"; FINISHED=1; exit 0' INT TERM HUP
+    while [ "$(systemctl show -p SubState --value "$UNIT" 2>/dev/null)" = "running" ]; do sleep 2; done
+    sleep 1; kill $TAILPID 2>/dev/null || true; wait $TAILPID 2>/dev/null || true
+    RC="$(systemctl show -p ExecMainStatus --value "$UNIT" 2>/dev/null || echo 1)"
+    FINISHED=1
+    exit "${RC:-1}"
+fi
+
 port_busy() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q . || return 1; }
 envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 
 # ── 1. Пакеты ────────────────────────────────────────────────────────────────
 log "Пакеты: git, python3-venv, openssh-client, curl"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq >/dev/null 2>&1 || warn "apt-get update не прошёл — пробуем с тем, что есть"
-apt-get install -y -qq git python3 python3-venv openssh-client curl unzip ca-certificates >/dev/null \
-    || die "apt-get install не прошёл"
+# Таймауты: без них apt молча ждёт зеркало или чужую блокировку dpkg
+# (unattended-upgrades на свежей машине) — вывод скрыт, выглядит как зависание.
+APT=(-o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+timeout 300 apt-get "${APT[@]}" update -qq >/dev/null 2>&1 || warn "apt-get update не прошёл — пробуем с тем, что есть"
+timeout 900 apt-get "${APT[@]}" install -y -qq git python3 python3-venv openssh-client curl unzip ca-certificates >/dev/null \
+    || die "apt-get install не прошёл (или занят dpkg: ps aux | grep -E 'apt|dpkg')"
 
 # ── Адрес и порт хаба ────────────────────────────────────────────────────────
 # Повторный запуск (обновление) берёт прежние — иначе сменился бы URL коннектора.
@@ -117,7 +160,7 @@ if [ -n "$SELF_DIR" ] && [ -d "$SELF_DIR/nexus_mcp" ] && [ "$SELF_DIR" != "$APP"
     rm -rf "$APP" && cp -a "$SELF_DIR" "$APP"
 elif [ -d "$APP/.git" ]; then
     log "Обновляю хаб"
-    git -C "$APP" fetch -q --depth 1 "$AUTH_URL" "$BRANCH" && git -C "$APP" reset -q --hard FETCH_HEAD \
+    timeout 300 git -C "$APP" fetch -q --depth 1 "$AUTH_URL" "$BRANCH" && git -C "$APP" reset -q --hard FETCH_HEAD \
         || die "git fetch не прошёл: доступ к GitHub с этой машины? (приватный форк — --token)"
 else
     log "Клонирую хаб"
@@ -136,14 +179,18 @@ log "venv и зависимости"
 # (нет python3.X-venv) оставляет каталог без pip — такой пересоздаём.
 if [ ! -x "$BASE/venv/bin/pip" ]; then
     PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-    apt-get install -y -qq "python${PYV}-venv" >/dev/null 2>&1 || true
+    timeout 600 apt-get "${APT[@]}" install -y -qq "python${PYV}-venv" >/dev/null 2>&1 || true
     rm -rf "$BASE/venv"
     python3 -m venv "$BASE/venv" \
         || die "python3 -m venv не прошёл — поставьте пакет: apt-get install python${PYV}-venv"
 fi
-"$BASE/venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
-timeout 600 "$BASE/venv/bin/pip" install -q -r "$APP/requirements.txt" \
-    || die "pip install не прошёл: доступ к pypi.org с этой машины?"
+PIP=(--timeout 30 --retries 3 --progress-bar off --disable-pip-version-check)
+timeout 180 "$BASE/venv/bin/pip" install -q "${PIP[@]}" --upgrade pip >/dev/null 2>&1 || true
+# Без -q: видно, какой пакет качается, — иначе долгая загрузка неотличима от зависания.
+if ! timeout 900 "$BASE/venv/bin/pip" install "${PIP[@]}" -r "$APP/requirements.txt" 2>&1 \
+        | { grep -E --line-buffered '^(Collecting|Successfully|ERROR)' || true; }; then
+    die "pip install не прошёл (15 минут): доступ к pypi.org с этой машины?"
+fi
 
 # ── 3. SSH-ключ хаба ─────────────────────────────────────────────────────────
 if [ ! -f "$ETC/id_ed25519" ]; then
