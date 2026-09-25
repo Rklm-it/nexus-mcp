@@ -344,6 +344,7 @@ WorkingDirectory=$APP
 ExecStart=$BASE/venv/bin/python -m nexus_chat
 Restart=always
 RestartSec=3
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

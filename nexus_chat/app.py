@@ -204,8 +204,11 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     s = config.settings
+    # Приложение держит long-poll до 25 с и тут же открывает следующий: без
+    # потолка остановка ждала бы их вечно, и `systemctl restart` висел до
+    # SIGKILL через 90 с. Оборванный опрос приложение просто повторит.
     uvicorn.run(build_app(), host=s.host, port=s.port, proxy_headers=True,
-                forwarded_allow_ips="127.0.0.1", log_level="info")
+                forwarded_allow_ips="127.0.0.1", log_level="info", timeout_graceful_shutdown=3)
 
 
 if __name__ == "__main__":
