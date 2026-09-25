@@ -27,25 +27,17 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 Проверяйте на одной и той же ноде: быстро открывается одна, а режется другая.
 
-## Шаг 1. Два токена
+## Шаг 1. Токен панели
 
-- **GitHub** (репо приватный): GitHub → Settings → Developer settings →
-  Personal access tokens → **Fine-grained tokens** → Generate new token →
-  Repository access: **Only select repositories** → `nexus-mcp` →
-  Permissions → **Contents: Read-only**. Скопируйте `github_pat_…`.
-- **Панели**: на сервере панели `grep ^VPN_ADMIN_TOKEN /opt/vgx3d/.env`.
+На сервере панели: `grep ^VPN_ADMIN_TOKEN /opt/vgx3d/.env`.
 
 ## Шаг 2. Установка — одна команда
 
 На VPS под root:
 
 ```bash
-T=<github_pat_…>
-curl -fsSL -H "Authorization: Bearer $T" -H "Accept: application/vnd.github.raw" \
-  https://api.github.com/repos/Rklm-it/nexus-mcp/contents/install.sh \
-  | bash -s -- --token "$T" \
-      --brain-url https://<адрес вашей панели> \
-      --brain-token <VPN_ADMIN_TOKEN>
+bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
+  --brain-url https://<адрес вашей панели> --brain-token <VPN_ADMIN_TOKEN>
 ```
 
 Сам установщик:

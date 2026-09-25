@@ -42,14 +42,11 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 ## Установка
 
-Одной командой на VPS под root (репо приватный — нужен fine-grained токен
-GitHub с доступом `nexus-mcp` → Contents: Read-only):
+Одной командой на VPS под root:
 
 ```bash
-T=<github_pat_…>
-curl -fsSL -H "Authorization: Bearer $T" -H "Accept: application/vnd.github.raw" \
-  https://api.github.com/repos/Rklm-it/nexus-mcp/contents/install.sh \
-  | bash -s -- --token "$T" --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN>
+bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
+  --brain-url https://<адрес вашей панели> --brain-token <VPN_ADMIN_TOKEN>
 ```
 
 - адрес хаба по умолчанию — `<IP>.sslip.io`; свой домен — `--domain mcp.example.ru`;

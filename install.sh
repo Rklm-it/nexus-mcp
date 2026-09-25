@@ -6,11 +6,10 @@
 # режется, разбор 22.09.2026). Проверка перед установкой — README, раздел
 # «Куда ставить».
 #
-# Одной командой (репозиторий приватный — нужен токен GitHub на чтение):
-#   T=<github_pat_…>
-#   curl -fsSL -H "Authorization: Bearer $T" -H "Accept: application/vnd.github.raw" \
-#     https://api.github.com/repos/Rklm-it/nexus-mcp/contents/install.sh \
-#     | bash -s -- --token "$T" --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN>
+# Одной командой на VPS под root:
+#   bash <(curl -fsSL --connect-timeout 15 \
+#     https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
+#     --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN>
 #
 # Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
@@ -98,9 +97,9 @@ mkdir -p "$BASE" "$ETC" "$STATE"
 chmod 700 "$ETC" "$STATE"
 APP="$BASE/app"
 
-# Репозиторий хаба приватный. Три пути: запуск из уже скачанной копии (скрипт
-# лежит рядом с nexus_mcp/), клон с токеном (--token, fine-grained PAT на
-# чтение этого репо) или обновление уже стоящего.
+# Три пути: запуск из уже скачанной копии (скрипт лежит рядом с nexus_mcp/),
+# обновление уже стоящего или свежий клон. --token нужен только для
+# приватного форка.
 # Под `curl | bash` BASH_SOURCE пуст — тогда копии рядом нет, клонируем.
 SELF_DIR=""
 if [ -f "${BASH_SOURCE[0]:-}" ]; then
@@ -116,11 +115,11 @@ if [ -n "$SELF_DIR" ] && [ -d "$SELF_DIR/nexus_mcp" ] && [ "$SELF_DIR" != "$APP"
 elif [ -d "$APP/.git" ]; then
     log "Обновляю хаб"
     git -C "$APP" fetch -q --depth 1 "$AUTH_URL" "$BRANCH" && git -C "$APP" reset -q --hard FETCH_HEAD \
-        || die "git fetch не прошёл: репозиторий приватный — нужен --token"
+        || die "git fetch не прошёл: доступ к GitHub с этой машины? (приватный форк — --token)"
 else
     log "Клонирую хаб"
     timeout 300 git clone -q --depth 1 -b "$BRANCH" "$AUTH_URL" "$APP" \
-        || die "git clone не прошёл: репозиторий приватный — нужен --token <PAT>, либо скачайте код и запустите install.sh из него"
+        || die "git clone не прошёл (5 минут): доступ к GitHub с этой машины? (приватный форк — --token)"
     # Токен не должен остаться в .git/config.
     git -C "$APP" remote set-url origin "$REPO_URL"
 fi
