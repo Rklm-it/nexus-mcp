@@ -109,6 +109,15 @@ if [ -z "${NEXUS_INSTALL_BG:-}" ] && [ "$FOREGROUND" = "0" ] && command -v syste
 fi
 
 port_busy() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q . || return 1; }
+# Порт держит НАШ Caddy (nexus-mcp-caddy) — это обновление хаба, а не чужой
+# сервис: Caddy перезапустится с новым конфигом. Сверка по PID, не по имени:
+# Caddy панели на той же машине — тоже «caddy», но наш на его порт не встанет.
+own_caddy_port() {
+    local pid
+    pid="$(systemctl show -p MainPID --value nexus-mcp-caddy 2>/dev/null || true)"
+    [ -n "$pid" ] && [ "$pid" != "0" ] || return 1
+    ss -ltnpH "sport = :$1" 2>/dev/null | grep -q "pid=$pid," || return 1
+}
 envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 
 # ── 1. Пакеты ────────────────────────────────────────────────────────────────
@@ -355,7 +364,7 @@ fi
 
 # ── 7. Caddy (TLS) ───────────────────────────────────────────────────────────
 if [ "$WITH_CADDY" = "1" ]; then
-    if port_busy 80; then
+    if port_busy 80 && ! own_caddy_port 80; then
         die "порт 80 занят ($(ss -ltnpH 'sport = :80' | head -1)) — Let's Encrypt не выдаст сертификат. Освободите 80 или поставьте --no-caddy и отдайте TLS своим прокси на 127.0.0.1:8765."
     fi
     if port_busy "$PORT" && ! ss -ltnpH "sport = :$PORT" | grep -q caddy; then
