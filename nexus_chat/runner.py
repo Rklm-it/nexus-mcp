@@ -38,6 +38,25 @@ PAID_TOOLS = ("sim_probe", "sim_vless", "sim_geo")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
+def panel_names() -> list[str]:
+    """Панели хаба — те же, что видит Claude в panels_list."""
+    from nexus_mcp import panels
+
+    try:
+        return [p["name"] for p in panels.all_panels()]
+    except Exception:  # noqa: BLE001 — битый panels.json не должен ронять чат
+        return []
+
+
+def with_panel(text: str, panel: str) -> str:
+    """Выбранная в приложении панель — указанием для Claude перед вопросом."""
+    if not panel:
+        return text
+    return (f"[Выбрана панель «{panel}»: работай с ней — panel=\"{panel}\" у инструментов панели; "
+            f"при нескольких панелях её ноды называются «{panel}/имя». Другие панели не трогай, "
+            f"если вопрос прямо не про них.]\n\n{text}")
+
+
 def short_tool(name: str) -> str:
     return name[len(MCP_PREFIX):] if name.startswith(MCP_PREFIX) else name
 
@@ -170,10 +189,15 @@ class Runner:
         return [cid for cid, lv in self._live.items() if lv.running]
 
     async def send(self, chat_id: str, text: str, *, fresh: bool = False,
-                   notice: str = "") -> None:
+                   notice: str = "", panel: str = "") -> None:
         text = (text or "").strip()
         if not text:
             raise StoreError("пустое сообщение")
+        panel = (panel or "").strip()
+        if panel:
+            names = panel_names()
+            if panel not in names:
+                raise StoreError(f"на хабе нет панели «{panel}». Есть: {', '.join(names) or 'ни одной'}")
         chat = self.store.get_chat(chat_id)
         lv = self.live(chat_id)
         if lv.running:
@@ -185,10 +209,11 @@ class Runner:
         else:
             if chat["title"] == "Новый диалог":
                 self.store.rename_chat(chat_id, text.splitlines()[0][:48])
-            await self.emit(chat_id, "user", {"text": text})
+            await self.emit(chat_id, "user", {"text": text, **({"panel": panel} if panel else {})})
         lv.running, lv.partial, lv.activity = True, "", "думает"
         await self._notify(chat_id)
-        self._tasks[chat_id] = asyncio.create_task(self._turn(chat_id, text, fresh))
+        prompt = with_panel(text, panel)
+        self._tasks[chat_id] = asyncio.create_task(self._turn(chat_id, prompt, fresh))
 
     async def _turn(self, chat_id: str, text: str, fresh: bool) -> None:
         lv = self.live(chat_id)
@@ -315,8 +340,19 @@ class Runner:
             await self._notify(chat_id)
             return
         if kind == "SystemMessage":
-            if msg.subtype == "init" and (msg.data or {}).get("session_id"):
-                self.store.set_session(chat_id, msg.data["session_id"])
+            data = msg.data or {}
+            if msg.subtype == "init" and data.get("session_id"):
+                self.store.set_session(chat_id, data["session_id"])
+            if msg.subtype == "init" and isinstance(data.get("tools"), list):
+                # Без инструментов хаба Claude отвечает догадками — сказать
+                # об этом сразу и с причиной, а не ждать «No such tool».
+                if not any(str(t).startswith(MCP_PREFIX) for t in data["tools"]):
+                    st = [f"{m.get('name')}: {m.get('status')}" for m in data.get("mcp_servers") or []
+                          if isinstance(m, dict)]
+                    await self.emit(chat_id, "error", {
+                        "text": "Claude не получил инструменты хаба" +
+                                (f" ({'; '.join(st)})" if st else "") +
+                                " — ответ будет без проверок. На хабе: journalctl -u nexus-chat -n 50"})
             return
         if kind == "RateLimitEvent":
             info = msg.rate_limit_info
@@ -491,6 +527,11 @@ def _sdk_client(opts: dict):
         can_use_tool=opts["can_use_tool"],
         include_partial_messages=True,
         setting_sources=[],            # чужие settings.json и CLAUDE.md сюда не попадают
+        # Поиск инструментов Claude Code прячет MCP-инструменты за ToolSearch и
+        # подгружает по запросу — а встроенных инструментов (и ToolSearch с ними)
+        # у чата нет. На официальном API он включён по умолчанию: модель видела
+        # только имена и звала «panels_list» → «No such tool available».
+        env={"ENABLE_TOOL_SEARCH": "false"},
         stderr=_stderr,
     )
     return ClaudeSDKClient(options)

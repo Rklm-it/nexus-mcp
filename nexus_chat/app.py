@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from nexus_chat import config
-from nexus_chat.runner import Runner
+from nexus_chat.runner import Runner, panel_names
 from nexus_chat.store import Store, StoreError
 
 logger = logging.getLogger("nexus_chat")
@@ -90,6 +90,7 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
     async def state(request: Request):
         return JSONResponse({
             "sim": await sim_state(),
+            "panels": panel_names(),
             "ok": True, "api": API_VERSION,
             "logged_in": s.logged_in,
             "model": s.model or "", "effort": s.effort or "",
@@ -141,7 +142,7 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
     async def send(request: Request):
         cid = request.path_params["cid"]
         body = await _body(request)
-        await runner.send(cid, str(body.get("text") or ""))
+        await runner.send(cid, str(body.get("text") or ""), panel=str(body.get("panel") or ""))
         return JSONResponse({"ok": True}, status_code=202)
 
     async def stop(request: Request):

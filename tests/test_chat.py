@@ -503,3 +503,65 @@ def test_paid_sim_check_needs_button_only_for_the_run(chat_settings):
         assert not ok
 
     asyncio.run(go())
+
+
+def test_start_without_hub_tools_is_reported(chat_settings):
+    """Claude стартовал без инструментов хаба — в ленте причина, а не
+    молчаливые догадки модели («No such tool available: panels_list»)."""
+    async def script(opts, prompt):
+        yield SystemMessage("init", {"session_id": "s1", "tools": ["DeferredToolPlaceholder"],
+                                     "mcp_servers": [{"name": "nexus", "status": "failed"}]})
+        yield AssistantMessage([TextBlock("…")])
+        yield ResultMessage()
+
+    async def go():
+        _, client, _ = _setup(chat_settings, script)
+        cid = (await client.post("/chat/api/chats", json={}, headers=AUTH)).json()["chat"]["id"]
+        await client.post(f"/chat/api/chats/{cid}/send", json={"text": "?"}, headers=AUTH)
+        events = await _wait_done(client, cid)
+        err = [e["data"]["text"] for e in events if e["type"] == "error"]
+        assert err and "nexus: failed" in err[0]
+
+    asyncio.run(go())
+
+
+def test_sdk_options_turn_off_tool_search():
+    """Встроенных инструментов в чате нет, значит и ToolSearch нет: MCP-инструменты
+    обязаны приходить модели сразу, а не «отложенными»."""
+    pytest.importorskip("claude_agent_sdk")
+    from nexus_chat.runner import _sdk_client
+
+    c = _sdk_client({"mcp_servers": {}, "system_prompt": "", "resume": None, "cwd": "/tmp",
+                     "model": None, "effort": None, "can_use_tool": None})
+    assert c.options.env.get("ENABLE_TOOL_SEARCH") == "false"
+    assert c.options.tools == []
+
+
+def test_selected_panel_reaches_claude(chat_settings, hub_settings, tmp_path):
+    """Панель, выбранная в приложении, доходит до Claude указанием и видна в
+    ленте; чужое имя — отказ со списком, а не молчаливый разбор «не той»."""
+    import json as _json
+
+    hub_settings.panels_file = tmp_path / "panels.json"
+    hub_settings.panels_file.write_text(_json.dumps({"panels": [
+        {"name": "main", "url": "https://a.example", "token": "t1"},
+        {"name": "shop2", "url": "https://b.example", "token": "t2"}]}))
+
+    async def script(opts, prompt):
+        yield ResultMessage()
+
+    async def go():
+        _, client, calls = _setup(chat_settings, script)
+        st = (await client.get("/chat/api/state", headers=AUTH)).json()
+        assert st["panels"] == ["main", "shop2"]
+        cid = (await client.post("/chat/api/chats", json={}, headers=AUTH)).json()["chat"]["id"]
+        r = await client.post(f"/chat/api/chats/{cid}/send", json={"text": "что с нодами?", "panel": "shop2"},
+                              headers=AUTH)
+        assert r.status_code == 202
+        events = await _wait_done(client, cid)
+        assert events[0]["data"] == {"text": "что с нодами?", "panel": "shop2"}
+        assert 'panel="shop2"' in calls[0]["prompt"] and calls[0]["prompt"].endswith("что с нодами?")
+        r = await client.post(f"/chat/api/chats/{cid}/send", json={"text": "?", "panel": "nope"}, headers=AUTH)
+        assert r.status_code == 400 and "main, shop2" in r.json()["detail"]
+
+    asyncio.run(go())
