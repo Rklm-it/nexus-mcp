@@ -491,7 +491,7 @@ def test_playbook_keys_are_real_finding_codes():
     from nexus_mcp import playbook
 
     src = (Path(__file__).resolve().parents[1] / "nexus_mcp" / "diagnose.py").read_text(encoding="utf-8")
-    missing = [k for k in playbook.PLAYBOOK if k != "docker_pull_hangs" and f'"{k}"' not in src]
+    missing = [k for k in playbook.PLAYBOOK if k not in playbook.USER_SYMPTOMS and f'"{k}"' not in src]
     assert not missing, missing
 
 
