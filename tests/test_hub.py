@@ -635,3 +635,47 @@ def test_cf_links_go_to_e2e(hub_settings, monkeypatch):
     r = asyncio.run(diagnose.diagnose(node, with_ssh=False))
     assert tested == [CF_LINK]
     assert "links_note" not in r
+
+
+# ── SSH через промежуточную ноду (ssh_via) ─────────────────────────────────
+
+def test_ssh_via_node_name_resolves_to_its_address(hub_settings):
+    by_panel = {"main": [
+        {"id": "1", "name": "ger", "ip_address": "111.235.151.78"},
+        {"id": "2", "name": "eng", "ip_address": "45.43.75.64"},
+    ]}
+    nodes = {n["name"]: n for n in inventory.merge(by_panel, {"nodes": [
+        {"name": "eng", "ssh_via": "ger"}, {"name": "ger", "ssh_port": 2222}]})}
+    assert nodes["eng"]["ssh_via"] == "root@111.235.151.78:2222"
+    assert "ssh_via" not in nodes["ger"]
+
+
+@pytest.mark.parametrize("via,ok", [
+    ("root@111.235.151.78:22", True), ("111.235.151.78", True), ("admin@jump.example.com", True),
+    ("x; rm -rf /", False), ("root@h -oProxyCommand=sh", False), ("$(id)@h", False), ("", False),
+])
+def test_ssh_via_is_validated(via, ok):
+    assert (ssh.parse_via(via) is not None) is ok
+
+
+def test_ssh_argv_with_via_is_valid_for_ssh(hub_settings):
+    """ProxyCommand собирается так, что настоящий ssh его разбирает: тот же
+    ключ, тот же known_hosts, прыжок через -W."""
+    import shutil
+
+    node = {"name": "eng", "ssh_host": "45.43.75.64", "ssh_via": "root@111.235.151.78:2222"}
+    argv = ssh.ssh_argv(node)
+    proxy = next(a for a in argv if a.startswith("ProxyCommand="))
+    assert "-W %h:%p root@111.235.151.78" in proxy and "-p 2222" in proxy
+    if shutil.which("ssh"):
+        cfg = subprocess.run(["ssh", "-G", *argv[1:-2], argv[-2]], capture_output=True, text=True)
+        assert cfg.returncode == 0, cfg.stderr
+        assert "proxycommand ssh -i" in cfg.stdout
+
+
+def test_bad_via_is_a_reason_not_a_crash(hub_settings, tmp_path):
+    key = tmp_path / "k"
+    key.write_text("x")
+    hub_settings.ssh_key = str(key)
+    r = asyncio.run(ssh.run_script({"name": "n", "ssh_host": "1.2.3.4", "ssh_via": "a b"}, "true"))
+    assert r.ok is False and r.failure == "bad_via"
