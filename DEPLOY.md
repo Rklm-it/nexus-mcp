@@ -31,8 +31,10 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 На сервере панели:
 ```bash
-grep -E '^(VPN_ADMIN_TOKEN|VPN_PANEL_GATE_SECRET)=' /opt/vgx3d/.env
+grep -E '^(VPN_ADMIN_TOKEN|VPN_PANEL_GATE_SECRET)=' /opt/nexus/.env
 ```
+Каталог панели: `/opt/nexus` у клиентской установки (лицензия), `/opt/vgx3d` у
+мастера — дальше везде подставляйте свой.
 `VPN_ADMIN_TOKEN` — токен админ-API. `VPN_PANEL_GATE_SECRET` пропускает хаб мимо
 пароля Caddy (Basic Auth), которым закрыт `/api` панели. Пароль Basic Auth
 вспоминать не нужно.
