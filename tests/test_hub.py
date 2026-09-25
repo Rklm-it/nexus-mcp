@@ -517,4 +517,121 @@ def test_diagnose_attaches_next_steps(hub_settings, monkeypatch):
     node = {"name": "n", "ip": "203.0.113.7", "ssh_host": "203.0.113.7", "source": "file"}
     r = asyncio.run(diagnose.diagnose(node, with_e2e=False, with_ssh=False))
     assert r["findings"][0]["code"] == "payload_filtered"
-    assert "RU-вход" in r["next_steps"]["payload_filtered"][0]["do"]
+    steps = r["next_steps"]["payload_filtered"]
+    # Первым — свой инструмент панели, затем чужой опыт.
+    assert "Включить Cloudflare" in steps[0]["do"]
+    assert any("RU-вход" in s["do"] for s in steps)
+
+
+# ── Cloudflare-фронт ───────────────────────────────────────────────────────
+
+CF = {"enabled": True, "hostname": "nl1.example.com", "port": 2087, "cf_only": False}
+CF_LINK = ("vless://11111111-2222-3333-4444-555555555555@nl1.example.com:2087?type=ws&security=tls"
+           "&sni=nl1.example.com&host=nl1.example.com&path=%2Fx#NL%20%7C%20VLESS%20WS%20%C2%B7%20CF")
+
+
+def _panel_node(hub_settings):
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    return {"id": "00383c6f-9853-484b-8f16-d6023c734291", "name": "nl", "ip": "203.0.113.7",
+            "ssh_host": "203.0.113.7", "source": "panel", "panel": "main"}
+
+
+def _blocked_ip_probes(monkeypatch, cf_ok: bool):
+    from nexus_mcp import probes as probes_mod
+
+    seen = []
+
+    async def fake_run(probe, kind, args, timeout=40.0):
+        seen.append((kind, args))
+        if args.get("sni"):
+            return {"ok": True} if cf_ok else {"ok": False, "stage": "handshake", "error": "timeout"}
+        return {"ok": False, "stage": "connect", "error": "timeout"}
+
+    monkeypatch.setattr(probes_mod.registry, "run", fake_run)
+    return seen
+
+
+def test_cf_front_checked_from_every_probe(hub_settings, monkeypatch):
+    """IP режется, фронт включён — адрес фронта проверяется отдельно (TLS с SNI)."""
+    node = _panel_node(hub_settings)
+
+    async def status(path, panel, timeout=15.0):
+        assert path == f"/api/v1/admin/cloudflare/servers/{node['id']}"
+        return {**CF, "inbound_id": "x"}
+
+    monkeypatch.setattr(inventory, "brain_get", status)
+    seen = _blocked_ip_probes(monkeypatch, cf_ok=True)
+    r = asyncio.run(diagnose.diagnose(node, with_e2e=False, with_ssh=False))
+    assert r["cf_front"] == CF
+    assert ("tls", {"host": "nl1.example.com", "port": 2087, "sni": "nl1.example.com"}) in seen
+    codes = _codes(r["findings"])
+    assert "ip_unreachable" in codes and "cf_reachable" in codes and "cf_front_off" not in codes
+    assert r["reach"]["hub"]["cf_tls"]["target"] == "nl1.example.com:2087"
+
+
+def test_cf_blocked_is_critical(hub_settings, monkeypatch):
+    node = _panel_node(hub_settings)
+
+    async def status(path, panel, timeout=15.0):
+        return CF
+
+    monkeypatch.setattr(inventory, "brain_get", status)
+    _blocked_ip_probes(monkeypatch, cf_ok=False)
+    r = asyncio.run(diagnose.diagnose(node, with_e2e=False, with_ssh=False))
+    assert "cf_blocked" in _codes(r["findings"])
+    assert "cf_blocked" in r["next_steps"]
+
+
+def test_cf_front_off_suggested_when_ip_blocked(hub_settings, monkeypatch):
+    node = _panel_node(hub_settings)
+
+    async def status(path, panel, timeout=15.0):
+        return {"enabled": False, "cf_only": False}
+
+    monkeypatch.setattr(inventory, "brain_get", status)
+    seen = _blocked_ip_probes(monkeypatch, cf_ok=True)
+    r = asyncio.run(diagnose.diagnose(node, with_e2e=False, with_ssh=False))
+    assert "cf_front_off" in _codes(r["findings"])
+    assert not [a for k, a in seen if a.get("sni")]
+
+
+def test_cf_status_error_does_not_break_diagnose(hub_settings, monkeypatch):
+    """Старая панель без ручки (404) — разбор идёт дальше, фронт «неизвестен»."""
+    node = _panel_node(hub_settings)
+
+    async def status(path, panel, timeout=15.0):
+        raise inventory.InventoryError("панель main ответила 404")
+
+    monkeypatch.setattr(inventory, "brain_get", status)
+    _blocked_ip_probes(monkeypatch, cf_ok=True)
+    r = asyncio.run(diagnose.diagnose(node, with_e2e=False, with_ssh=False))
+    assert r["cf_front"]["enabled"] is None
+    assert "cf_front_off" not in _codes(r["findings"])
+
+
+def test_cf_links_go_to_e2e(hub_settings, monkeypatch):
+    """Строка «· CF» ведёт на имя фронта, а не на IP — links_for_node её не
+    находит; разбор добавляет её в сквозную проверку сам."""
+    node = _panel_node(hub_settings)
+    hub_settings.test_sub_url = "https://p.ru/sub/x"
+
+    async def status(path, panel, timeout=15.0):
+        return CF
+
+    async def fetch():
+        return [VLESS.replace("203.0.113.7", "198.51.100.9"), CF_LINK]
+
+    monkeypatch.setattr(inventory, "brain_get", status)
+    monkeypatch.setattr(links, "fetch_links", fetch)
+    _blocked_ip_probes(monkeypatch, cf_ok=True)
+    tested = []
+
+    async def fake_e2e(probe, uri):
+        tested.append(uri)
+        return {"link": uri, "ok": True}
+
+    monkeypatch.setattr(diagnose, "e2e", fake_e2e)
+    r = asyncio.run(diagnose.diagnose(node, with_ssh=False))
+    assert tested == [CF_LINK]
+    assert "links_note" not in r

@@ -182,6 +182,7 @@ ROUTES = [
     ("brain/app/api/v1/admin/payments.py", "", "/payments"),
     ("brain/app/api/v1/admin/resync.py", "/resync", "/run"),
     ("brain/app/api/v1/servers.py", "", "/{server_id}/reachability"),
+    ("brain/app/api/v1/admin/cloudflare.py", "/cloudflare", "/servers/{server_id}"),
 ]
 
 
@@ -192,6 +193,21 @@ def test_panel_routes_exist(vgx3d, fname, prefix, route):
         assert f'prefix="{prefix}"' in text, f"{fname}: префикс {prefix} сменился"
     assert re.search(r'@router\.(get|post)\(\s*"' + re.escape(route) + '"', text), \
         f"{fname}: нет ручки {route}"
+
+
+def test_cf_front_contract_matches_panel(vgx3d):
+    """Хаб читает у панели состояние Cloudflare-фронта и ищет строки «· CF»
+    по имени фронта. Поля ответа и адрес ссылки — из кода vgx3d."""
+    from nexus_mcp import diagnose
+
+    front = (vgx3d / "brain/app/services/cf_front.py").read_text(encoding="utf-8")
+    status = front[front.index("async def status("):]
+    for field in diagnose.CF_FIELDS:
+        assert f'"{field}"' in status, field
+    assert '"hostname": cfg.get("host")' in status
+    sub = (vgx3d / "brain/app/api/v1/subscription.py").read_text(encoding="utf-8")
+    ws = sub[sub.index("def _build_vless_ws("):]
+    assert "address = host if host else srv.ip_address" in ws
 
 
 def test_restart_services_match_panel(vgx3d):

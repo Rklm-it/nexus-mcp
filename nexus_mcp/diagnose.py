@@ -6,6 +6,12 @@
   3. доступен ли IP с каждой точки обзора (TCP → данные → TLS);
   4. работает ли каждый протокол на самом деле (сквозная проверка xray).
 
+Cloudflare-фронт ноды (кнопка «Включить Cloudflare» панели, vgx3d
+services/cf_front.py): клиент идёт на адрес Cloudflare, а не на IP ноды,
+поэтому блок IP ему не мешает. Если фронт включён, его адрес проверяется
+с каждой точки обзора отдельно от IP, а строка «· CF» подписки — сквозной
+проверкой: Cloudflare в РФ местами тоже режут.
+
 Каждая находка — код, текст и что делать. Коды стабильны: по ним удобно
 сравнивать прогоны и писать тесты. Текст — для человека.
 """
@@ -16,6 +22,7 @@ import asyncio
 from urllib.parse import urlparse
 
 from nexus_mcp import config, inventory, links, playbook, recipes, ssh
+from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, registry
 
 CRIT, WARN, INFO, OK = "crit", "warn", "info", "ok"
@@ -121,6 +128,51 @@ def node_findings(ov: dict, brain_url: str) -> list[dict]:
     return out
 
 
+# ── Cloudflare-фронт ───────────────────────────────────────────────────────
+
+# Ручка панели (vgx3d api/v1/admin/cloudflare.py → cf_front.status).
+CF_STATUS_PATH = "/api/v1/admin/cloudflare/servers/{id}"
+CF_FIELDS = ("enabled", "hostname", "port", "cf_only")
+
+
+async def cf_front(node: dict) -> dict | None:
+    """Cloudflare-фронт ноды по данным панели: enabled, hostname, port, cf_only.
+    None — ноды нет в панели; enabled=None — панель не ответила (у старой
+    панели ручки нет — 404)."""
+    p = inventory.node_panel(node)
+    if node.get("source") != "panel" or not node.get("id") or not p:
+        return None
+    try:
+        st = await inventory.brain_get(CF_STATUS_PATH.format(id=node["id"]), p)
+    except InventoryError as e:
+        return {"enabled": None, "error": str(e)[:200]}
+    if not isinstance(st, dict):
+        return {"enabled": None, "error": "панель ответила не объектом"}
+    return {k: st.get(k) for k in CF_FIELDS}
+
+
+def cf_target(cf: dict | None) -> tuple[str, int] | None:
+    if not cf or not cf.get("enabled") or not cf.get("hostname"):
+        return None
+    return str(cf["hostname"]), int(cf.get("port") or 2087)
+
+
+def cf_verdict(probe: str, r: dict) -> dict | None:
+    """Открывается ли адрес фронта с этой точки. TLS до Cloudflare — это ещё
+    не путь до ноды: его подтверждает сквозная проверка по строке «· CF»."""
+    c = r.get("cf_tls")
+    if not c or c.get("error") == "probe_timeout":
+        return None
+    where = c.get("target", "")
+    if c.get("ok"):
+        return finding(OK, "cf_reachable", f"[{probe}] адрес Cloudflare-фронта {where} открывается.")
+    return finding(CRIT, "cf_blocked",
+                   f"[{probe}] адрес Cloudflare-фронта {where} не открывается "
+                   f"({c.get('stage', '?')}: {c.get('error', '?')}): эта сеть режет Cloudflare — "
+                   "здесь фронт не спасёт.",
+                   "Для этой сети — другой путь: российский CDN (Яндекс/Timeweb) или RU-вход.")
+
+
 # ── 3. Доступность IP с точек обзора ───────────────────────────────────────
 
 def client_ports(node: dict, node_links: list[str]) -> list[int]:
@@ -134,8 +186,10 @@ def client_ports(node: dict, node_links: list[str]) -> list[int]:
     return ports[:3] or [443]
 
 
-async def reach(probe: str, node: dict, ports: list[int]) -> dict:
-    """TCP и данные к SSH-порту + TLS к клиентским портам с одной точки."""
+async def reach(probe: str, node: dict, ports: list[int],
+                cf: tuple[str, int] | None = None) -> dict:
+    """TCP и данные к SSH-порту + TLS к клиентским портам с одной точки;
+    с включённым Cloudflare-фронтом — ещё TLS до его адреса (cf_tls)."""
     host = node.get("ip") or node.get("ssh_host")
     sp = int(node.get("ssh_port") or 22)
     tasks = {
@@ -144,11 +198,15 @@ async def reach(probe: str, node: dict, ports: list[int]) -> dict:
     }
     for p in ports:
         tasks[f"tls_{p}"] = registry.run(probe, "tls", {"host": host, "port": p})
+    if cf:
+        tasks["cf_tls"] = registry.run(probe, "tls", {"host": cf[0], "port": cf[1], "sni": cf[0]})
     keys = list(tasks)
     vals = await asyncio.gather(*tasks.values(), return_exceptions=True)
     res = {}
     for k, v in zip(keys, vals):
         res[k] = v if isinstance(v, dict) else {"ok": False, "error": "probe_error", "detail": str(v)}
+    if cf and isinstance(res.get("cf_tls"), dict):
+        res["cf_tls"] = {**res["cf_tls"], "target": f"{cf[0]}:{cf[1]}"}
     return res
 
 
@@ -168,7 +226,7 @@ def reach_verdict(probe: str, r: dict) -> dict:
                        f"[{probe}] до IP не открывается ни одно TCP-соединение ({kind}): нода лежит "
                        "или IP закрыт с этой сети целиком.",
                        "Сверить с другими точками: у всех — нода/хостер; у одной сети — блок IP у "
-                       "провайдера → RU-вход перед нодой или новый IP.")
+                       "провайдера → Cloudflare-фронт в панели, RU-вход перед нодой или новый IP.")
     if (tcp.get("ok") and banner.get("stage") == "data") or tls_frozen:
         what = []
         if banner.get("stage") == "data":
@@ -178,7 +236,8 @@ def reach_verdict(probe: str, r: dict) -> dict:
         return finding(CRIT, "payload_filtered",
                        f"[{probe}] TCP открывается, но данные режутся ({'; '.join(what)}). Это фильтр "
                        "по IP на пути, а не поломка ноды — настройками протокола не лечится.",
-                       "RU-вход перед нодой (relay) или смена IP у хостера.")
+                       "Cloudflare-фронт в панели («Включить Cloudflare»), RU-вход перед нодой "
+                       "(relay) или смена IP у хостера.")
     if not tcp.get("ok"):
         return finding(WARN, "ssh_port_closed",
                        f"[{probe}] клиентские порты отвечают, а SSH-порт нет ({tcp.get('error', '?')}): "
@@ -209,13 +268,22 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
         "agent_version", "rf_status", "source")}}
     findings: list[dict] = panel_findings(node)
 
+    cf = await cf_front(node)
+    if cf is not None:
+        report["cf_front"] = cf
+    cft = cf_target(cf)
+
     node_links: list[str] = []
+    cf_links: list[str] = []
     links_note = ""
     if config.settings.test_sub_url:
         try:
             all_links = await links.fetch_links()
             node_links = await asyncio.to_thread(links.links_for_node, all_links, node)
-            if not node_links:
+            # Строки «· CF» ведут на имя фронта (адрес Cloudflare), а не на IP.
+            if cft:
+                cf_links = [u for u in all_links if (urlparse(u).hostname or "") == cft[0]]
+            if not node_links and not cf_links:
                 links_note = "в подписке тестового юзера нет ссылок на эту ноду"
         except links.LinksError as e:
             links_note = str(e)
@@ -231,7 +299,7 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
             return None
         return await ssh.run_script(node, recipes.overview(), timeout=60)
 
-    ssh_res, *reaches = await asyncio.gather(ssh_part(), *[reach(p, node, ports) for p in probes])
+    ssh_res, *reaches = await asyncio.gather(ssh_part(), *[reach(p, node, ports, cft) for p in probes])
 
     if ssh_res is not None:
         if ssh_res.ok:
@@ -248,11 +316,22 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
     for probe, r in zip(probes, reaches):
         report["reach"][probe] = r
         findings.append(reach_verdict(probe, r))
+        cv = cf_verdict(probe, r)
+        if cv:
+            findings.append(cv)
 
-    if with_e2e and node_links:
+    ip_blocked = any(f["code"] in ("payload_filtered", "ip_unreachable") for f in findings)
+    if ip_blocked and cf is not None and cf.get("enabled") is False:
+        findings.append(finding(WARN, "cf_front_off",
+                                "IP ноды режется, а Cloudflare-фронт у неё не включён.",
+                                "Панель → нода → «Включить Cloudflare» (нужен агент, до которого "
+                                "достаёт панель), затем проверить строку «· CF» из дома."))
+
+    e2e_links = node_links[:6] + cf_links[:2]
+    if with_e2e and e2e_links:
         report["e2e"] = {}
         for probe in probes:
-            results = await asyncio.gather(*[e2e(probe, u) for u in node_links[:6]])
+            results = await asyncio.gather(*[e2e(probe, u) for u in e2e_links])
             report["e2e"][probe] = results
             alive = [x["link"] for x in results if x.get("ok")]
             dead = [x["link"] for x in results if x.get("ok") is False]
