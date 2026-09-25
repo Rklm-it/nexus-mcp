@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Сторожа сверяют хаб с кодом панели и ноды (инвариант 25 vgx3d):
+      # без клона они падают, а не пропускаются.
+      - name: Клон vgx3d (только нужные каталоги)
+        run: |
+          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/Rklm-it/vgx3d.git ../vgx3d
+          git -C ../vgx3d sparse-checkout set brain/app/services cell
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q tests
+        env:
+          NEXUS_REPO_DIR: ${{ github.workspace }}/../vgx3d
+      - name: Пробник — Python 3.8 (роутеры, старые Windows)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - run: python -m py_compile probe/probe.py && python probe/probe.py --help >/dev/null
+      - run: bash -n install.sh
