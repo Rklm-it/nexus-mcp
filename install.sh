@@ -48,6 +48,11 @@ REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
 FOREGROUND=0; ARGS=("$@")
 UNIT=nexus-mcp-install; LOG=/var/log/nexus-mcp-install.log
+# Имя юнита текущей фоновой установки. У каждого запуска имя своё: юнит
+# прошлой установки (RemainAfterExit) systemd выгружает не сразу, и повтор
+# с тем же именем падал «Unit … was already loaded or has a fragment file»
+# — обновление хаба из меню не запускалось вовсе.
+UNITF="${NEXUS_INSTALL_UNITF:-/run/nexus-mcp-install.unit}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -76,7 +81,9 @@ done
 # Оборвалось SSH или нажали Ctrl+C — установка продолжается; та же команда
 # ещё раз снова показывает лог идущей установки, а не запускает вторую.
 if [ -z "${NEXUS_INSTALL_BG:-}" ] && [ "$FOREGROUND" = "0" ] && command -v systemd-run >/dev/null 2>&1; then
-    if [ "$(systemctl show -p SubState --value "$UNIT" 2>/dev/null)" = "running" ]; then
+    CUR="$(cat "$UNITF" 2>/dev/null || true)"; [ -n "$CUR" ] || CUR="$UNIT"
+    if [ "$(systemctl show -p SubState --value "$CUR" 2>/dev/null)" = "running" ]; then
+        UNIT="$CUR"
         warn "Установка уже идёт — показываю её лог"
     else
         SELF=""
@@ -88,15 +95,20 @@ if [ -z "${NEXUS_INSTALL_BG:-}" ] && [ "$FOREGROUND" = "0" ] && command -v syste
                 "https://raw.githubusercontent.com/Rklm-it/nexus-mcp/$BRANCH/install.sh" \
                 || die "не скачал install.sh с GitHub — запустите с --foreground"
         fi
-        systemctl stop "$UNIT" >/dev/null 2>&1 || true
-        systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+        # Хвосты прошлых запусков (и старого общего имени) — убрать, не мешают.
+        for u in "$UNIT" "$CUR"; do
+            systemctl stop "$u" >/dev/null 2>&1 || true
+            systemctl reset-failed "$u" >/dev/null 2>&1 || true
+        done
+        UNIT="nexus-mcp-install-$(date +%s)"
         : > "$LOG"; chmod 600 "$LOG"
         BG_ENV=(--setenv=NEXUS_INSTALL_BG=1 --setenv=HOME=/root)
         [ -n "$GH_TOKEN" ] && BG_ENV+=("--setenv=GH_TOKEN=$GH_TOKEN")
         systemd-run --quiet --unit "$UNIT" --description "Nexus MCP: установка" \
             -p RemainAfterExit=yes -p "StandardOutput=append:$LOG" -p "StandardError=append:$LOG" \
             "${BG_ENV[@]}" /bin/bash "$SELF" "${ARGS[@]}" \
-            || die "systemd-run не запустил установку — запустите с --foreground"
+            || die "systemd-run не запустил установку ($UNIT) — запустите с --foreground"
+        echo "$UNIT" > "$UNITF"
     fi
     echo -e "${CYAN}Установка идёт в фоне. Обрыв SSH ей не мешает; лог: tail -f $LOG${NC}"
     tail -n +1 -f "$LOG" & TAILPID=$!
