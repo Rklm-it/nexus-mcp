@@ -168,6 +168,16 @@ def merge(by_panel: dict[str, list[dict]], file_data: dict) -> list[dict]:
         # SSH идёт на адрес управления, если он есть: это тот, что доступен.
         n.setdefault("ssh_host", n.get("api_host") or n.get("ip"))
         out.append(n)
+    # ssh_via: имя другой ноды → её адрес (user@host:port). Не имя — оставляем
+    # как есть, ssh.parse_via проверит.
+    for n in out:
+        via = n.get("ssh_via")
+        if not via:
+            continue
+        hop = nodes.get(via) or next((m for m in out if m.get("short_name") == via), None)
+        if hop is not None and hop is not n and hop.get("ssh_host"):
+            n["ssh_via"] = f"{hop.get('ssh_user') or config.settings.ssh_user}@{hop['ssh_host']}:" \
+                           f"{int(hop.get('ssh_port') or 22)}"
     out.sort(key=lambda n: n["name"])
     return out
 

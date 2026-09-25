@@ -264,7 +264,7 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
                    with_ssh: bool = True) -> dict:
     probes = probes or [HUB]
     report: dict = {"node": {k: node.get(k) for k in (
-        "name", "panel", "ip", "ssh_host", "country", "panel_online", "heartbeat_age_s",
+        "name", "panel", "ip", "ssh_host", "ssh_via", "country", "panel_online", "heartbeat_age_s",
         "agent_version", "rf_status", "source")}}
     findings: list[dict] = panel_findings(node)
 

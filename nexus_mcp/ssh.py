@@ -10,6 +10,8 @@ IP — настоящий IP). Скрипт уходит в `bash -s` через
 from __future__ import annotations
 
 import asyncio
+import re
+import shlex
 import time
 from dataclasses import dataclass
 
@@ -41,7 +43,8 @@ class SshResult:
 
 FAILURE_HINTS = {
     "timeout": "SSH не ответил вовремя: пакеты к ноде с хаба не доходят (фильтр по дороге) "
-               "или нода выключена. Сверить с пробами TCP/баннер и с check-host.",
+               "или нода выключена. Сверить с пробами TCP/баннер и с check-host. Нода жива, "
+               "а дорога режется — заходить через живую ноду: \"ssh_via\" в nodes.json.",
     "refused": "Порт SSH закрыт: sshd не запущен или слушает другой порт (поправка ssh_port в nodes.json).",
     "unreachable": "Маршрута до ноды нет: IP сменился или машина удалена у хостера.",
     "auth": "Нода не принимает ключ хаба: публичный ключ не добавлен в authorized_keys ноды.",
@@ -51,7 +54,20 @@ FAILURE_HINTS = {
     "remote_error": "Команда на ноде завершилась с ошибкой — см. stdout/stderr.",
     "ssh_error": "ssh завершился с ошибкой, которую хаб не распознал — причина в stderr.",
     "kill_timeout": "Команда на ноде не уложилась в отведённое время и была прервана.",
+    "bad_via": "ssh_via в nodes.json не распознан: имя ноды из списка или user@host[:port].",
 }
+
+# Промежуточный узел (ssh_via) уходит в ProxyCommand, то есть в шелл: только
+# user@host[:port] без лишних символов. Имя ноды inventory.merge уже заменил
+# на её адрес.
+_VIA_RE = re.compile(r"^(?:([a-z_][a-z0-9_-]{0,31})@)?([A-Za-z0-9.-]{1,253})(?::(\d{1,5}))?$")
+
+
+def parse_via(via: str) -> tuple[str, str, int] | None:
+    m = _VIA_RE.match((via or "").strip())
+    if not m:
+        return None
+    return m.group(1) or config.settings.ssh_user, m.group(2), int(m.group(3) or 22)
 
 
 def classify(stderr: str, rc: int | None) -> str | None:
@@ -85,13 +101,9 @@ def _trim(text: str) -> str:
     return "…(начало обрезано)…\n" + text[-MAX_OUTPUT:]
 
 
-def ssh_argv(node: dict) -> list[str]:
+def _common_opts() -> list[str]:
     s = config.settings
-    s.state_dir.mkdir(parents=True, exist_ok=True)
     return [
-        "ssh",
-        "-i", s.ssh_key,
-        "-p", str(int(node.get("ssh_port") or 22)),
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=5",
@@ -99,9 +111,24 @@ def ssh_argv(node: dict) -> list[str]:
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", f"UserKnownHostsFile={s.known_hosts}",
         "-o", "LogLevel=ERROR",
-        f"{node.get('ssh_user') or s.ssh_user}@{node['ssh_host']}",
-        "bash", "-s",
     ]
+
+
+def ssh_argv(node: dict) -> list[str]:
+    """argv ssh к ноде. С ssh_via — через промежуточный узел (ProxyCommand
+    с тем же ключом): дорога «зарубежная нода → зарубежная нода» не режется
+    там, где режется «хаб → нода»."""
+    s = config.settings
+    s.state_dir.mkdir(parents=True, exist_ok=True)
+    argv = ["ssh", "-i", s.ssh_key, "-p", str(int(node.get("ssh_port") or 22)), *_common_opts()]
+    if node.get("ssh_via"):
+        via = parse_via(str(node["ssh_via"]))
+        if via is None:
+            raise ValueError(node["ssh_via"])
+        user, host, port = via
+        proxy = ["ssh", "-i", s.ssh_key, "-p", str(port), *_common_opts(), "-W", "%h:%p", f"{user}@{host}"]
+        argv += ["-o", "ProxyCommand=" + " ".join(shlex.quote(x) for x in proxy)]
+    return argv + [f"{node.get('ssh_user') or s.ssh_user}@{node['ssh_host']}", "bash", "-s"]
 
 
 async def run_script(node: dict, script: str, timeout: float = 45.0) -> SshResult:
@@ -112,9 +139,13 @@ async def run_script(node: dict, script: str, timeout: float = 45.0) -> SshResul
         return SshResult(False, None, "", f"нет файла ключа {config.settings.ssh_key}", 0.0, "no_key")
     if not node.get("ssh_host"):
         return SshResult(False, None, "", "у ноды нет адреса", 0.0, "unreachable")
+    try:
+        argv = ssh_argv(node)
+    except ValueError:
+        return SshResult(False, None, "", f"ssh_via «{node.get('ssh_via')}» не распознан", 0.0, "bad_via")
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
-        *ssh_argv(node),
+        *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
