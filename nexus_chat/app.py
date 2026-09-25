@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from nexus_chat import config
+from nexus_chat import config, usage
 from nexus_chat.runner import Runner, panel_names
 from nexus_chat.store import Store, StoreError
 
@@ -98,7 +98,23 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
             "busy": runner.busy(),
             "pending_approvals": store.pending_approvals(),
             "last_seq": store.last_seq(),
+            "usage": _usage_short(),
         })
+
+    def _usage_short() -> dict:
+        """Коротко для шапки приложения: токены за сегодня / 7 дней / месяц."""
+        try:
+            sm = usage.summary(store, s.tz)
+        except Exception as e:  # noqa: BLE001 — учёт не повод ронять state
+            return {"error": str(e)[:200]}
+        out = {k: {"tokens": v["tokens"], "answers": v["answers"], "cost_usd": v["cost_usd"]}
+               for k, v in sm["periods"].items()}
+        out["limits"] = [{"title": x["title"], "utilization": x.get("utilization"),
+                          "resets_at": x.get("resets_at")} for x in sm["limits"]]
+        return out
+
+    async def usage_full(request: Request):
+        return JSONResponse({"ok": True, **usage.summary(store, s.tz)})
 
     async def chats(request: Request):
         if request.method == "POST":
@@ -192,6 +208,7 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         Route("/chat/api/chats/{cid}/stop", guarded(stop), methods=["POST"]),
         Route("/chat/api/approvals/{aid}", guarded(approve), methods=["POST"]),
         Route("/chat/api/inbox", guarded(inbox), methods=["GET"]),
+        Route("/chat/api/usage", guarded(usage_full), methods=["GET"]),
         Route("/chat/api/audit", guarded(audit), methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)

@@ -85,6 +85,8 @@ class ResultMessage:
     result: str | None = None
     errors: list | None = None
     api_error_status: int | None = None
+    model_usage: dict | None = None
+    usage: dict | None = None
 
 
 class FakeClient:
@@ -565,3 +567,80 @@ def test_selected_panel_reaches_claude(chat_settings, hub_settings, tmp_path):
         assert r.status_code == 400 and "main, shop2" in r.json()["detail"]
 
     asyncio.run(go())
+
+
+# ── Расход токенов ─────────────────────────────────────────────────────────
+
+@dataclass
+class RateLimitInfo:
+    status: str = "allowed_warning"
+    resets_at: int | None = None
+    rate_limit_type: str | None = "five_hour"
+    utilization: float | None = 0.8
+
+
+@dataclass
+class RateLimitEvent:
+    rate_limit_info: RateLimitInfo
+    uuid: str = "u"
+    session_id: str = "s"
+
+
+def test_usage_counted_by_model_and_survives_chat_delete(chat_settings):
+    """Токены каждого ответа — в учёт по моделям; удалённый диалог не
+    «возвращает» потраченное; лимит подписки виден в state."""
+    resets = int(time.time()) + 3600
+
+    async def script(opts, prompt):
+        yield RateLimitEvent(RateLimitInfo(resets_at=resets))
+        yield AssistantMessage([TextBlock("Ок.")])
+        yield ResultMessage(model_usage={
+            "claude-opus-x": {"inputTokens": 1000, "outputTokens": 500, "cacheReadInputTokens": 20000,
+                              "cacheCreationInputTokens": 3000, "costUSD": 0.25},
+            "claude-haiku-x": {"inputTokens": 200, "outputTokens": 50, "cacheReadInputTokens": 0,
+                               "cacheCreationInputTokens": 0, "costUSD": 0.001}})
+
+    async def go():
+        runner, client, _ = _setup(chat_settings, script)
+        cid = (await client.post("/chat/api/chats", json={}, headers=AUTH)).json()["chat"]["id"]
+        for q in ("раз", "два"):
+            await client.post(f"/chat/api/chats/{cid}/send", json={"text": q}, headers=AUTH)
+            await _wait_done(client, cid)
+        full = (await client.get("/chat/api/usage", headers=AUTH)).json()
+        today = full["periods"]["today"]
+        assert today["answers"] == 4                       # 2 ответа × 2 модели
+        assert today["input"] == 2400 and today["output"] == 1100
+        assert today["tokens"] == 2 * (1000 + 500 + 20000 + 3000 + 200 + 50)
+        assert today["by_model"]["claude-opus-x"]["cache_read"] == 40000
+        assert abs(today["cost_usd"] - 0.502) < 1e-6
+        assert full["periods"]["month"]["tokens"] == today["tokens"] == full["periods"]["all"]["tokens"]
+        assert full["limits"][0]["window"] == "five_hour" and full["limits"][0]["utilization"] == 0.8
+
+        await client.delete(f"/chat/api/chats/{cid}", headers=AUTH)
+        st = (await client.get("/chat/api/state", headers=AUTH)).json()
+        assert st["usage"]["today"]["tokens"] == today["tokens"]
+        assert st["usage"]["limits"][0]["title"] == "5 часов"
+
+    asyncio.run(go())
+
+
+def test_usage_periods_follow_timezone(tmp_path):
+    """Граница «сегодня» и «месяц» — по часовому поясу хаба, а не UTC."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from nexus_chat import usage
+
+    st = Store(tmp_path / "u.db")
+    msk = ZoneInfo("Europe/Moscow")
+    now = datetime(2026, 9, 25, 1, 0, tzinfo=msk).timestamp()          # 01:00 МСК = 22:00 UTC 24-го
+    st.add_usage("chat", "m", input=10, ts=datetime(2026, 9, 25, 0, 30, tzinfo=msk).timestamp())
+    st.add_usage("chat", "m", input=100, ts=datetime(2026, 9, 24, 23, 30, tzinfo=msk).timestamp())
+    st.add_usage("audit", "m", input=1000, ts=datetime(2026, 8, 31, 12, 0, tzinfo=msk).timestamp())
+    sm = usage.summary(st, "Europe/Moscow", now)
+    assert sm["periods"]["today"]["input"] == 10
+    assert sm["periods"]["week"]["input"] == 110
+    assert sm["periods"]["month"]["input"] == 110
+    assert sm["periods"]["all"]["input"] == 1110 and sm["periods"]["all"]["audit_answers"] == 1
+    text = "\n".join(usage.lines(sm))
+    assert "Сегодня" in text and "Этот месяц" in text and "Лимит подписки" in text

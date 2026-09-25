@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse
 from urllib.parse import urlparse
 
 from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbook, recipes, ssh
+from nexus_mcp import node_edit as edits
 from nexus_mcp import links as sublinks
 from nexus_mcp import relay
 from nexus_mcp import panel as panel_api
@@ -55,6 +56,17 @@ panel=<имя>, а ноды называются «панель/имя».
 4. Действия (node_action) — только после согласия человека, с confirm=true.
    Смена порта/транспорта/IP уезжает в подписки всех юзеров ноды — это предлагать,
    а не делать.
+
+Правка конфигурации ноды (node_edit) — маршрутизация, relay, настройки ноды,
+инбаунды — ТОЛЬКО по просьбе человека:
+1. вызов без confirm — бесплатный план: что поменяется, кого из клиентов заденет,
+   plan_hash. План показать человеку своими словами.
+2. человек согласился — тот же вызов с confirm=true и plan_hash из плана.
+3. после правки маршрутизации — проверить: panel_logs(source=<нода>, service="xray").
+Несколько шагов одной ноды (relay_add → swap_outbound → relay_remove) — одним
+op="batch". Каждая правка получает id; откат — op="rollback", args={"edit": id};
+история — node_edits. Секреты (ключи, пароли) в args не передавать: в ответах
+панели они замаскированы, а маска вместо ключа ломает ноду — хаб такое отвергнет.
 
 IP ноды режется (payload_filtered / ip_unreachable) — первое средство панели:
 Cloudflare-фронт («Включить Cloudflare», VLESS+WS через Cloudflare). Если он
@@ -631,7 +643,7 @@ async def panel_action(path: str, confirm: bool = False, params: dict | None = N
                 "detail": "действие меняет панель или ноду: спросите человека и повторите с confirm=true"}
     res = await _panel(panel_api.post_action, path, params or {}, panel_name=panel)
     audit.record("panel_action", {"path": path, "params": params, "panel": panel}, res.get("ok", False),
-                 res.get("detail", ""), panel_name=panel)
+                 res.get("detail", ""))
     return res
 
 
@@ -720,6 +732,61 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
     return await _job(f"{action} {n['name']}", work())
 
 
+# ── Правка конфигурации ноды ───────────────────────────────────────────────
+
+@mcp.tool()
+async def node_edit(node: str, op: str, args: dict | None = None, confirm: bool = False,
+                    plan_hash: str = "") -> dict:
+    """Поменять конфигурацию ноды через её панель — ТОЛЬКО по просьбе человека.
+
+    op: routing | swap_outbound | settings | relay_add | relay_remove |
+    inbound_update | inbound_create | inbound_delete | inbound_push |
+    inbound_order | push_network | batch | rollback (args — см. отказ с
+    неизвестным op, там список). Примеры:
+      swap_outbound  args={"from": "relay-00383c6f", "to": "relay-49341184"}
+      relay_add      args={"via": "ger41s2"}          (mode=xray по умолчанию)
+      relay_remove   args={"tag": "relay-00383c6f"}
+      settings       args={"display_name": "#1 Обход"}
+      inbound_update args={"inbound": "vless-xhttp-cdn", "changes": {"display_name": "…"}}
+      batch          args={"ops": [{"op": "relay_add", "args": {...}}, {"op": "swap_outbound", ...}]}
+      rollback       args={"edit": "<id правки>"}
+    Без confirm — план (бесплатно, ничего не меняет) и plan_hash. С confirm=true
+    нужен тот же plan_hash: изменилась нода с момента плана — отказ.
+    """
+    if not config.settings.allow_actions:
+        return {"ok": False, "error": "actions_disabled",
+                "detail": "действия выключены на хабе (NEXUS_ALLOW_ACTIONS=1 чтобы включить)"}
+    try:
+        p = await edits.plan(node, op, args)
+    except edits.EditError as e:
+        return _err(e)
+    view = edits.preview(p)
+    if not confirm:
+        return {"ok": True, "preview": True, **view,
+                "next": "покажите план человеку; согласится — тот же вызов с confirm=true и plan_hash"}
+    if plan_hash != p["plan_hash"]:
+        return {"ok": False, "error": "plan_changed",
+                "detail": "plan_hash не сходится: план не показан или нода изменилась с момента плана. "
+                          "Покажите человеку новый план",
+                **view}
+
+    async def work() -> dict:
+        res = await edits.apply(p)
+        audit.record("node_edit", {"node": p["node"], "op": op, "edit": res.get("edit"),
+                                   "args": panel_api.redact(args)},
+                     res.get("ok", False), res.get("detail", ""))
+        return {**res, "changes": view["changes"]}
+
+    return await _job(f"node_edit {op} {p['node']}", work())
+
+
+@mcp.tool()
+async def node_edits(limit: int = 20) -> dict:
+    """История правок конфигурации нод (node_edit): id, нода, что, прошло ли,
+    можно ли откатить."""
+    return {"ok": True, "edits": edits.history(max(1, min(limit, 100)))}
+
+
 # ── Долгие действия ────────────────────────────────────────────────────────
 # Обновление агента идёт минутами, а коннектор claude.ai рвёт вызов через
 # 60 с — вместе с вызовом отменялся бы и SSH к ноде посреди установки.
@@ -748,7 +815,7 @@ async def _job(title: str, coro) -> dict:
 
 @mcp.tool()
 async def action_status(job: str) -> dict:
-    """Итог долгого действия (node_action update_agent / use_relay), если оно
+    """Итог долгого действия (node_action update_agent / use_relay, node_edit), если оно
     не уложилось в ожидание вызова и вернуло номер job."""
     j = _JOBS.get(job)
     if not j:

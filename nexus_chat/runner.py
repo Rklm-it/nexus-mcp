@@ -20,7 +20,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from nexus_chat import prompts
+from nexus_chat import prompts, usage
 from nexus_chat.config import ChatSettings
 from nexus_chat.store import Store, StoreError
 
@@ -34,6 +34,17 @@ ACTION_TOOLS = ("node_action", "panel_action")
 # Платные SIM-проверки bschekbot: preview (без confirm) бесплатен и идёт сразу,
 # запуск с confirm=true — деньги, поэтому тоже ждёт кнопки.
 PAID_TOOLS = ("sim_probe", "sim_vless", "sim_geo")
+# Правка конфигурации ноды: план (без confirm) только читает и идёт сразу,
+# применение (confirm=true) ждёт кнопки.
+EDIT_TOOLS = ("node_edit",)
+
+EDIT_OPS = {
+    "routing": "маршрутизация", "swap_outbound": "переключить выход", "settings": "настройки ноды",
+    "relay_add": "добавить relay", "relay_remove": "удалить relay", "inbound_update": "изменить инбаунд",
+    "inbound_create": "новый инбаунд", "inbound_delete": "удалить инбаунд",
+    "inbound_push": "переприменить инбаунд", "inbound_order": "порядок инбаундов",
+    "push_network": "применить сеть", "batch": "пакет правок", "rollback": "откат правки",
+}
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -61,8 +72,34 @@ def short_tool(name: str) -> str:
     return name[len(MCP_PREFIX):] if name.startswith(MCP_PREFIX) else name
 
 
+def _edit_detail(op: str, args: dict) -> str:
+    if op == "swap_outbound":
+        return f"{args.get('from', '?')} → {args.get('to', '?')}"
+    if op == "relay_add":
+        return f"через {args.get('via', '?')}"
+    if op == "relay_remove":
+        return str(args.get("tag", "?"))
+    if op in ("inbound_update", "inbound_delete", "inbound_push"):
+        ch = args.get("changes") or {}
+        return str(args.get("inbound", "?")) + (f": {', '.join(ch)}" if ch else "")
+    if op == "settings":
+        return ", ".join(f"{k}={v}" for k, v in args.items())[:120]
+    if op == "routing":
+        return ", ".join(args)
+    if op == "rollback":
+        return str(args.get("edit", "?"))
+    if op == "batch":
+        return " → ".join(EDIT_OPS.get((o or {}).get("op"), str((o or {}).get("op")))
+                          for o in args.get("ops") or [])
+    return ""
+
+
 def describe_action(tool: str, inp: dict) -> str:
     """Одна строка для кнопки «Разрешить»: что именно произойдёт."""
+    if tool == "node_edit":
+        op = inp.get("op", "?")
+        detail = _edit_detail(op, inp.get("args") or {})
+        return f"Изменить ноду {inp.get('node', '?')}: {EDIT_OPS.get(op, op)}" + (f" · {detail}" if detail else "")
     if tool == "node_action":
         action = inp.get("action", "?")
         node = inp.get("node", "?")
@@ -358,12 +395,17 @@ class Runner:
             return
         if kind == "RateLimitEvent":
             info = msg.rate_limit_info
+            try:
+                usage.save_rate_limit(self.store, info)
+            except Exception as e:  # noqa: BLE001 — учёт не повод ронять ответ
+                logger.warning("лимит подписки не сохранён: %s", e)
             if info.status in ("allowed_warning", "rejected"):
                 await self.emit(chat_id, "notice", {"text": _rate_limit_text(info)})
             return
         if kind == "ResultMessage":
             if msg.session_id:
                 self.store.set_session(chat_id, msg.session_id)
+            self._record_usage(chat_id, msg)
             if msg.is_error:
                 why = msg.result or "; ".join(msg.errors or []) or msg.subtype
                 if getattr(msg, "api_error_status", None):
@@ -374,6 +416,28 @@ class Runner:
             await self.emit(chat_id, "done", {"ended": ended, "cost_usd": msg.total_cost_usd,
                                               "duration_ms": msg.duration_ms,
                                               "turns": msg.num_turns})
+
+    def _record_usage(self, chat_id: str, msg: Any) -> None:
+        """Токены ответа — по моделям (model_usage), иначе общим числом."""
+        try:
+            kind = self.store.get_chat(chat_id)["kind"]
+        except StoreError:
+            kind = "chat"
+        try:
+            per_model = getattr(msg, "model_usage", None) or {}
+            if per_model:
+                for model, u in per_model.items():
+                    self.store.add_usage(kind, model, u.get("inputTokens", 0), u.get("outputTokens", 0),
+                                         u.get("cacheReadInputTokens", 0), u.get("cacheCreationInputTokens", 0),
+                                         u.get("costUSD", 0.0))
+                return
+            u = getattr(msg, "usage", None) or {}
+            if u or getattr(msg, "total_cost_usd", None):
+                self.store.add_usage(kind, self.settings.model or "?", u.get("input_tokens", 0),
+                                     u.get("output_tokens", 0), u.get("cache_read_input_tokens", 0),
+                                     u.get("cache_creation_input_tokens", 0), msg.total_cost_usd or 0.0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("расход токенов не записан: %s", e)
 
     # ── Разрешения ─────────────────────────────────────────────────────────
 
@@ -386,7 +450,7 @@ class Runner:
         if not name.startswith(MCP_PREFIX):
             return False, "В чате доступны только инструменты хаба nexus"
         tool = short_tool(name)
-        paid = tool in PAID_TOOLS and bool(tool_input.get("confirm"))
+        paid = tool in PAID_TOOLS + EDIT_TOOLS and bool(tool_input.get("confirm"))
         if tool not in ACTION_TOOLS and not paid:
             return True, tool_input
         title = describe_action(tool, tool_input)

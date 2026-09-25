@@ -42,6 +42,22 @@ def _nodes() -> None:
         print(f"  ! {w}")
 
 
+def _edits() -> None:
+    """Правки конфигурации нод (node_edit): что, где, откатывается ли."""
+    from nexus_mcp import node_edit
+
+    items = node_edit.history(20)
+    if not items:
+        print("  правок ещё не было")
+        return
+    for e in items:
+        state = ("\033[31m✗\033[0m " + str(e["error"])[:80]) if e["error"] else "\033[32m✓\033[0m"
+        tail = " · откачена " + e["rolled_back"] if e["rolled_back"] else (
+            " · можно откатить" if e["can_rollback"] else "")
+        print(f"  {e['ts']}  {e['edit']}  {e['node']:<22} {e['op']:<15} {state}{tail}")
+    print("\n  Откат — попросите Claude в чате: «откати правку <id>»")
+
+
 def _panel_check(url: str, token: str, gate: str) -> None:
     """Панель отвечает админ-токеном? Перед записью в хаб."""
     import httpx
@@ -70,6 +86,8 @@ def main(argv: list[str]) -> int:
         _sim()
     elif cmd == "nodes":
         _nodes()
+    elif cmd == "edits":
+        _edits()
     elif cmd == "panels-count":
         try:
             print(len(panels.all_panels()))
@@ -78,7 +96,7 @@ def main(argv: list[str]) -> int:
     elif cmd == "panel-check" and len(argv) >= 3:
         _panel_check(argv[1], argv[2], argv[3] if len(argv) > 3 else "")
     else:
-        print("команды: sim | nodes | panels-count | panel-check <url> <token> [gate]", file=sys.stderr)
+        print("команды: sim | nodes | edits | panels-count | panel-check <url> <token> [gate]", file=sys.stderr)
         return 2
     return 0
 

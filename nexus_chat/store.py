@@ -59,6 +59,19 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided REAL
 );
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- Расход токенов: строка на ответ Claude и модель. Отдельно от событий —
+-- удалённый диалог не должен «возвращать» потраченное за месяц.
+CREATE TABLE IF NOT EXISTS usage (
+    ts REAL NOT NULL,
+    chat_kind TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input INTEGER NOT NULL DEFAULT 0,
+    output INTEGER NOT NULL DEFAULT 0,
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
 """
 
 
@@ -241,3 +254,34 @@ class Store:
 
     def kv_set(self, k: str, v: str) -> None:
         self._x("INSERT INTO kv(k, v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+
+    # ── Расход токенов ─────────────────────────────────────────────────────
+
+    def add_usage(self, chat_kind: str, model: str, input: int = 0, output: int = 0,
+                  cache_read: int = 0, cache_write: int = 0, cost_usd: float = 0.0,
+                  ts: float | None = None) -> None:
+        self._x("INSERT INTO usage(ts, chat_kind, model, input, output, cache_read, cache_write, cost_usd)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (ts or time.time(), chat_kind, model or "?", int(input or 0), int(output or 0),
+                 int(cache_read or 0), int(cache_write or 0), float(cost_usd or 0)))
+
+    def usage_since(self, since: float) -> dict:
+        rows = self._q("SELECT model, chat_kind, COUNT(*) AS n, SUM(input) AS i, SUM(output) AS o, "
+                       "SUM(cache_read) AS cr, SUM(cache_write) AS cw, SUM(cost_usd) AS c "
+                       "FROM usage WHERE ts>=? GROUP BY model, chat_kind", (since,))
+        total = {"answers": 0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+                 "cost_usd": 0.0, "by_model": {}, "audit_answers": 0}
+        for r in rows:
+            part = {"answers": r["n"], "input": r["i"] or 0, "output": r["o"] or 0,
+                    "cache_read": r["cr"] or 0, "cache_write": r["cw"] or 0, "cost_usd": r["c"] or 0.0}
+            for k, v in part.items():
+                total[k] += v
+            m = total["by_model"].setdefault(r["model"], {"input": 0, "output": 0, "cache_read": 0,
+                                                          "cache_write": 0, "cost_usd": 0.0})
+            for k in m:
+                m[k] += part[k]
+            if r["chat_kind"] == "audit":
+                total["audit_answers"] += r["n"]
+        total["cost_usd"] = round(total["cost_usd"], 4)
+        total["tokens"] = total["input"] + total["output"] + total["cache_read"] + total["cache_write"]
+        return total

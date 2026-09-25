@@ -26,7 +26,11 @@ def _run(tmp: Path, keys: str, *args: str) -> tuple[subprocess.CompletedProcess,
     if not (base / "app").exists():
         (base / "app").symlink_to(ROOT)
         (base / "venv" / "bin").mkdir(parents=True)
-        (base / "venv" / "bin" / "python").symlink_to(sys.executable)
+        # Обёртка, а не симлинк: через симлинк питон не видит venv и падает на
+        # import httpx — меню тогда молча показывало пустые строки.
+        py = base / "venv" / "bin" / "python"
+        py.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        py.chmod(0o755)
     (tmp / "etc").mkdir(exist_ok=True)
     (tmp / "input").write_text(keys)
     env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}", "NEXUS_HUB_ENV": str(tmp / "env"),
@@ -71,3 +75,23 @@ def test_status_works_without_tty_and_menu_refuses(tmp_path):
            "NEXUS_HUB_BASE": str(tmp_path / "base"), "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
     r = subprocess.run(["bash", str(ROOT / "bin/nexus-hub")], capture_output=True, text=True, timeout=30, env=env)
     assert r.returncode == 1 and "нет терминала" in r.stderr
+
+
+def test_usage_and_edits_items(tmp_path):
+    """Шапка показывает токены; пункты 19 и 20 работают и без чата/правок."""
+    env = ENV + f"NEXUS_STATE_DIR={tmp_path / 'state'}\n"
+    (tmp_path / "env").write_text(env)
+    r, _ = _run(tmp_path, "19\n\n20\n\n0\n")
+    assert r.returncode == 0, r.stderr
+    assert "Токены" in r.stdout and "чат ещё не запускался" in r.stdout
+    assert "правок ещё не было" in r.stdout
+
+    # Чат поработал: шапка и пункт 19 показывают расход.
+    sys.path.insert(0, str(ROOT))
+    from nexus_chat.store import Store
+
+    st = Store(tmp_path / "state" / "chat" / "chat.db")
+    st.add_usage("chat", "claude-x", input=1500, output=500, cache_read=1_000_000)
+    r, _ = _run(tmp_path, "19\n\n0\n")
+    assert "сегодня 1 млн" in r.stdout, r.stdout
+    assert "Этот месяц" in r.stdout and "claude.ai → Settings → Usage" in r.stdout

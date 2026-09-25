@@ -40,6 +40,7 @@ envset() {
     fi
 }
 hubpy() { ( cd "$APP" && set -a && . "$ENVF" && set +a && "$PY" -m nexus_mcp.cli "$@" ) 2>&1; }
+usagepy() { ( cd "$APP" && set -a && . "$ENVF" && set +a && "$PY" -m nexus_chat.usage "$@" ) 2>&1; }
 gen() { head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
 svc_dot() { systemctl is-active --quiet "$1" 2>/dev/null && echo "$OK" || echo "$BAD"; }
 
@@ -61,7 +62,7 @@ restart_hub() { systemctl restart nexus-mcp nexus-chat && ok "хаб и чат �
 
 # ── Шапка ────────────────────────────────────────────────────────────────────
 header() {
-    local claude sim acts audit np chat
+    local claude sim acts audit np chat tokens
     chat="$(curl -fsS --connect-timeout 2 -m 4 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
     if [ -z "$chat" ]; then claude="$BAD чат не отвечает"
     elif echo "$chat" | grep -q '"logged_in":true'; then claude="$OK вошёл в подписку"
@@ -71,9 +72,11 @@ header() {
     [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ] && acts="${G}включены${N}" || acts="${D}выключены${N}"
     audit="$(envget NEXUS_CHAT_AUDIT_AT)"; [ -n "$audit" ] || audit="${D}нет${N}"
     np="$(hubpy panels-count | tail -1)"
+    tokens="$(usagepy --short | tail -1)"
     printf '\n%s\n' "${B}╭─ Nexus Hub ${N}${D}$(hub_url)${N}"
     printf '%s  хаб %s   чат %s   caddy %s\n' "${B}│${N}" "$(svc_dot nexus-mcp)" "$(svc_dot nexus-chat)" "$(svc_dot nexus-mcp-caddy)"
     printf '%s  Claude  %s\n' "${B}│${N}" "$claude"
+    printf '%s  Токены  %s\n' "${B}│${N}" "$tokens"
     printf '%s  SIM     %s\n' "${B}│${N}" "$sim"
     printf '%s  Панели %s · действия из чата %s · аудит %s\n' "${B}│${N}" "${B}$np${N}" "$acts" "$audit"
     printf '%s\n' "${B}╰────────────────────────────────────────────────────────${N}"
@@ -96,6 +99,8 @@ menu() {
    8  Вход Claude в подписку
    9  Строка подключения приложения
   10  Плановый аудит                 ${s}время сводки уведомлением${N}
+  19  Расход Claude                  ${s}токены: день, неделя, месяц${N}
+  20  Правки нод Claude              ${s}что менял и что можно откатить${N}
  ${B}SIM-проверки (bschekbot)${N}
   11  Ключ bschekbot                 ${s}ввод скрыт${N}
   12  Дневной потолок трат
@@ -229,7 +234,8 @@ a_bsbord_cap() {
 
 a_actions() {
     title "Действия из чата и коннектора"
-    echo "Перезапуск сервисов ноды, обновление агента, реле, действия в панели — каждое"
+    echo "Перезапуск сервисов ноды, обновление агента, реле, действия в панели, правка"
+    echo "маршрутизации/relay/инбаундов нод — каждое"
     echo "всё равно только по кнопке «Разрешить» (чат) или confirm=true (коннектор)."
     if [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ]; then
         yes_no "Сейчас ВКЛЮЧЕНЫ. Выключить?" && envset NEXUS_ALLOW_ACTIONS 0 && restart_hub
@@ -267,6 +273,19 @@ a_logs() {
     esac
 }
 
+a_usage() {
+    title "Расход Claude"
+    usagepy
+    echo
+    echo "${D}Считается чат приложения и плановый аудит. Разговоры в claude.ai через коннектор"
+    echo "сюда не входят — их расход виден в claude.ai → Settings → Usage.${N}"
+}
+
+a_edits() {
+    title "Правки конфигурации нод"
+    hubpy edits
+}
+
 a_update() {
     title "Обновить хаб"
     echo "Та же команда установки: настройки, секреты и ключ берутся из $ENVF."
@@ -291,6 +310,7 @@ while true; do
         8) a_login ;; 9) a_app_line ;; 10) a_audit ;;
         11) a_bsbord_key ;; 12) a_bsbord_cap ;;
         13) a_actions ;; 14) a_rotate ;; 15) a_connector ;; 16) a_logs ;; 17) restart_hub ;; 18) a_update ;;
+        19) a_usage ;; 20) a_edits ;;
         0|q|й|"") echo; exit 0 ;;
         *) bad "нет такого пункта" ;;
     esac

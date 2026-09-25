@@ -44,6 +44,23 @@ ACTION_PATTERNS = {
     r"/api/v1/admin/resync/run": "пересинхронизация юзеров на ноды",
 }
 
+# Правка конфигурации нод (node_edit): метод + путь целиком. Только ресурсы
+# ОДНОЙ ноды — её маршрутизация, relay, инбаунды, настройки. Удаления ноды,
+# юзеров, денег здесь нет и быть не должно.
+_U = "[0-9a-f-]{36}"
+WRITE_PATTERNS = [
+    ("PATCH", rf"/api/v1/servers/{_U}"),
+    ("POST", rf"/api/v1/servers/{_U}/push-network"),
+    ("POST", rf"/api/v1/admin/nodes/{_U}/relay-node"),
+    ("POST", rf"/api/v1/servers/{_U}/outbounds"),
+    ("DELETE", rf"/api/v1/servers/{_U}/outbounds/{_U}"),
+    ("POST", rf"/api/v1/servers/{_U}/inbounds"),
+    ("PUT", rf"/api/v1/servers/{_U}/inbounds/order"),
+    ("PATCH", rf"/api/v1/servers/{_U}/inbounds/{_U}"),
+    ("DELETE", rf"/api/v1/servers/{_U}/inbounds/{_U}"),
+    ("POST", rf"/api/v1/servers/{_U}/inbounds/{_U}/push"),
+]
+
 MAX_CHARS = 60_000
 
 _SECRET_KEY = re.compile(
@@ -163,15 +180,19 @@ def compact_health(data: Any) -> Any:
 
 
 async def request(method: str, path: str, params: dict | None = None,
-                  timeout: float = 30.0, panel_name: str = "", compact=None) -> Any:
+                  timeout: float = 30.0, panel_name: str = "", compact=None,
+                  body: Any = None, raw: bool = False) -> Any:
+    """raw=True — ответ как есть, БЕЗ маскировки: только для кода хаба
+    (снимок «как было» для отката правки), в модель такое не отдаётся."""
     try:
         p = panels.resolve(panel_name)
     except panels.PanelConfigError as e:
         raise PanelError(str(e)) from e
     clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+    kw = {"json": body} if body is not None else {}
     try:
         async with httpx.AsyncClient(timeout=timeout, auth=_brain_auth(p)) as c:
-            r = await c.request(method, p["url"] + path, params=clean, headers=_brain_headers(p))
+            r = await c.request(method, p["url"] + path, params=clean, headers=_brain_headers(p), **kw)
     except httpx.HTTPError as e:
         raise PanelError(f"панель {p['name']} не ответила на {path}: {type(e).__name__}: {e}") from e
     if r.status_code >= 400:
@@ -183,10 +204,14 @@ async def request(method: str, path: str, params: dict | None = None,
         elif r.status_code == 403:
             hint = " — токен не принят или фича выключена лицензией"
         raise PanelError(f"панель {p['name']} ответила {r.status_code} на {method} {path}: {detail}{hint}")
+    if r.status_code == 204 or not r.content:
+        return {} if raw else {"status": r.status_code}
     try:
         data = r.json()
     except ValueError:
         data = r.text[:MAX_CHARS]
+    if raw:
+        return data
     if compact is not None:
         data = compact(data)
     return _shrink(redact(data))
@@ -195,6 +220,26 @@ async def request(method: str, path: str, params: dict | None = None,
 async def get(path: str, params: dict | None = None, timeout: float = 30.0,
               panel_name: str = "", compact=None) -> Any:
     return await request("GET", check_read_path(path), params, timeout, panel_name, compact)
+
+
+def check_write(method: str, path: str) -> str:
+    p = _check_path(path)
+    m = method.upper()
+    if any(m == wm and re.fullmatch(pat, p) for wm, pat in WRITE_PATTERNS):
+        return p
+    raise PanelError(f"запись {m} {p} не из списка правок ноды")
+
+
+async def write(method: str, path: str, body: Any = None, params: dict | None = None,
+                timeout: float = 120.0, panel_name: str = "") -> Any:
+    """Правка через панель; ответ — сырой (для снимка отката), маскирует вызывающий."""
+    return await request(method.upper(), check_write(method, path), params, timeout, panel_name,
+                         body=body, raw=True)
+
+
+async def read_raw(path: str, panel_name: str = "", timeout: float = 30.0) -> Any:
+    """Чтение без маскировки — для снимка «как было». В модель не отдавать."""
+    return await request("GET", check_read_path(path), None, timeout, panel_name, raw=True)
 
 
 async def post_action(path: str, params: dict | None = None, timeout: float = 120.0,
