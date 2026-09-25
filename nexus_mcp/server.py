@@ -299,7 +299,8 @@ async def panel_health(fresh: bool = False, panel: str = "") -> dict:
     fresh=True — мимо 20-секундного кэша.
     panel — имя панели (panels_list); при одной панели можно не указывать.
     """
-    return await _panel(panel_api.get, "/api/v1/admin/app/health", {"fresh": fresh or None}, panel_name=panel)
+    return await _panel(panel_api.get, "/api/v1/admin/app/health", {"fresh": fresh or None},
+                        panel_name=panel, compact=panel_api.compact_health)
 
 
 @mcp.tool()

@@ -134,8 +134,36 @@ def _shrink(data: Any) -> Any:
     return text[:MAX_CHARS] + "…(обрезано)"
 
 
+HEALTH_LINES = 15
+HEALTH_LINE_CHARS = 300
+
+
+def compact_health(data: Any) -> Any:
+    """Ответ /app/health → то, что нужно модели. Мегабайт в нём — хвосты
+    логов (`lines`) при проверках: целиком они вытесняли все группы, и модель
+    не видела даже, какая проверка красная. У ok/off хвосты убираются, у
+    остальных остаются последние HEALTH_LINES строк по HEALTH_LINE_CHARS."""
+    if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
+        return data
+    groups = []
+    for g in data["groups"]:
+        if not isinstance(g, dict):
+            continue
+        checks = []
+        for c in g.get("checks") or []:
+            if not isinstance(c, dict):
+                continue
+            c = dict(c)
+            lines = c.pop("lines", None) or []
+            if lines and c.get("status") not in ("ok", "off"):
+                c["lines"] = [str(x)[:HEALTH_LINE_CHARS] for x in lines[-HEALTH_LINES:]]
+            checks.append(c)
+        groups.append({**g, "checks": checks})
+    return {**data, "groups": groups}
+
+
 async def request(method: str, path: str, params: dict | None = None,
-                  timeout: float = 30.0, panel_name: str = "") -> Any:
+                  timeout: float = 30.0, panel_name: str = "", compact=None) -> Any:
     try:
         p = panels.resolve(panel_name)
     except panels.PanelConfigError as e:
@@ -159,12 +187,14 @@ async def request(method: str, path: str, params: dict | None = None,
         data = r.json()
     except ValueError:
         data = r.text[:MAX_CHARS]
+    if compact is not None:
+        data = compact(data)
     return _shrink(redact(data))
 
 
 async def get(path: str, params: dict | None = None, timeout: float = 30.0,
-              panel_name: str = "") -> Any:
-    return await request("GET", check_read_path(path), params, timeout, panel_name)
+              panel_name: str = "", compact=None) -> Any:
+    return await request("GET", check_read_path(path), params, timeout, panel_name, compact)
 
 
 async def post_action(path: str, params: dict | None = None, timeout: float = 120.0,

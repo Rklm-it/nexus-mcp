@@ -114,6 +114,38 @@ def test_big_list_is_truncated_with_note(hub_settings, monkeypatch):
     assert len(json.dumps(out)) <= panel.MAX_CHARS * 1.2
 
 
+def test_health_keeps_every_check_when_logs_are_huge(hub_settings, monkeypatch):
+    """Мегабайт хвостов логов в /app/health вытеснял все группы («обрезано»),
+    и модель не видела, какая проверка красная. Проверки остаются, хвосты —
+    только у не-ok и короткие."""
+    from nexus_mcp import server
+
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    log = ["x" * 2000] * 400
+    body = {"status": "error", "counts": {"error": 1, "ok": 1}, "groups": [
+        {"key": "containers", "title": "Контейнеры", "status": "error", "checks": [
+            {"key": "bot", "title": "bot", "status": "error", "detail": "упал", "lines": log},
+            {"key": "api", "title": "api", "status": "ok", "detail": "ok", "lines": log},
+        ]},
+    ]}
+    _mock(monkeypatch, lambda req: httpx.Response(200, json=body))
+    r = asyncio.run(server.panel_health())
+    checks = r["data"]["groups"][0]["checks"]
+    assert [c["key"] for c in checks] == ["bot", "api"]
+    assert len(checks[0]["lines"]) == panel.HEALTH_LINES
+    assert len(checks[0]["lines"][0]) == panel.HEALTH_LINE_CHARS
+    assert "lines" not in checks[1]
+    assert len(json.dumps(r, ensure_ascii=False)) < panel.MAX_CHARS
+
+
+def test_health_fields_match_panel(vgx3d):
+    """compact_health опирается на поля ответа панели — сверяем с её кодом."""
+    text = (vgx3d / "brain/app/services/app_health.py").read_text(encoding="utf-8")
+    for field in ('"groups"', '"checks"', "lines: list[str]", "status: str"):
+        assert field in text, field
+
+
 def test_panel_not_configured_is_a_reason(hub_settings):
     from nexus_mcp import server
 
