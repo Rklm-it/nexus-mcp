@@ -150,8 +150,8 @@ async def request(method: str, path: str, params: dict | None = None,
         detail = r.text[:400]
         hint = ""
         if r.status_code == 401 and "basic" in r.headers.get("www-authenticate", "").lower():
-            hint = (" — /api закрыт basic_auth Caddy: nexus-mcp-panels add "
-                    f"{p['name']} <url> <токен> --basic user:pass")
+            hint = (" — /api закрыт паролем Caddy: нужен VPN_PANEL_GATE_SECRET из .env панели — "
+                    f"nexus-mcp-panels add {p['name']} <url> <токен> --gate <секрет>")
         elif r.status_code == 403:
             hint = " — токен не принят или фича выключена лицензией"
         raise PanelError(f"панель {p['name']} ответила {r.status_code} на {method} {path}: {detail}{hint}")

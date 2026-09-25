@@ -13,7 +13,7 @@
 
 Управление — командой на хабе, чтобы токены не набирать в JSON руками:
     nexus-mcp-panels list
-    nexus-mcp-panels add shop2 https://p2.example.com <VPN_ADMIN_TOKEN> [--basic user:pass]
+    nexus-mcp-panels add shop2 https://p2.example.com <VPN_ADMIN_TOKEN> --gate <VPN_PANEL_GATE_SECRET>
     nexus-mcp-panels remove shop2
 """
 
@@ -55,7 +55,7 @@ def all_panels() -> list[dict]:
     s = config.settings
     if s.brain_url and s.brain_admin_token and not any(p["name"] == "main" for p in panels):
         panels.insert(0, {"name": "main", "url": s.brain_url, "token": s.brain_admin_token,
-                          "basic_auth": s.brain_basic_auth})
+                          "gate": s.brain_gate, "basic_auth": s.brain_basic_auth})
     for p in panels:
         p["url"] = p["url"].rstrip("/")
     return panels
@@ -81,7 +81,8 @@ def resolve(name: str = "") -> dict:
 
 def public_view(p: dict) -> dict:
     """Для вывода: без токена и пароля."""
-    return {"name": p["name"], "url": p["url"], "basic_auth": bool(p.get("basic_auth"))}
+    return {"name": p["name"], "url": p["url"], "gate": bool(p.get("gate")),
+            "basic_auth": bool(p.get("basic_auth"))}
 
 
 # ── Команда управления ─────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ def _write(panels: list[dict]) -> None:
     os.replace(tmp, path)
 
 
-def add(name: str, url: str, token: str, basic_auth: str = "") -> dict:
+def add(name: str, url: str, token: str, basic_auth: str = "", gate: str = "") -> dict:
     if not NAME_RE.match(name):
         raise PanelConfigError("имя: латиница в нижнем регистре, цифры, - и _, до 32 символов")
     if not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?(/[A-Za-z0-9._~/\-]*)?$", url.rstrip("/")):
@@ -105,6 +106,8 @@ def add(name: str, url: str, token: str, basic_auth: str = "") -> dict:
         raise PanelConfigError("нужен токен панели (VPN_ADMIN_TOKEN из её .env)")
     panels = [p for p in _read_file() if p["name"] != name]
     entry = {"name": name, "url": url.rstrip("/"), "token": token}
+    if gate:
+        entry["gate"] = gate
     if basic_auth:
         entry["basic_auth"] = basic_auth
     panels.append(entry)
@@ -131,7 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("name")
     a.add_argument("url")
     a.add_argument("token")
-    a.add_argument("--basic", default="", help="user:pass, если /api панели за basic_auth")
+    a.add_argument("--gate", default="", help="VPN_PANEL_GATE_SECRET из .env панели (проход мимо basic_auth)")
+    a.add_argument("--basic", default="", help="user:pass, если /api панели за basic_auth, а gate не задан")
     r = sub.add_parser("remove")
     r.add_argument("name")
     args = ap.parse_args(argv)
@@ -139,9 +143,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "list":
             for p in all_panels():
                 v = public_view(p)
-                print(f"{v['name']:<16} {v['url']}{'  (basic_auth)' if v['basic_auth'] else ''}")
+                how = "gate" if v["gate"] else ("basic_auth" if v["basic_auth"] else "")
+                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}")
         elif args.cmd == "add":
-            v = add(args.name, args.url, args.token, args.basic)
+            v = add(args.name, args.url, args.token, args.basic, args.gate)
             print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
         elif args.cmd == "remove":
             if not remove(args.name):

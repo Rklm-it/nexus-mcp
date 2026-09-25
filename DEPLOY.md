@@ -27,9 +27,15 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 Проверяйте на одной и той же ноде: быстро открывается одна, а режется другая.
 
-## Шаг 1. Токен панели
+## Шаг 1. Два значения из панели
 
-На сервере панели: `grep ^VPN_ADMIN_TOKEN /opt/vgx3d/.env`.
+На сервере панели:
+```bash
+grep -E '^(VPN_ADMIN_TOKEN|VPN_PANEL_GATE_SECRET)=' /opt/vgx3d/.env
+```
+`VPN_ADMIN_TOKEN` — токен админ-API. `VPN_PANEL_GATE_SECRET` пропускает хаб мимо
+пароля Caddy (Basic Auth), которым закрыт `/api` панели. Пароль Basic Auth
+вспоминать не нужно.
 
 ## Шаг 2. Установка — одна команда
 
@@ -37,7 +43,8 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 ```bash
 bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
-  --brain-url https://<адрес вашей панели> --brain-token <VPN_ADMIN_TOKEN>
+  --brain-url https://<адрес вашей панели> \
+  --brain-token <VPN_ADMIN_TOKEN> --brain-gate <VPN_PANEL_GATE_SECRET>
 ```
 
 Сам установщик:
@@ -72,8 +79,8 @@ curl -s https://<адрес хаба>/healthz        # {"ok":true,"service":"nex
 (`--brain-url`, это панель `main`), остальные — командой на хабе:
 
 ```bash
-nexus-mcp-panels add vip   https://panel.example.ru/vip <VPN_ADMIN_TOKEN VIP-контура>
-nexus-mcp-panels add shop2 https://p2.example.com <её VPN_ADMIN_TOKEN> [--basic user:pass]
+nexus-mcp-panels add vip   https://panel.example.ru/vip <VPN_ADMIN_TOKEN VIP-контура> --gate <VPN_PANEL_GATE_SECRET>
+nexus-mcp-panels add shop2 https://p2.example.com <её VPN_ADMIN_TOKEN> --gate <её VPN_PANEL_GATE_SECRET>
 nexus-mcp-panels list
 nexus-mcp-panels remove shop2
 ```
@@ -215,5 +222,5 @@ systemctl daemon-reload && systemctl enable --now nexus-probe
 | коннектор «не может подключиться» | URL целиком, с `/mcp/<секрет>`; `curl https://…/healthz` снаружи |
 | `ssh_auth` в отчёте | ключ хаба не добавлен на ноду (шаг 4) |
 | `ssh_timeout` на всех нодах | с этой VPS путь до нод режется: шаг 0 не пройден |
-| «список из панели не получен» | `--brain-url` / `--brain-token`; если `/api` панели за паролем — `NEXUS_BRAIN_BASIC_AUTH=user:pass` |
+| «список из панели не получен» / 401 | `--brain-url` / `--brain-token` / `--brain-gate` (значения из `.env` панели, шаг 1) |
 | пробник «не на связи» | запущен ли `probe.py` дома, верный ли `--token` (при неверном печатает `хаб ответил 401`) |

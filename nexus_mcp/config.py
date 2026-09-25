@@ -38,7 +38,10 @@ class Settings:
     # без него ноды берутся из файла.
     brain_url: str = field(default_factory=lambda: _env("NEXUS_BRAIN_URL").rstrip("/"))
     brain_admin_token: str = field(default_factory=lambda: _env("NEXUS_BRAIN_ADMIN_TOKEN"))
-    # user:pass, если /api закрыт basic_auth в Caddy панели.
+    # VPN_PANEL_GATE_SECRET из .env панели: Caddy пропускает мимо basic_auth
+    # запрос с cookie nexus_gate=<секрет> (дальше всё равно нужен токен).
+    brain_gate: str = field(default_factory=lambda: _env("NEXUS_BRAIN_GATE"))
+    # user:pass, если /api закрыт basic_auth в Caddy панели, а gate не задан.
     brain_basic_auth: str = field(default_factory=lambda: _env("NEXUS_BRAIN_BASIC_AUTH"))
 
     # Панели (несколько на одном хабе) — см. panels.py.

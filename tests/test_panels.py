@@ -119,3 +119,44 @@ def test_panels_list_tool_hides_tokens(hub_settings):
     r = asyncio.run(server.panels_list())
     assert r["ok"] and {p["name"] for p in r["panels"]} == {"main", "shop2"}
     assert "TA" not in json.dumps(r) and "u:p" not in json.dumps(r)
+
+
+# ── Проход мимо пароля Caddy по cookie ─────────────────────────────────────
+
+def test_gate_cookie_sent_with_token(hub_settings, monkeypatch):
+    hub_settings.panels_file.write_text(json.dumps({"panels": [
+        {"name": "main", "url": "https://a.ru", "token": "TA", "gate": "GATE123"}]}))
+    seen = {}
+    real = httpx.AsyncClient
+
+    def factory(*a, **kw):
+        def handler(req):
+            seen["cookie"] = req.headers.get("cookie")
+            seen["token"] = req.headers.get("x-admin-token")
+            return httpx.Response(200, json={"ok": True})
+        kw["transport"] = httpx.MockTransport(handler)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(panel.httpx, "AsyncClient", factory)
+    asyncio.run(panel.get("/api/v1/admin/app/health"))
+    assert seen == {"cookie": "nexus_gate=GATE123", "token": "TA"}
+
+
+def test_legacy_env_gate(hub_settings):
+    hub_settings.brain_url, hub_settings.brain_admin_token, hub_settings.brain_gate = "https://o.ru", "T", "G"
+    assert inventory._brain_headers(panels.resolve(""))["Cookie"] == "nexus_gate=G"
+
+
+def test_gate_cookie_name_matches_panel(vgx3d):
+    """Имя cookie — контракт с Caddyfile установщиков и brain (инвариант 25)."""
+    brain = (vgx3d / "brain/app/services/admin_devices.py").read_text(encoding="utf-8")
+    assert f'GATE_COOKIE = "{inventory.GATE_COOKIE}"' in brain
+    setup = (vgx3d / "brain-setup.sh").read_text(encoding="utf-8")
+    assert f"*{inventory.GATE_COOKIE}=" in setup
+
+
+def test_cli_gate(hub_settings, capsys):
+    assert panels.main(["add", "p", "https://c.ru", "TOK", "--gate", "GATESECRET"]) == 0
+    panels.main(["list"])
+    out = capsys.readouterr().out
+    assert "(gate)" in out and "GATESECRET" not in out

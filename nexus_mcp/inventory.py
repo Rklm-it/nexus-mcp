@@ -38,8 +38,16 @@ class InventoryError(Exception):
     """Ни панель, ни файл не дали списка нод — с причиной."""
 
 
+# Имя cookie, по которой Caddy панели пропускает мимо basic_auth. То же, что
+# в brain/app/core/panel_gate.py и Caddyfile установщиков (сторож в тестах).
+GATE_COOKIE = "nexus_gate"
+
+
 def _brain_headers(panel: dict) -> dict:
-    return {"X-Admin-Token": panel.get("token") or ""}
+    h = {"X-Admin-Token": panel.get("token") or ""}
+    if panel.get("gate"):
+        h["Cookie"] = f"{GATE_COOKIE}={panel['gate']}"
+    return h
 
 
 def _brain_auth(panel: dict) -> tuple[str, str] | None:

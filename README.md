@@ -46,7 +46,7 @@ timeout 10 openssl s_client -connect $IP:443 </dev/null 2>&1 | grep -E "Protocol
 
 ```bash
 bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
-  --brain-url https://<адрес вашей панели> --brain-token <VPN_ADMIN_TOKEN>
+  --brain-url https://<адрес вашей панели> --brain-token <VPN_ADMIN_TOKEN> --brain-gate <VPN_PANEL_GATE_SECRET>
 ```
 
 - адрес хаба по умолчанию — `<IP>.sslip.io`; свой домен — `--domain mcp.example.ru`;

@@ -9,7 +9,8 @@
 # Одной командой на VPS под root:
 #   bash <(curl -fsSL --connect-timeout 15 \
 #     https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
-#     --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN>
+#     --brain-url https://panel.example.ru --brain-token <VPN_ADMIN_TOKEN> \
+#     --brain-gate <VPN_PANEL_GATE_SECRET>
 #
 # Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
@@ -38,7 +39,7 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 
-DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; WITH_CADDY=1; WITH_XRAY=1
+DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
 VGX3D_URL="https://github.com/Rklm-it/vgx3d.git"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --port)        PORT="$2"; PORT_SET=1; shift 2 ;;
         --brain-url)   BRAIN_URL="${2%/}"; shift 2 ;;
         --brain-token) BRAIN_TOKEN="$2"; shift 2 ;;
+        --brain-gate)  BRAIN_GATE="$2"; shift 2 ;;
         --repo)        REPO_URL="$2"; shift 2 ;;
         --token)       GH_TOKEN="$2"; shift 2 ;;
         --vgx3d)       VGX3D_URL="$2"; shift 2 ;;
@@ -157,6 +159,7 @@ SECRET="$(envget NEXUS_MCP_SECRET)"; [ -n "$SECRET" ] || SECRET="$(gen 40)"
 PROBE_TOKEN="$(envget NEXUS_PROBE_TOKENS)"; [ -n "$PROBE_TOKEN" ] || PROBE_TOKEN="$(gen 32)"
 [ -n "$BRAIN_URL" ] || BRAIN_URL="$(envget NEXUS_BRAIN_URL)"
 [ -n "$BRAIN_TOKEN" ] || BRAIN_TOKEN="$(envget NEXUS_BRAIN_ADMIN_TOKEN)"
+[ -n "$BRAIN_GATE" ] || BRAIN_GATE="$(envget NEXUS_BRAIN_GATE)"
 TEST_SUB="$(envget NEXUS_TEST_SUB_URL)"
 ALLOW="$(envget NEXUS_ALLOW_ACTIONS)"; [ -n "$ALLOW" ] || ALLOW=0
 BASIC="$(envget NEXUS_BRAIN_BASIC_AUTH)"
@@ -169,6 +172,7 @@ NEXUS_MCP_SECRET=$SECRET
 NEXUS_PROBE_TOKENS=$PROBE_TOKEN
 NEXUS_BRAIN_URL=$BRAIN_URL
 NEXUS_BRAIN_ADMIN_TOKEN=$BRAIN_TOKEN
+NEXUS_BRAIN_GATE=$BRAIN_GATE
 NEXUS_BRAIN_BASIC_AUTH=$BASIC
 NEXUS_TEST_SUB_URL=$TEST_SUB
 NEXUS_ALLOW_ACTIONS=$ALLOW
