@@ -32,7 +32,7 @@ def test_snippet_has_only_agent_paths_and_right_rewrites():
              {"name": "vip", "url": "https://panel.example.ru/vip", "gate": "g123"},
              {"name": "Bad Name", "url": "https://x.example"}]
     text = relay.caddy_snippet(items)
-    assert "path /relay/main/api/v1/agent/* /relay/main/api/v1/traffic/report /relay/main/install/*" in text
+    assert "path /relay/main/api/v1/agent/* /relay/main/api/v1/traffic/report /relay/main/install/* /relay/main/health" in text
     assert "uri strip_prefix /relay/main" in text
     assert "uri path_regexp ^/relay/vip /vip" in text
     assert "rewrite" not in text                     # см. docstring модуля: rewrite выполняется раньше uri

@@ -12,6 +12,7 @@ import asyncio
 import hmac
 import json
 import logging
+import time
 
 import httpx
 
@@ -698,20 +699,69 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
             return {"ok": False, "error": "unknown_action", "detail": f"есть: {', '.join(ACTIONS)}"}
     except (InventoryError, recipes.RecipeError, relay.RelayError) as e:
         return _err(e)
-    res = await ssh.run_script(n, script, timeout=timeout)
-    out = res.as_dict()
-    if action == "use_relay":
-        out["relay"] = via
-    if action in ("update_agent", "use_relay"):
-        # rc=0 без отметки конца — не успех: скрипт мог оборваться.
-        done = recipes.UPDATE_DONE_MARK in res.stdout
-        out["update_finished"] = done
-        out["ok"] = res.ok and done
-        if res.ok and not done:
-            out["detail"] = "скрипт обновления не дошёл до конца — см. stdout"
-    audit.record("node_action", {"node": n["name"], "action": action, "service": service},
-                 out["ok"], res.failure or "")
-    return out
+    relay_via = via if action == "use_relay" else ""
+
+    async def work() -> dict:
+        res = await ssh.run_script(n, script, timeout=timeout)
+        out = res.as_dict()
+        if relay_via:
+            out["relay"] = relay_via
+        if action in ("update_agent", "use_relay"):
+            # rc=0 без отметки конца — не успех: скрипт мог оборваться.
+            done = recipes.UPDATE_DONE_MARK in res.stdout
+            out["update_finished"] = done
+            out["ok"] = res.ok and done
+            if res.ok and not done:
+                out["detail"] = "скрипт обновления не дошёл до конца — см. stdout"
+        audit.record("node_action", {"node": n["name"], "action": action, "service": service},
+                     out["ok"], res.failure or "")
+        return out
+
+    return await _job(f"{action} {n['name']}", work())
+
+
+# ── Долгие действия ────────────────────────────────────────────────────────
+# Обновление агента идёт минутами, а коннектор claude.ai рвёт вызов через
+# 60 с — вместе с вызовом отменялся бы и SSH к ноде посреди установки.
+# Поэтому действие живёт отдельной задачей: ждём его JOB_WAIT секунд, не
+# успело — отдаём номер, итог забирается action_status.
+
+JOB_WAIT = 45.0
+_JOBS: dict[str, dict] = {}
+
+
+async def _job(title: str, coro) -> dict:
+    import uuid
+
+    jid = uuid.uuid4().hex[:10]
+    task = asyncio.create_task(coro)
+    _JOBS[jid] = {"title": title, "task": task, "started": time.time()}
+    for old in [k for k, v in _JOBS.items() if time.time() - v["started"] > 86400]:
+        _JOBS.pop(old, None)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), JOB_WAIT)
+    except asyncio.TimeoutError:
+        return {"ok": True, "running": True, "job": jid, "title": title,
+                "detail": f"действие идёт дольше {int(JOB_WAIT)} с и продолжается на хабе",
+                "next": f"action_status(job='{jid}') — через минуту-две"}
+
+
+@mcp.tool()
+async def action_status(job: str) -> dict:
+    """Итог долгого действия (node_action update_agent / use_relay), если оно
+    не уложилось в ожидание вызова и вернуло номер job."""
+    j = _JOBS.get(job)
+    if not j:
+        return {"ok": False, "error": "unknown_job",
+                "detail": "такой задачи нет: хаб перезапускался или номер неверный — смотрите audit_tail"}
+    t = j["task"]
+    elapsed = int(time.time() - j["started"])
+    if not t.done():
+        return {"ok": True, "running": True, "job": job, "title": j["title"], "elapsed_s": elapsed}
+    try:
+        return {**t.result(), "job": job, "title": j["title"], "elapsed_s": elapsed}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "job": job, "error": type(e).__name__, "detail": str(e)[:300]}
 
 
 # ── HTTP: пробники и здоровье ──────────────────────────────────────────────

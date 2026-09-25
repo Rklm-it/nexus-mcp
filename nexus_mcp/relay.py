@@ -37,7 +37,9 @@ from urllib.parse import urlparse
 
 from nexus_mcp import config, panels
 
-RELAY_PATHS = ("/api/v1/agent/*", "/api/v1/traffic/report", "/install/*")
+# /health — публичный у панели; без него разбор ноды на реле видел 404 от
+# хаба и писал «нода не достаёт до панели» при живом heartbeat.
+RELAY_PATHS = ("/api/v1/agent/*", "/api/v1/traffic/report", "/install/*", "/health")
 SNIPPET = Path(os.environ.get("NEXUS_RELAY_CADDY", "/etc/caddy-nexus-mcp/relay.caddy"))
 CADDYFILE = Path("/etc/caddy-nexus-mcp/Caddyfile")
 _NAME = re.compile(r"^[a-z0-9_-]{1,32}$")

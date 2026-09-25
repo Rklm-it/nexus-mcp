@@ -679,3 +679,32 @@ def test_bad_via_is_a_reason_not_a_crash(hub_settings, tmp_path):
     hub_settings.ssh_key = str(key)
     r = asyncio.run(ssh.run_script({"name": "n", "ssh_host": "1.2.3.4", "ssh_via": "a b"}, "true"))
     assert r.ok is False and r.failure == "bad_via"
+
+
+# ── Долгие действия ────────────────────────────────────────────────────────
+
+def test_long_action_survives_caller_timeout(monkeypatch):
+    """Коннектор claude.ai рвёт вызов через 60 с, а обновление агента идёт
+    минутами: действие обязано доработать и отдать итог по номеру задачи."""
+    from nexus_mcp import server
+
+    monkeypatch.setattr(server, "JOB_WAIT", 0.1)
+
+    async def slow():
+        await asyncio.sleep(0.4)
+        return {"ok": True, "update_finished": True}
+
+    async def go():
+        first = await server._job("update_agent de-1", slow())
+        assert first["running"] and first["job"]
+        # Вызов «оборвался» — задача живёт; спрашиваем итог, пока идёт и после.
+        mid = await server.action_status(first["job"])
+        assert mid["running"] is True
+        await asyncio.sleep(0.5)
+        done = await server.action_status(first["job"])
+        assert done["ok"] and done["update_finished"] and "running" not in done
+        quick = await server._job("restart", asyncio.sleep(0, result={"ok": True}))
+        assert quick == {"ok": True}                        # быстрые — как раньше, сразу итог
+        assert (await server.action_status("nope"))["error"] == "unknown_job"
+
+    asyncio.run(go())
