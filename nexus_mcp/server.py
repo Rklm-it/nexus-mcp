@@ -18,7 +18,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from nexus_mcp import audit, config, diagnose, inventory, playbook, recipes, ssh
+from nexus_mcp import audit, config, diagnose, inventory, panel, playbook, recipes, ssh
 from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, ProbeError, registry
 
@@ -30,7 +30,13 @@ INSTRUCTIONS = """\
 фильтром: TCP открывается, пакеты с данными пропадают. Поэтому нода бывает красной
 в панели при живой ноде, и наоборот.
 
-Как разбирать:
+Панель: panel_health — проверка всего одной ручкой (ядро, контейнеры, боты, ноды,
+мониторинг, платежи), с неё начинать общий осмотр. panel_findings — находки центра
+состояния. Дальше panel_users / panel_user_diagnose (почему у юзера нет пинга),
+panel_inbound_diagnose, panel_logs, panel_payments, panel_get для любой админской ручки.
+Секреты в ответах панели замаскированы — так и задумано.
+
+Как разбирать ноды:
 1. nodes_list(only_problems=True) — какие ноды красные/без heartbeat.
 2. node_diagnose(node) — панель + SSH-обзор + доступность IP + сквозная проверка.
    Для домашних нод добавляй probes=[имена домашних пробников] (probes_list):
@@ -253,6 +259,131 @@ async def fix_playbook(symptom: str = "") -> dict:
 async def audit_tail(n: int = 30) -> dict:
     """Последние вызовы хаба — кто что делал с нодами."""
     return {"ok": True, "entries": audit.tail(max(1, min(n, 500)))}
+
+
+# ── Панель ─────────────────────────────────────────────────────────────────
+
+async def _panel(call, *args, **kwargs) -> dict:
+    try:
+        data = await call(*args, **kwargs)
+    except (panel.PanelError, InventoryError) as e:
+        return _err(e)
+    return {"ok": True, "data": data}
+
+
+@mcp.tool()
+async def panel_health(fresh: bool = False) -> dict:
+    """Проверка всей панели одной ручкой: ядро, контейнеры, боты, ноды,
+    мониторинг, платежи — то же, что видит приложение администратора.
+    fresh=True — мимо 20-секундного кэша."""
+    return await _panel(panel.get, "/api/v1/admin/app/health", {"fresh": fresh or None})
+
+
+@mcp.tool()
+async def panel_overview() -> dict:
+    """Цифры главного экрана: юзеры (всего/активные/заблокированные), онлайн,
+    выручка, версия панели."""
+    return await _panel(panel.get, "/api/v1/admin/app/overview")
+
+
+@mcp.tool()
+async def panel_findings(fresh: bool = False) -> dict:
+    """Находки центра состояния (что панель сама считает проблемой) с
+    объяснениями. Требует фичу monitoring_pro в лицензии."""
+    return await _panel(panel.get, "/api/v1/admin/monitoring/overview", {"fresh": fresh or None})
+
+
+@mcp.tool()
+async def panel_regions(hours: int = 6) -> dict:
+    """Регионы и операторы клиентов: у кого из провайдеров проблемы."""
+    return await _panel(panel.get, "/api/v1/admin/monitoring/regions", {"hours": hours})
+
+
+@mcp.tool()
+async def panel_versions() -> dict:
+    """Версии панели и агентов на всех нодах — кто отстал."""
+    return await _panel(panel.get, "/api/v1/admin/nodes/versions")
+
+
+@mcp.tool()
+async def panel_users(search: str = "", status: str = "", limit: int = 20) -> dict:
+    """Найти юзеров: search — ник, имя, telegram_id или часть UUID;
+    status — active | inactive | paid_inactive."""
+    return await _panel(panel.get, "/api/v1/admin/users",
+                        {"search": search, "status": status, "limit": max(1, min(limit, 100))})
+
+
+@mcp.tool()
+async def panel_user_diagnose(user_id: str) -> dict:
+    """Почему у юзера нет пинга: панель проверяет каждую ссылку его подписки
+    и объясняет. user_id — UUID из panel_users."""
+    return await _panel(panel.get, f"/api/v1/admin/users/{user_id}/diagnose-links", timeout=90)
+
+
+@mcp.tool()
+async def panel_inbound_diagnose(inbound_id: str) -> dict:
+    """Разбор инбаунда: конфиг в панели против того, что реально на ноде."""
+    return await _panel(panel.get, f"/api/v1/admin/inbounds/{inbound_id}/diagnose", timeout=90)
+
+
+@mcp.tool()
+async def panel_logs(source: str = "brain", service: str = "", lines: int = 150) -> dict:
+    """Логи через панель. source="brain" — сервисы панели (service: brain | bot |
+    admin-bot | dealer-bot | support-bot | postgres | redis); source=<имя ноды> —
+    логи ноды (service: vpn-cell | xray | hysteria-server; идёт через панель,
+    поэтому для красной ноды используйте node_logs по SSH)."""
+    lines = max(10, min(lines, 500))
+    if source == "brain":
+        return await _panel(panel.get, "/api/v1/admin/logs/brain",
+                            {"service": service or "brain", "lines": lines})
+    try:
+        n = await inventory.find_node(source)
+    except InventoryError as e:
+        return _err(e)
+    if not n.get("id"):
+        return {"ok": False, "error": "not_in_panel", "detail": "ноды нет в панели — node_logs по SSH"}
+    return await _panel(panel.get, f"/api/v1/admin/logs/node/{n['id']}",
+                        {"service": service or "vpn-cell", "lines": lines}, timeout=60)
+
+
+@mcp.tool()
+async def panel_payments(limit: int = 25, status: str = "") -> dict:
+    """Последние платежи (status — фильтр, например pending | paid | failed)."""
+    return await _panel(panel.get, "/api/v1/admin/payments",
+                        {"limit": max(1, min(limit, 100)), "status": status})
+
+
+@mcp.tool()
+async def panel_get(path: str, params: dict | None = None) -> dict:
+    """Любая админская GET-ручка панели, когда нет готового инструмента.
+
+    path — например "/api/v1/admin/dashboard", "/api/v1/servers/<id>",
+    "/api/v1/admin/expiring", "/api/v1/admin/users/<id>/connection-log".
+    Разрешены /api/v1/admin/*, /api/v1/servers*, /api/v1/inbounds*,
+    /api/v1/outbounds*, /api/v1/users*, /api/v1/traffic*, /health.
+    """
+    return await _panel(panel.get, path, params or {}, timeout=60)
+
+
+@mcp.tool()
+async def panel_action(path: str, confirm: bool = False, params: dict | None = None) -> dict:
+    """Действие в панели из короткого списка (проверить/перезапустить/обновить
+    ноду, прогон центра состояния, пересинхронизация). Только с согласия
+    человека: NEXUS_ALLOW_ACTIONS=1 на хабе и confirm=true."""
+    if not config.settings.allow_actions:
+        return {"ok": False, "error": "actions_disabled",
+                "detail": "действия выключены на хабе (NEXUS_ALLOW_ACTIONS=1 чтобы включить)"}
+    try:
+        panel.check_action_path(path)
+    except panel.PanelError as e:
+        return _err(e)
+    if not confirm:
+        return {"ok": False, "error": "need_confirm",
+                "detail": "действие меняет панель или ноду: спросите человека и повторите с confirm=true"}
+    res = await _panel(panel.post_action, path, params or {})
+    audit.record("panel_action", {"path": path, "params": params}, res.get("ok", False),
+                 res.get("detail", ""))
+    return res
 
 
 # ── Действия ───────────────────────────────────────────────────────────────
