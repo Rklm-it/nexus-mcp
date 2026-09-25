@@ -193,7 +193,7 @@ journalctl -u vpn-cell --since "-1min" --no-pager -o cat | grep -iE "heartbeat|�
 """
 
 
-def update_agent(brain_url: str) -> str:
+def update_agent(brain_url: str, via: str = "") -> str:
     """Обновить агент скриптом панели — тем же путём, что «Обновить агент»
     в самой панели: `<панель>/install/cell-update.sh` (без пароля, тарбол
     агента берётся оттуда же, CELL_BRAIN_URL скрипт прописывает сам). Не из
@@ -201,13 +201,24 @@ def update_agent(brain_url: str) -> str:
 
     Скрипт сперва скачивается целиком и только потом выполняется: `bash <(curl)`
     при обрыве выполнил бы половину установки и вышел с нулём (инвариант 32).
+
+    via — реле хаба (`https://<хаб>/relay/<панель>`) для ноды, которая не
+    достаёт до панели: скрипт и тарбол качаются через него, и адрес реле же
+    уходит агенту в CELL_BRAIN_URL (скрипт вшивает адрес панели в BRAIN_URL —
+    его подменяем, иначе тарбол и heartbeat снова пошли бы напрямую).
     """
-    src = shlex.quote(_url(brain_url) + "/install/cell-update.sh")
+    base = _url(via or brain_url)
+    src = shlex.quote(base + "/install/cell-update.sh")
+    swap = ""
+    if via:
+        swap = (f"grep -q '^BRAIN_URL=' $F || {{ echo \"BAD_SCRIPT: в скрипте панели нет BRAIN_URL\"; exit 5; }}\n"
+                f"sed -i 's|^BRAIN_URL=.*|BRAIN_URL=\"{base}\"|' $F\n"
+                f"echo \"RELAY: агент пойдёт к панели через {base}\"\n")
     return f"""set +e
 F=/tmp/nexus-cell-update.sh
 rm -f $F
-curl -fsSL --connect-timeout 15 -m 120 -o $F {src} || {{ echo "DOWNLOAD_FAILED: скрипт обновления не скачался с панели"; exit 4; }}
-bash $F 2>&1 | sed -r 's/\\x1B\\[[0-9;]*m//g' | tail -60
+curl -fsSL --connect-timeout 15 -m 120 -o $F {src} || {{ echo "DOWNLOAD_FAILED: скрипт обновления не скачался с {'реле хаба' if via else 'панели'}"; exit 4; }}
+{swap}bash $F 2>&1 | sed -r 's/\\x1B\\[[0-9;]*m//g' | tail -60
 echo "rc=${{PIPESTATUS[0]}}"
 """
 

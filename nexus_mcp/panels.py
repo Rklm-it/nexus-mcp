@@ -124,6 +124,13 @@ def remove(name: str) -> bool:
     return True
 
 
+def _refresh_relay() -> None:
+    """У каждой панели хаба — свой маршрут реле (nexus_mcp.relay)."""
+    from nexus_mcp import relay
+
+    print(relay.refresh())
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -148,11 +155,13 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "add":
             v = add(args.name, args.url, args.token, args.basic, args.gate)
             print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
+            _refresh_relay()
         elif args.cmd == "remove":
             if not remove(args.name):
                 print(f"панели «{args.name}» в файле нет", file=sys.stderr)
                 return 1
             print(f"удалена {args.name}")
+            _refresh_relay()
     except PanelConfigError as e:
         print(f"ошибка: {e}", file=sys.stderr)
         return 2

@@ -33,6 +33,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt pytest
+      # Маршруты реле хаба проверяются на настоящем Caddy (tests/test_relay.py):
+      # без него тест в CI падает, а не пропускается.
+      - name: Caddy для теста реле
+        run: |
+          curl -fsSL --connect-timeout 15 -m 120 -o /tmp/caddy.tgz \
+            https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_amd64.tar.gz
+          tar xzf /tmp/caddy.tgz -C /tmp caddy
+          echo "CADDY_BIN=/tmp/caddy" >> "$GITHUB_ENV"
       - run: python -m pytest -q tests
         env:
           NEXUS_REPO_DIR: ${{ github.workspace }}/../vgx3d

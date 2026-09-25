@@ -25,6 +25,7 @@ SOURCES = {
     "naive": "https://www.youtube.com/watch?v=vnTgnL1tskw — swrneko, 06.04.2026",
     "vmess_http": "https://www.youtube.com/watch?v=y80eCKUbuP8 — LinkOfFreedom, 23.08.2026",
     "remnawave_docker": "https://www.youtube.com/watch?v=sKVHWAkoYFo — Евгеньевич, 25.01.2026",
+    "journal_relay": "vgx3d docs/journal/MONITORING.md, «Реле нода → хаб → панель» 25.09.2026",
     "owner_whitelist": "слово владельца сервиса, 25.09.2026 (vgx3d CLAUDE.md, инвариант 45; "
                        "docs/journal/CDN.md)",
 }
@@ -150,6 +151,13 @@ PLAYBOOK: dict[str, list[dict]] = {
          "src": ["journal_monitoring"]},
     ],
     "node_cant_reach_panel": [
+        {"do": "node_action(action='use_relay'): агент обновляется через реле хаба и ходит к панели "
+               "через него (`https://<хаб>/relay/<панель>`): heartbeat, обратный канал, трафик, "
+               "обновления.",
+         "why": "Связка «сеть хостера ноды → российский IP панели» режется выборочно (eng41s2 — да, "
+                "ger41s2 — нет), а хаб достаёт до обеих сторон. Панель остаётся на месте, клиентам "
+                "ничего не меняется.",
+         "evidence": "ours", "src": ["journal_relay"]},
         {"do": "Дать ноде другой путь к панели: адрес панели за CDN/Cloudflare или через живую "
                "ноду; управлять через хаб, пока путь не появится.",
          "why": "Если нода не достаёт до панели, ни heartbeat, ни обратный канал не поднимутся.",

@@ -13,6 +13,8 @@ import hmac
 import json
 import logging
 
+import httpx
+
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
@@ -22,6 +24,7 @@ from urllib.parse import urlparse
 
 from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbook, recipes, ssh
 from nexus_mcp import links as sublinks
+from nexus_mcp import relay
 from nexus_mcp import panel as panel_api
 from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, ProbeError, registry
@@ -633,7 +636,21 @@ async def panel_action(path: str, confirm: bool = False, params: dict | None = N
 
 # ── Действия ───────────────────────────────────────────────────────────────
 
-ACTIONS = ("restart", "set_brain_url", "update_agent")
+ACTIONS = ("restart", "set_brain_url", "update_agent", "use_relay")
+
+
+async def _relay_check(via: str) -> str:
+    """Реле хаба отвечает сам по себе? Иначе нода получит пустой скрипт и
+    непонятную ошибку — проверяем с хаба до того, как трогать ноду."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False) as c:
+            r = await c.get(via + "/install/cell-update.sh")
+    except httpx.HTTPError as e:
+        return f"реле {via} не отвечает с самого хаба: {e}"
+    if r.status_code != 200 or "BRAIN_URL=" not in r.text:
+        return (f"реле {via} ответило {r.status_code}, а не скриптом обновления — маршрутов реле нет "
+                "в Caddy хаба: обновите хаб установщиком или выполните nexus-mcp-panels list на хабе")
+    return ""
 
 
 @mcp.tool()
@@ -644,7 +661,11 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
     restart — перезапустить service (vpn-cell | xray | hysteria-server);
     set_brain_url — прописать адрес панели в .env агента и перезапустить его;
     update_agent — обновить агент скриптом панели <панель>/install/cell-update.sh
-    (он же прописывает адрес панели в .env агента).
+    (он же прописывает адрес панели в .env агента);
+    use_relay — для ноды, которая НЕ ДОСТАЁТ до панели (node_cant_reach_panel,
+    DOWNLOAD_FAILED при update_agent): обновить агент через реле хаба и
+    прописать реле адресом панели. Нода начнёт ходить к панели через хаб:
+    heartbeat, обратный канал, трафик, обновления.
     brain_url по умолчанию — адрес панели, к которой относится нода.
     """
     s = config.settings
@@ -665,13 +686,23 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
             script, timeout = recipes.set_brain_url(url), 60
         elif action == "update_agent":
             script, timeout = recipes.update_agent(url), 900
+        elif action == "use_relay":
+            if not n.get("panel"):
+                return {"ok": False, "error": "no_panel", "detail": "нода не из панели — реле некуда вести"}
+            via = relay.relay_url(n["panel"])
+            problem = await _relay_check(via)
+            if problem:
+                return {"ok": False, "error": "relay_down", "detail": problem}
+            script, timeout = recipes.update_agent(url, via=via), 900
         else:
             return {"ok": False, "error": "unknown_action", "detail": f"есть: {', '.join(ACTIONS)}"}
-    except (InventoryError, recipes.RecipeError) as e:
+    except (InventoryError, recipes.RecipeError, relay.RelayError) as e:
         return _err(e)
     res = await ssh.run_script(n, script, timeout=timeout)
     out = res.as_dict()
-    if action == "update_agent":
+    if action == "use_relay":
+        out["relay"] = via
+    if action in ("update_agent", "use_relay"):
         # rc=0 без отметки конца — не успех: скрипт мог оборваться.
         done = recipes.UPDATE_DONE_MARK in res.stdout
         out["update_finished"] = done

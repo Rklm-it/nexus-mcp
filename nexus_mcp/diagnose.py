@@ -91,8 +91,8 @@ def node_findings(ov: dict, brain_url: str) -> list[dict]:
             out.append(finding(CRIT, "node_cant_reach_panel",
                                f"Нода не достаёт до панели ({ov.get('brain_url')}): путь нода→панель "
                                "тоже режется. Heartbeat не дойдёт, пока нет обходного пути.",
-                               "node_run(recipe='brain_path') для подробностей; обходной путь — "
-                               "адрес панели за CDN/другим IP или relay через живую ноду."))
+                               "node_action(action='use_relay') — нода пойдёт к панели через реле хаба "
+                               "(хаб до панели достаёт); подробности пути — node_run(recipe='brain_path')."))
         elif ov.get("brain_basic_auth") == "yes":
             out.append(finding(CRIT, "heartbeat_behind_basic_auth",
                                "Ручка heartbeat закрыта basic_auth в Caddy панели: нода стучится, а "

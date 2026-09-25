@@ -381,12 +381,20 @@ if [ "$WITH_CADDY" = "1" ]; then
     fi
     CADDY_BIN="$(command -v caddy)"
     mkdir -p /etc/caddy-nexus-mcp
+    # Реле нода → хаб → панель для нод, до которых путь к панели режется
+    # (nexus_mcp/relay.py). Файл маршрутов пересобирает и nexus-mcp-panels.
+    if ! ( cd "$APP" && set -a && . "$ENVF" && set +a && \
+           "$BASE/venv/bin/python" -m nexus_mcp.relay caddy --no-reload ); then
+        warn "маршруты реле не собрались — хаб работает без реле"
+        echo "# реле не собрано установщиком" > /etc/caddy-nexus-mcp/relay.caddy
+    fi
     cat > /etc/caddy-nexus-mcp/Caddyfile <<EOF
 {
     http_port 80
     https_port $PORT
 }
 $DOMAIN:$PORT {
+    import /etc/caddy-nexus-mcp/relay.caddy
     handle /chat/* {
         reverse_proxy 127.0.0.1:8766 {
             flush_interval -1

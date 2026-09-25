@@ -70,6 +70,8 @@ def describe_action(tool: str, inp: dict) -> str:
             return f"Перезапустить {inp.get('service') or 'vpn-cell'} на ноде {node}"
         if action == "update_agent":
             return f"Обновить агент на ноде {node}"
+        if action == "use_relay":
+            return f"Перевести ноду {node} на реле хаба: обновить агент и слать панели через хаб"
         if action == "set_brain_url":
             return f"Прописать адрес панели на ноде {node}" + (
                 f": {inp['brain_url']}" if inp.get("brain_url") else "")

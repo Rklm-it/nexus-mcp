@@ -142,7 +142,7 @@ python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ро�
 | `panel_inbound_diagnose`, `panel_logs`, `panel_payments` | инбаунд в панели против ноды, логи сервисов панели и нод, платежи |
 | `panel_get` | любая админская GET-ручка (`/api/v1/admin/*`, серверы, инбаунды, юзеры) |
 | `panel_action` | короткий список действий: проверка/перезапуск/обновление ноды, прогон центра состояния, пересинхронизация; только с флагом и `confirm=true` |
-| `node_action` | restart / set_brain_url / update_agent; только при `NEXUS_ALLOW_ACTIONS=1` и `confirm=true` |
+| `node_action` | restart / set_brain_url / update_agent / use_relay (нода не достаёт до панели — ходит к ней через реле хаба); только при `NEXUS_ALLOW_ACTIONS=1` и `confirm=true` |
 | `sim_probe`, `sim_vless`, `sim_geo` | проверки с SIM-карт операторов РФ, в т.ч. с белыми списками, и из городов РФ (bschekbot, платно: preview → `confirm=true` + `max_credits`, дневной потолок хаба) |
 | `sim_units`, `sim_account`, `sim_result`, `sim_cancel` | единицы оператор × округ × БС, баланс, результат и отмена долгой проверки |
 | `audit_tail` | журнал вызовов |
