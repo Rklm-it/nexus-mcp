@@ -328,7 +328,14 @@ EOF
     systemctl daemon-reload
     systemctl enable nexus-mcp-caddy >/dev/null 2>&1
     systemctl restart nexus-mcp-caddy
-    log "Caddy запущен; сертификат для $DOMAIN выпускается при первом запросе"
+    log "Caddy запущен; жду сертификат для $DOMAIN (до 90 секунд)"
+    # Сертификат выпускается при первом запросе — сразу после старта https
+    # ещё не отвечает, и итог ниже показал бы ложный ✗.
+    HUBURL="https://$DOMAIN"; [ "$PORT" = "443" ] || HUBURL="https://$DOMAIN:$PORT"
+    for _ in $(seq 18); do
+        curl -fsS --connect-timeout 5 -m 10 "$HUBURL/healthz" >/dev/null 2>&1 && break
+        sleep 5
+    done
 fi
 
 # ── Итог ─────────────────────────────────────────────────────────────────────
