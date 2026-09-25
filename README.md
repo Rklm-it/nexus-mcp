@@ -68,7 +68,7 @@ bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it
 - `--no-caddy` — если TLS отдаёт ваш собственный прокси на `127.0.0.1:8765`;
 - нужен свободный 80 порт: через него Caddy получает сертификат.
 
-Ссылка коннектора в любой момент — `nexus-mcp-info --url`. Ещё панели —
+Меню хаба со всеми частыми действиями — `nexus-hub`. Ссылка коннектора в любой момент — `nexus-mcp-info --url`. Ещё панели —
 `nexus-mcp-panels add <имя> <url> <токен>` (см. DEPLOY.md, «Несколько панелей»).
 
 Код встаёт в `/opt/nexus-mcp/app`. Репозиторий панели (vgx3d, приватный)

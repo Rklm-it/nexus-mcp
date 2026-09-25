@@ -438,12 +438,14 @@ fi
 install -m 0755 "$APP/bin/nexus-mcp-info" /usr/local/bin/nexus-mcp-info
 install -m 0755 "$APP/bin/nexus-mcp-panels" /usr/local/bin/nexus-mcp-panels
 install -m 0755 "$APP/bin/nexus-chat-login" /usr/local/bin/nexus-chat-login
+install -m 0755 "$APP/bin/nexus-hub" /usr/local/bin/nexus-hub
 echo
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Хаб установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 /usr/local/bin/nexus-mcp-info || true
 echo "Показать это снова в любой момент: nexus-mcp-info   (только ссылку: nexus-mcp-info --url)"
+echo -e "${CYAN}Меню хаба — панели, ноды, ключи, секреты, журналы: nexus-hub${NC}"
 echo
 FINISHED=1
 }

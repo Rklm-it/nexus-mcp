@@ -74,4 +74,5 @@ else
     echo "   NEXUS_BSBORD_KEY=bsk_live_… в $ENVF (кабинет bsbord.com → API, тариф Bronze+)"
 fi
 echo
+echo "Меню хаба (панели, ноды, ключи, секреты, журналы): nexus-hub"
 echo "Настройки: $ENVF → systemctl restart nexus-mcp nexus-chat"

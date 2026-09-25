@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# Меню хаба Nexus MCP: состояние и все частые действия в одном месте.
+#   nexus-hub          — меню
+#   nexus-hub status   — только шапка состояния (для проверки по ssh)
+#
+# Ввод — только с терминала, проверка открытием (инвариант 27 vgx3d).
+# Секреты по умолчанию не печатаются; ключи вводятся без эха.
+set -uo pipefail
+
+# Пути подменяются только для прогона в тестах.
+ENVF="${NEXUS_HUB_ENV:-/etc/nexus-mcp.env}"
+ETC="${NEXUS_HUB_ETC:-/etc/nexus-mcp}"
+BASE="${NEXUS_HUB_BASE:-/opt/nexus-mcp}"
+APP=$BASE/app
+PY=$BASE/venv/bin/python
+KEY=$ETC/id_ed25519
+TTY="${NEXUS_HUB_TTY:-/dev/tty}"
+
+if [ -t 1 ]; then
+    B=$'\033[1m'; D=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; N=$'\033[0m'
+else
+    B=""; D=""; R=""; G=""; Y=""; C=""; N=""
+fi
+OK="${G}●${N}"; BAD="${R}●${N}"; WARN="${Y}●${N}"
+
+die() { echo "${R}✗${N} $*" >&2; exit 1; }
+[ "$(id -u)" = "0" ] || die "нужен root"
+[ -r "$ENVF" ] || die "нет $ENVF — хаб не установлен"
+
+envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+# Записать ключ в .env: заменить строку или дописать. Копия — перед правкой.
+envset() {
+    cp -a "$ENVF" "$ENVF.bak"
+    if grep -qE "^$1=" "$ENVF"; then
+        local tmp; tmp="$(mktemp)"
+        awk -v k="$1" -v v="$2" 'BEGIN{FS=OFS="="} $1==k{print k"="v; next} {print}' "$ENVF" > "$tmp" && cat "$tmp" > "$ENVF"
+        rm -f "$tmp"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$ENVF"
+    fi
+}
+hubpy() { ( cd "$APP" && set -a && . "$ENVF" && set +a && "$PY" -m nexus_mcp.cli "$@" ) 2>&1; }
+gen() { head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
+svc_dot() { systemctl is-active --quiet "$1" 2>/dev/null && echo "$OK" || echo "$BAD"; }
+
+hub_url() {
+    local d p; d="$(envget NEXUS_MCP_PUBLIC_HOSTS)"; p="$(envget NEXUS_MCP_PUBLIC_PORT)"
+    [ -n "$d" ] || { echo "(адрес не задан)"; return; }
+    if [ -z "$p" ] || [ "$p" = "443" ]; then echo "https://$d"; else echo "https://$d:$p"; fi
+}
+
+# ── Ввод ─────────────────────────────────────────────────────────────────────
+ask()    { local a; printf '%s' "${C}›${N} $1 " >&2; IFS= read -r a <&3 || a=""; printf '%s' "$a"; }
+ask_s()  { local a; printf '%s' "${C}›${N} $1 " >&2; IFS= read -rs a <&3 || a=""; echo >&2; printf '%s' "$a"; }
+yes_no() { local a; a="$(ask "$1 [д/н]")"; case "$a" in д|Д|y|Y|да|Да|yes) return 0 ;; *) return 1 ;; esac; }
+pause()  { printf '\n%s' "${D}Enter — назад в меню${N}" >&2; local _; IFS= read -r _ <&3 || true; }
+title()  { printf '\n%s\n%s\n' "${B}${C}$1${N}" "${D}$(printf '─%.0s' $(seq 1 56))${N}"; }
+ok()     { echo "${G}✓${N} $*"; }
+bad()    { echo "${R}✗${N} $*"; }
+restart_hub() { systemctl restart nexus-mcp nexus-chat && ok "хаб и чат перезапущены" || bad "перезапуск не прошёл: journalctl -u nexus-mcp -n 30"; }
+
+# ── Шапка ────────────────────────────────────────────────────────────────────
+header() {
+    local claude sim acts audit np chat
+    chat="$(curl -fsS --connect-timeout 2 -m 4 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
+    if [ -z "$chat" ]; then claude="$BAD чат не отвечает"
+    elif echo "$chat" | grep -q '"logged_in":true'; then claude="$OK вошёл в подписку"
+    else claude="$WARN не вошёл — пункт 7"; fi
+    sim="$(hubpy sim | tail -1)"
+    case "$sim" in "ключ не задан") sim="$D${sim}$N" ;; баланс*) sim="$OK $sim" ;; *) sim="$WARN $sim" ;; esac
+    [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ] && acts="${G}включены${N}" || acts="${D}выключены${N}"
+    audit="$(envget NEXUS_CHAT_AUDIT_AT)"; [ -n "$audit" ] || audit="${D}нет${N}"
+    np="$(hubpy panels-count | tail -1)"
+    printf '\n%s\n' "${B}╭─ Nexus Hub ${N}${D}$(hub_url)${N}"
+    printf '%s  хаб %s   чат %s   caddy %s\n' "${B}│${N}" "$(svc_dot nexus-mcp)" "$(svc_dot nexus-chat)" "$(svc_dot nexus-mcp-caddy)"
+    printf '%s  Claude  %s\n' "${B}│${N}" "$claude"
+    printf '%s  SIM     %s\n' "${B}│${N}" "$sim"
+    printf '%s  Панели %s · действия из чата %s · аудит %s\n' "${B}│${N}" "${B}$np${N}" "$acts" "$audit"
+    printf '%s\n' "${B}╰────────────────────────────────────────────────────────${N}"
+}
+
+menu() {
+    local s="${D}"
+    cat <<EOF
+
+ ${B}Панели${N}
+   1  Список панелей                 ${s}+ маршруты реле${N}
+   2  Добавить панель                ${s}с проверкой, что отвечает${N}
+   3  Удалить панель
+ ${B}Ноды${N}
+   4  Ноды всех панелей              ${s}статус и heartbeat${N}
+   5  Положить ключ хаба на ноду     ${s}напрямую или через живую ноду${N}
+   6  Проверить SSH до ноды
+ ${B}Claude и приложение${N}
+   7  Вход Claude в подписку
+   8  Строка подключения приложения
+   9  Плановый аудит                 ${s}время сводки уведомлением${N}
+ ${B}SIM-проверки (bschekbot)${N}
+  10  Ключ bschekbot                 ${s}ввод скрыт${N}
+  11  Дневной потолок трат
+ ${B}Обслуживание${N}
+  12  Действия из чата: вкл / выкл
+  13  Сменить секреты                ${s}коннектор, пробник, чат${N}
+  14  Ссылка коннектора claude.ai
+  15  Журналы                        ${s}хаб / чат / Caddy / установка${N}
+  16  Перезапустить хаб и чат
+  17  Обновить хаб
+   0  Выход
+EOF
+}
+
+# ── Действия ─────────────────────────────────────────────────────────────────
+a_panels() {
+    title "Панели хаба"
+    nexus-mcp-panels list 2>&1 | sed 's/^/  /'
+    echo; echo "${D}Реле для нод: $(hub_url)/relay/<имя панели>${N}"
+}
+
+a_panel_add() {
+    title "Добавить панель"
+    echo "${D}Значения — из .env панели: grep -E '^(VPN_ADMIN_TOKEN|VPN_PANEL_GATE_SECRET)=' /opt/nexus/.env${N}"
+    local name url token gate
+    name="$(ask "Имя (латиница, цифры, - и _, например shop1):")"
+    [ -n "$name" ] || { bad "пустое имя"; return; }
+    url="$(ask "Адрес панели (https://домен):")"
+    token="$(ask_s "VPN_ADMIN_TOKEN (ввод скрыт):")"
+    gate="$(ask_s "VPN_PANEL_GATE_SECRET (ввод скрыт, Enter — нет):")"
+    echo "… проверяю панель"
+    local chk; chk="$(hubpy panel-check "$url" "$token" "$gate" | tail -1)"
+    echo "  $chk"
+    case "$chk" in ✓*) ;; *) yes_no "Панель не прошла проверку. Всё равно добавить?" || return ;; esac
+    if [ -n "$gate" ]; then nexus-mcp-panels add "$name" "$url" "$token" --gate "$gate"
+    else nexus-mcp-panels add "$name" "$url" "$token"; fi
+}
+
+a_panel_remove() {
+    title "Удалить панель"
+    nexus-mcp-panels list 2>&1 | sed 's/^/  /'
+    local name; name="$(ask "Имя панели для удаления:")"
+    [ -n "$name" ] || return
+    [ "$name" = "main" ] && [ -n "$(envget NEXUS_BRAIN_URL)" ] && {
+        bad "main задана при установке (NEXUS_BRAIN_URL в $ENVF) — её убирают правкой файла"; return; }
+    yes_no "Удалить панель «$name» из хаба?" && nexus-mcp-panels remove "$name"
+}
+
+a_nodes() {
+    title "Ноды всех панелей"
+    echo "… спрашиваю панели"
+    hubpy nodes
+}
+
+a_key_to_node() {
+    title "Ключ хаба на ноду"
+    echo "${D}Ключ: $(cat "$KEY.pub" 2>/dev/null | cut -c1-60)…${N}"
+    local ip port user jump
+    ip="$(ask "IP ноды:")"; [ -n "$ip" ] || return
+    port="$(ask "SSH-порт [22]:")"; port="${port:-22}"
+    user="$(ask "Пользователь [root]:")"; user="${user:-root}"
+    jump="$(ask "Через живую ноду? (root@IP, Enter — напрямую):")"
+    echo "${D}Спросит пароль $user@$ip.${N}"
+    if [ -n "$jump" ]; then
+        ssh-copy-id -i "$KEY.pub" -p "$port" -o ProxyJump="$jump" -o ConnectTimeout=15 "$user@$ip" <&3
+    else
+        ssh-copy-id -i "$KEY.pub" -p "$port" -o ConnectTimeout=15 "$user@$ip" <&3
+    fi && ok "ключ положен — проверка: пункт 6"
+}
+
+a_ssh_check() {
+    title "Проверка SSH до ноды"
+    local ip port; ip="$(ask "IP ноды:")"; [ -n "$ip" ] || return
+    port="$(ask "SSH-порт [22]:")"; port="${port:-22}"
+    ssh -i "$KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        "root@$ip" 'echo "  хост: $(hostname) · агент: $(cat /opt/vpn-cell/agent/VERSION 2>/dev/null || echo нет)"' \
+        && ok "хаб заходит на $ip своим ключом" \
+        || bad "не заходит: Permission denied — ключа нет (пункт 5); timeout — путь до ноды режется"
+}
+
+a_login() { title "Вход Claude в подписку"; nexus-chat-login <&3; }
+
+a_app_line() {
+    title "Строка подключения приложения"
+    echo "Приложение: Ещё → Чат с Claude → «Подключить хаб»."
+    yes_no "Показать строку? В ней токен чата — не пересылайте её в переписку" || return
+    echo; echo "  $(hub_url)/chat#$(envget NEXUS_CHAT_TOKEN)"
+}
+
+a_audit() {
+    title "Плановый аудит"
+    echo "Сейчас: $(envget NEXUS_CHAT_AUDIT_AT | sed 's/^$/выключен/') (часовой пояс $(envget NEXUS_CHAT_TZ))"
+    local v; v="$(ask "Время через запятую (09:00,21:00), «-» — выключить, Enter — не менять:")"
+    [ -n "$v" ] || return
+    [ "$v" = "-" ] && v=""
+    if [ -n "$v" ] && ! [[ "$v" =~ ^([01][0-9]|2[0-3]):[0-5][0-9](,([01][0-9]|2[0-3]):[0-5][0-9])*$ ]]; then
+        bad "формат ЧЧ:ММ через запятую"; return
+    fi
+    envset NEXUS_CHAT_AUDIT_AT "$v" && systemctl restart nexus-chat && ok "аудит: ${v:-выключен}"
+}
+
+a_bsbord_key() {
+    title "Ключ bschekbot"
+    echo "${D}Кабинет bsbord.com → API (тариф Bronze+). Ключ показывается там один раз.${N}"
+    local k; k="$(ask_s "Ключ bsk_live_… (ввод скрыт, Enter — не менять):")"
+    [ -n "$k" ] || return
+    case "$k" in bsk_live_*) ;; *) bad "ключ начинается с bsk_live_"; return ;; esac
+    envset NEXUS_BSBORD_KEY "$k"; unset k
+    restart_hub
+    echo "  SIM: $(hubpy sim | tail -1)"
+}
+
+a_bsbord_cap() {
+    title "Дневной потолок SIM-проверок"
+    echo "Сейчас: $(envget NEXUS_BSBORD_DAILY_RUB) ₽ в сутки"
+    local v; v="$(ask "Новый потолок в рублях (Enter — не менять):")"
+    [ -n "$v" ] || return
+    [[ "$v" =~ ^[0-9]+$ ]] || { bad "целое число рублей"; return; }
+    envset NEXUS_BSBORD_DAILY_RUB "$v" && restart_hub
+}
+
+a_actions() {
+    title "Действия из чата и коннектора"
+    echo "Перезапуск сервисов ноды, обновление агента, реле, действия в панели — каждое"
+    echo "всё равно только по кнопке «Разрешить» (чат) или confirm=true (коннектор)."
+    if [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ]; then
+        yes_no "Сейчас ВКЛЮЧЕНЫ. Выключить?" && envset NEXUS_ALLOW_ACTIONS 0 && restart_hub
+    else
+        yes_no "Сейчас выключены. Включить?" && envset NEXUS_ALLOW_ACTIONS 1 && restart_hub
+    fi
+}
+
+a_rotate() {
+    title "Сменить секреты"
+    echo "Новые: секрет коннектора claude.ai, токен домашнего пробника, токен чата."
+    echo "${Y}После смены:${N} коннектор в claude.ai — новая ссылка (пункт 14), приложение —"
+    echo "новая строка (пункт 8), пробник — новый --token. Ключ к нодам не меняется."
+    yes_no "Сменить?" || return
+    envset NEXUS_MCP_SECRET "$(gen 40)"; envset NEXUS_PROBE_TOKENS "$(gen 32)"; envset NEXUS_CHAT_TOKEN "$(gen 48)"
+    restart_hub
+}
+
+a_connector() {
+    title "Коннектор claude.ai"
+    echo "claude.ai → Settings → Connectors → Add custom connector."
+    yes_no "Показать ссылку? В ней секрет хаба — не пересылайте её в переписку" || return
+    echo; echo "  $(hub_url)/mcp/$(envget NEXUS_MCP_SECRET)"
+}
+
+a_logs() {
+    title "Журналы"
+    echo "  1 хаб   2 чат   3 Caddy   4 установка"
+    local w; w="$(ask "Какой:")"
+    case "$w" in
+        1) journalctl -u nexus-mcp -n 60 --no-pager ;;
+        2) journalctl -u nexus-chat -n 60 --no-pager ;;
+        3) journalctl -u nexus-mcp-caddy -n 40 --no-pager ;;
+        4) tail -n 60 /var/log/nexus-mcp-install.log 2>/dev/null || echo "лога установки нет" ;;
+    esac
+}
+
+a_update() {
+    title "Обновить хаб"
+    echo "Та же команда установки: настройки, секреты и ключ берутся из $ENVF."
+    yes_no "Обновить сейчас?" || return
+    bash <(curl -fsSL --connect-timeout 15 -m 120 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
+        || bad "установщик не скачался или упал — вывод выше"
+}
+
+if [ "${1:-}" = "status" ]; then header; exit 0; fi
+if ! { exec 3<"$TTY"; } 2>/dev/null; then
+    die "нет терминала — меню работает только интерактивно (ssh -t)"
+fi
+
+while true; do
+    clear 2>/dev/null || true
+    header
+    menu
+    c="$(ask "Пункт:")"
+    case "$c" in
+        1) a_panels ;; 2) a_panel_add ;; 3) a_panel_remove ;;
+        4) a_nodes ;; 5) a_key_to_node ;; 6) a_ssh_check ;;
+        7) a_login ;; 8) a_app_line ;; 9) a_audit ;;
+        10) a_bsbord_key ;; 11) a_bsbord_cap ;;
+        12) a_actions ;; 13) a_rotate ;; 14) a_connector ;; 15) a_logs ;; 16) restart_hub ;; 17) a_update ;;
+        0|q|й|"") echo; exit 0 ;;
+        *) bad "нет такого пункта" ;;
+    esac
+    pause
+done
