@@ -65,6 +65,13 @@ class Settings:
     test_sub_url: str = field(default_factory=lambda: _env("NEXUS_TEST_SUB_URL"))
     xray_bin: str = field(default_factory=lambda: _env("NEXUS_XRAY"))
 
+    # bschekbot (bsbord.com): проверки с SIM-карт операторов РФ, в т.ч. с
+    # включёнными белыми списками, и из городов РФ (FULL GEO). Платно: каждый
+    # запуск — по подтверждению человека, сверху — дневной потолок в рублях.
+    bsbord_key: str = field(default_factory=lambda: _env("NEXUS_BSBORD_KEY"))
+    bsbord_url: str = field(default_factory=lambda: _env("NEXUS_BSBORD_URL", "https://bsbord.com/v1").rstrip("/"))
+    bsbord_daily_rub: float = field(default_factory=lambda: float(_env("NEXUS_BSBORD_DAILY_RUB", "300") or 0))
+
     host: str = field(default_factory=lambda: _env("NEXUS_MCP_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(_env("NEXUS_MCP_PORT", "8765")))
     # Публичные имена хаба — для защиты от DNS rebinding в MCP-транспорте.
@@ -73,6 +80,10 @@ class Settings:
     @property
     def audit_log(self) -> Path:
         return self.state_dir / "audit.jsonl"
+
+    @property
+    def bsbord_ledger(self) -> Path:
+        return self.state_dir / "bsbord_spend.jsonl"
 
     @property
     def known_hosts(self) -> Path:

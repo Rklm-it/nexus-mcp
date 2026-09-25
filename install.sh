@@ -14,7 +14,7 @@
 #
 # Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
-# [--no-caddy] [--no-xray] [--no-chat] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
+# [--no-caddy] [--no-xray] [--no-chat] [--bsbord-key bsk_live_…] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
 #
 # Что делает: код в /opt/nexus-mcp/app, venv, SSH-ключ хаба, секреты,
 # /etc/nexus-mcp.env, systemd, xray для сквозной проверки, Caddy с
@@ -43,7 +43,7 @@ trap 'exit 130' INT TERM
 # Без доступа к репо git должен отказать сразу, а не молча ждать логина.
 export GIT_TERMINAL_PROMPT=0
 
-DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1; WITH_CHAT=1
+DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1; WITH_CHAT=1; BSBORD_KEY=""
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
 FOREGROUND=0; ARGS=("$@")
@@ -62,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --no-caddy)    WITH_CADDY=0; shift ;;
         --no-xray)     WITH_XRAY=0; shift ;;
         --no-chat)     WITH_CHAT=0; shift ;;
+        --bsbord-key)  BSBORD_KEY="$2"; shift 2 ;;
         --foreground)  FOREGROUND=1; shift ;;
         -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,23p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
         *) die "неизвестный параметр: $1" ;;
@@ -229,6 +230,8 @@ CHAT_MODEL="$(envget NEXUS_CHAT_MODEL)"
 CHAT_EFFORT="$(envget NEXUS_CHAT_EFFORT)"
 CHAT_AUDIT="$(envget NEXUS_CHAT_AUDIT_AT)"
 CHAT_TZ="$(envget NEXUS_CHAT_TZ)"; [ -n "$CHAT_TZ" ] || CHAT_TZ="Europe/Moscow"
+[ -n "$BSBORD_KEY" ] || BSBORD_KEY="$(envget NEXUS_BSBORD_KEY)"
+BSBORD_DAILY="$(envget NEXUS_BSBORD_DAILY_RUB)"; [ -n "$BSBORD_DAILY" ] || BSBORD_DAILY=300
 
 log "Пишу $ENVF"
 umask 077
@@ -256,6 +259,8 @@ NEXUS_CHAT_MODEL=$CHAT_MODEL
 NEXUS_CHAT_EFFORT=$CHAT_EFFORT
 NEXUS_CHAT_AUDIT_AT=$CHAT_AUDIT
 NEXUS_CHAT_TZ=$CHAT_TZ
+NEXUS_BSBORD_KEY=$BSBORD_KEY
+NEXUS_BSBORD_DAILY_RUB=$BSBORD_DAILY
 EOF
 umask 022
 

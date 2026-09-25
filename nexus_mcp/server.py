@@ -18,7 +18,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from nexus_mcp import audit, config, diagnose, inventory, panels, playbook, recipes, ssh
+from urllib.parse import urlparse
+
+from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbook, recipes, ssh
+from nexus_mcp import links as sublinks
 from nexus_mcp import panel as panel_api
 from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, ProbeError, registry
@@ -54,6 +57,13 @@ Cloudflare-фронт («Включить Cloudflare», VLESS+WS через Clou
 включён, node_diagnose проверяет его адрес (cf_reachable / cf_blocked) и строку
 «· CF» сквозной проверкой отдельно от IP. «Только через CF» советовать, лишь когда
 «· CF» прошла с домашних пробников: Cloudflare в РФ местами тоже режут.
+
+SIM-проверки (bschekbot, если задан ключ): хаб и пробники на проводном интернете,
+а клиенты сидят и на мобильном — с белыми списками (БС) операторов. sim_probe —
+доступность IP/домена/SNI с SIM каждого оператора в каждом округе, с БС и без;
+sim_vless — поднимается ли туннель; sim_geo — из каких городов открывается.
+ПЛАТНО: сначала вызов без confirm (бесплатный preview с ценой), цену — человеку,
+запуск — с confirm=true и max_credits из preview. Единицы — sim_units.
 
 Находки упорядочены: crit → warn → info → ok; у каждой есть fix, а в next_steps —
 приёмы починки из справочника (fix_playbook) с источником и степенью доверия:
@@ -276,6 +286,185 @@ async def fix_playbook(symptom: str = "") -> dict:
 async def audit_tail(n: int = 30) -> dict:
     """Последние вызовы хаба — кто что делал с нодами."""
     return {"ok": True, "entries": audit.tail(max(1, min(n, 500)))}
+
+
+# ── SIM-проверки: операторы и города РФ (bschekbot) ────────────────────────
+
+def _bs_err(e: Exception) -> dict:
+    if isinstance(e, bsbord.BsError):
+        return e.as_dict()
+    return _err(e)
+
+
+async def _node_targets(node: str) -> dict:
+    """Что проверять у ноды: IP:порты клиентов, адрес CF-фронта, SNI и ссылки
+    тестовой подписки — то же, что смотрит node_diagnose."""
+    n = await inventory.find_node(node)
+    node_links: list[str] = []
+    cf_links: list[str] = []
+    cf = await diagnose.cf_front(n)
+    cft = diagnose.cf_target(cf)
+    if config.settings.test_sub_url:
+        try:
+            all_links = await sublinks.fetch_links()
+            node_links = await asyncio.to_thread(sublinks.links_for_node, all_links, n)
+            if cft:
+                cf_links = [u for u in all_links if (urlparse(u).hostname or "") == cft[0]]
+        except sublinks.LinksError:
+            pass
+    ip = n.get("ip") or n.get("ssh_host")
+    targets = [f"{ip}:{p}" for p in diagnose.client_ports(n, node_links)]
+    if cft:
+        targets.append(f"{cft[0]}:{cft[1]}")
+    snis = []
+    for u in node_links + cf_links:
+        sni = sublinks.describe(u).get("sni")
+        if sni and sni not in snis:
+            snis.append(sni)
+    if cft and cft[0] not in snis:
+        snis.append(cft[0])
+    return {"node": n["name"], "targets": targets[:10], "sni_hosts": snis[:10],
+            "links": (node_links + cf_links)[:20]}
+
+
+@mcp.tool()
+async def sim_units(dpi: str = "any", operator: str = "", region: str = "") -> dict:
+    """Единицы SIM-проверки bschekbot: оператор × федеральный округ × белый
+    список (БС). Бесплатно. dpi: on — только с включённым БС, off — без БС,
+    any — все. operator/region — фильтр через запятую (mts,beeline / цфо,пфо).
+    Ключ единицы op_key ("mts|цфо|on") — для units у sim_probe/sim_vless;
+    селекторы: "mts" (все округа), "*|цфо|on" (все операторы ЦФО с БС)."""
+    try:
+        return await bsbord.units(dpi, operator, region)
+    except Exception as e:  # noqa: BLE001 — причина уходит в ответ
+        return _bs_err(e)
+
+
+@mcp.tool()
+async def sim_account() -> dict:
+    """Баланс bschekbot, тариф и дневной потолок трат хаба (сколько уже
+    потрачено сегодня). Бесплатно."""
+    try:
+        return await bsbord.account()
+    except Exception as e:  # noqa: BLE001
+        return _bs_err(e)
+
+
+@mcp.tool()
+async def sim_probe(targets: list[str] | None = None, node: str = "", units: list[str] | None = None,
+                    dpi: str = "on", probes: list[str] | None = None, sni_hosts: list[str] | None = None,
+                    max_credits: int = 0, confirm: bool = False) -> dict:
+    """Доступность цели с SIM-карт мобильных операторов РФ (ICMP / TCP / TLS-SNI),
+    в т.ч. с ВКЛЮЧЁННЫМИ БЕЛЫМИ СПИСКАМИ — то, чего не видят хаб и домашние
+    пробники. ПЛАТНО (1 кредит = 1 копейка).
+
+    Два шага: без confirm — бесплатный preview (цена, какие единицы поедут);
+    покажите цену человеку и с его согласия повторите тем же вызовом с
+    confirm=true и max_credits = cost_credits из preview.
+
+    targets — до 10 целей (IP, IP:порт, домен, URL). node — взять цели ноды
+    (IP:порты клиентов, адрес CF-фронта) и её SNI сами. units — op_key или
+    селекторы из sim_units; пусто — все доступные единицы. dpi: on (деф.) —
+    только единицы с БС, off — без БС, any — обе группы. probes: icmp, tcp, sni
+    (деф. icmp+tcp, +sni при заданных sni_hosts). reachable = icmp или tcp прошли;
+    http-ответ может быть заглушкой оператора — смотрите status/location/body_head.
+    """
+    try:
+        t, snis = list(targets or []), list(sni_hosts or [])
+        if node:
+            nt = await _node_targets(node)
+            t = t or nt["targets"]
+            snis = snis or nt["sni_hosts"]
+        pr = list(probes or (["icmp", "tcp"] + (["sni"] if snis else [])))
+        res = await bsbord.probe(t, list(units or []), dpi, pr, snis, int(max_credits or 0), bool(confirm))
+    except Exception as e:  # noqa: BLE001
+        res = _bs_err(e)
+    if confirm:
+        audit.record("sim_probe", {"targets": targets, "node": node, "units": units, "dpi": dpi},
+                     bool(res.get("ok")), f"{res.get('cost_rub')} ₽" if res.get("ok") else str(res.get("detail", ""))[:200])
+    return res
+
+
+@mcp.tool()
+async def sim_vless(node: str = "", links: list[str] | None = None, units: list[str] | None = None,
+                    dpi: str = "on", core: str = "", max_credits: int = 0, confirm: bool = False,
+                    wait: bool = True) -> dict:
+    """Сквозной тест протокола (VLESS/Reality, VMess, Trojan, SS, Hysteria2) с
+    SIM-карт операторов РФ: поднимается ли туннель и где режет DPI/ТСПУ.
+    ПЛАТНО: n_servers × n_units проверок. Preview у API нет — без confirm хаб
+    показывает, что поедет; с confirm=true и max_credits запускает, а если
+    цена при постановке выше потолка — сразу отменяет (бесплатно).
+
+    node — ссылки ноды из тестовой подписки; links — свои ссылки (до 20).
+    ⚠ Ссылки уходят сервису целиком — берите тестового юзера, не клиентов.
+    units/dpi — как у sim_probe. core: "" авто, stable, prerelease (xhttp,
+    VLESS Encryption). wait=false — вернуть test_id, результат — sim_result.
+    """
+    try:
+        lk = list(links or [])
+        if node and not lk:
+            lk = (await _node_targets(node))["links"]
+        res = await bsbord.vless(lk, list(units or []), dpi, core, int(max_credits or 0), bool(confirm), bool(wait))
+    except Exception as e:  # noqa: BLE001
+        res = _bs_err(e)
+    if confirm:
+        audit.record("sim_vless", {"node": node, "n_links": len(links or []), "units": units, "dpi": dpi},
+                     bool(res.get("ok")), str(res.get("cost_rub") or res.get("detail", ""))[:200])
+    return res
+
+
+@mcp.tool()
+async def sim_geo(targets: list[str] | None = None, node: str = "", network: str = "mob",
+                  district: str = "", region: str = "", isp: str = "", cities: list | None = None,
+                  city_limit: int = 0, probe_mode: str = "tls", heavy: bool = False, core: str = "",
+                  max_credits: int = 0, confirm: bool = False, wait: bool = True) -> dict:
+    """FULL GEO: из каких ГОРОДОВ РФ открывается цель — домашние (network=res)
+    или мобильные (mob) провайдеры в самих городах. ПЛАТНО по трафику.
+
+    Без confirm — бесплатный preview: число городов, время и reserve_credits
+    (ПОТОЛОК, списывается факт). С confirm=true и max_credits = reserve_credits —
+    запуск. targets — домены/URL/IP и/или ОДНА ссылка vless:// / hysteria2://;
+    node — взять первую ссылку ноды из тестовой подписки. district: ЦФО…ДФО
+    (8 округов), region/isp/cities — токены из каталога сервиса; isp="__ALL__" —
+    каждый провайдер города. city_limit — потолок проб. heavy — детект троттлинга
+    (только домены). Вердикты: blocked — подтверждённая блокировка, throttled —
+    режут скорость; exit_bad/no_ru_node — шум сервиса, не результат.
+    """
+    try:
+        t = list(targets or [])
+        if node and not any("://" in x and x.split("://")[0] in ("vless", "hysteria2") for x in t):
+            nl = [u for u in (await _node_targets(node))["links"] if u.startswith(("vless://", "hysteria2://"))]
+            if nl:
+                t.append(nl[0])
+        res = await bsbord.geo(t, network, district, region, isp, list(cities or []), int(city_limit or 0),
+                               probe_mode, bool(heavy), core, int(max_credits or 0), bool(confirm), bool(wait))
+    except Exception as e:  # noqa: BLE001
+        res = _bs_err(e)
+    if confirm:
+        audit.record("sim_geo", {"targets_n": len(targets or []), "node": node, "network": network,
+                                 "district": district, "isp": isp}, bool(res.get("ok")),
+                     str(res.get("charged_rub") or res.get("reserve_rub") or res.get("detail", ""))[:200])
+    return res
+
+
+@mcp.tool()
+async def sim_result(kind: str, id: str) -> dict:
+    """Статус и результат долгой SIM-проверки: kind = vless | geo | scan, id —
+    test_id / run_id / scan_id. Бесплатно, можно звать сколько угодно."""
+    try:
+        return await bsbord.result(kind, str(id))
+    except Exception as e:  # noqa: BLE001
+        return _bs_err(e)
+
+
+@mcp.tool()
+async def sim_cancel(kind: str, id: str) -> dict:
+    """Остановить долгую SIM-проверку (vless | geo | scan). Бесплатно:
+    несделанная часть не оплачивается, готовые вердикты остаются."""
+    try:
+        return await bsbord.cancel(kind, str(id))
+    except Exception as e:  # noqa: BLE001
+        return _bs_err(e)
 
 
 # ── Панель ─────────────────────────────────────────────────────────────────

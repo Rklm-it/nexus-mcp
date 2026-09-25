@@ -481,3 +481,25 @@ def test_inbox_notifies_answers_not_stops_and_cursor_moves(chat_settings):
         assert again["items"] == [] and again["last_seq"] == last
 
     asyncio.run(go())
+
+
+def test_paid_sim_check_needs_button_only_for_the_run(chat_settings):
+    """Preview SIM-проверки бесплатен и идёт сразу; запуск — деньги, ждёт кнопку
+    с ценой в заголовке."""
+    async def go():
+        runner, client, _ = _setup(chat_settings, None)
+        cid = runner.store.create_chat()["id"]
+        inp = {"node": "de-1", "units": ["*|цфо|on"], "dpi": "on"}
+        ok, val = await runner._decide(cid, "mcp__nexus__sim_probe", inp)
+        assert ok and val == inp and runner.store.pending_approvals() == []
+
+        task = asyncio.create_task(runner._decide(cid, "mcp__nexus__sim_probe",
+                                                  {**inp, "confirm": True, "max_credits": 240}))
+        ev = await _wait_type(client, cid, "approval")
+        assert ev["data"]["title"] == "SIM-проверка: de-1 · *|цфо|on · с БС · не дороже 2.40 ₽"
+        assert not task.done()
+        await client.post(f"/chat/api/approvals/{ev['data']['approval_id']}", json={"allow": False}, headers=AUTH)
+        ok, _ = await task
+        assert not ok
+
+    asyncio.run(go())

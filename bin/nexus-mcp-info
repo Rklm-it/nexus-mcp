@@ -62,4 +62,12 @@ if [ -n "$CHAT_TOKEN" ] && systemctl is-enabled nexus-chat >/dev/null 2>&1; then
     fi
     echo
 fi
+if [ -n "$(envget NEXUS_BSBORD_KEY)" ]; then
+    echo "6) SIM-проверки bschekbot: ключ задан, потолок трат в день — $(envget NEXUS_BSBORD_DAILY_RUB) ₽"
+    echo "   Потрачено: /var/lib/nexus-mcp/bsbord_spend.jsonl"
+else
+    echo "6) SIM-проверки bschekbot (операторы РФ, белые списки): ключ не задан —"
+    echo "   NEXUS_BSBORD_KEY=bsk_live_… в $ENVF (кабинет bsbord.com → API, тариф Bronze+)"
+fi
+echo
 echo "Настройки: $ENVF → systemctl restart nexus-mcp nexus-chat"

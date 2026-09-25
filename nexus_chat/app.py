@@ -13,6 +13,7 @@ import contextlib
 import hmac
 import json
 import logging
+import time
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -66,8 +67,29 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
                 return _err(e.status, e.message)
         return handler
 
+    sim_cache: dict = {"at": 0.0, "data": None}
+
+    async def sim_state() -> dict:
+        """Баланс bschekbot для экрана — раз в минуту, не на каждый опрос."""
+        from nexus_mcp import bsbord
+
+        if not bsbord.enabled():
+            return {"enabled": False}
+        now = time.monotonic()
+        if sim_cache["data"] is None or now - sim_cache["at"] > 60:
+            try:
+                acc = await bsbord.account()
+                sim_cache["data"] = {"enabled": True, "balance_rub": acc.get("balance_rub"),
+                                     "spent_today_rub": acc.get("spent_today_rub"),
+                                     "daily_cap_rub": acc.get("daily_cap_rub")}
+            except Exception as e:  # noqa: BLE001 — причина на экран
+                sim_cache["data"] = {"enabled": True, "error": str(e)[:200], **bsbord.budget()}
+            sim_cache["at"] = now
+        return sim_cache["data"]
+
     async def state(request: Request):
         return JSONResponse({
+            "sim": await sim_state(),
             "ok": True, "api": API_VERSION,
             "logged_in": s.logged_in,
             "model": s.model or "", "effort": s.effort or "",

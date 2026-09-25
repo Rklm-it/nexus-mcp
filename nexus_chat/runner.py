@@ -31,6 +31,9 @@ MCP_PREFIX = f"mcp__{MCP_NAME}__"
 
 # Инструменты хаба, которые что-то меняют. Остальные только читают.
 ACTION_TOOLS = ("node_action", "panel_action")
+# Платные SIM-проверки bschekbot: preview (без confirm) бесплатен и идёт сразу,
+# запуск с confirm=true — деньги, поэтому тоже ждёт кнопки.
+PAID_TOOLS = ("sim_probe", "sim_vless", "sim_geo")
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -52,6 +55,17 @@ def describe_action(tool: str, inp: dict) -> str:
             return f"Прописать адрес панели на ноде {node}" + (
                 f": {inp['brain_url']}" if inp.get("brain_url") else "")
         return f"{action} на ноде {node}"
+    if tool in PAID_TOOLS:
+        cap = inp.get("max_credits")
+        price = f"не дороже {int(cap) / 100:.2f} ₽" if isinstance(cap, (int, float)) and cap > 0 else "цена не указана"
+        what = inp.get("node") or ", ".join(map(str, (inp.get("targets") or inp.get("links") or [])[:3])) or "?"
+        units = inp.get("units") or []
+        where = {"sim_probe": "SIM-проверка", "sim_vless": "SIM-тест туннеля", "sim_geo": "Проверка по городам"}[tool]
+        scope = ", ".join(map(str, units[:4])) if units else ("все округа" if tool != "sim_geo" else
+                                                              inp.get("district") or inp.get("isp") or "опорные города")
+        dpi = {"on": "с БС", "off": "без БС", "any": "с БС и без"}.get(str(inp.get("dpi") or "on"), "")
+        tail = f" · {dpi}" if tool != "sim_geo" and dpi else ""
+        return f"{where}: {what} · {scope}{tail} · {price}"
     if tool == "panel_action":
         panel = inp.get("panel") or "main"
         params = inp.get("params")
@@ -334,7 +348,8 @@ class Runner:
         if not name.startswith(MCP_PREFIX):
             return False, "В чате доступны только инструменты хаба nexus"
         tool = short_tool(name)
-        if tool not in ACTION_TOOLS:
+        paid = tool in PAID_TOOLS and bool(tool_input.get("confirm"))
+        if tool not in ACTION_TOOLS and not paid:
             return True, tool_input
         title = describe_action(tool, tool_input)
         aid = self.store.create_approval(chat_id, tool, title, tool_input)
