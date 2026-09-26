@@ -45,6 +45,14 @@ INSTRUCTIONS = """\
 состояния. Дальше panel_users / panel_user_diagnose (почему у юзера нет пинга),
 panel_inbound_diagnose, panel_logs, panel_payments, panel_get для любой админской ручки.
 Секреты в ответах панели замаскированы — так и задумано.
+База и Redis панели: panel_db (размер, соединения, долгие запросы, блокировки,
+миграция, бэкап), panel_sql (SELECT только на чтение), panel_redis (INFO,
+ключи, значение). Всё остальное, что есть в админках (веб-панель, админ-бот,
+приложение): panel_endpoints — каталог всех админских ручек панели, panel_get —
+чтение любой из них, panel_call — изменение (тарифы, промокоды, юзеры, рассылки,
+настройки…), panel_maintenance — бэкап, VACUUM, снять запрос, удалить ключ
+Redis. panel_call и panel_maintenance — только по просьбе человека: вызов без
+confirm — предпросмотр (что за ручка, чем рискует), с confirm=true — выполнить.
 Панелей может быть несколько (panels_list): тогда у инструментов панели указывай
 panel=<имя>, а ноды называются «панель/имя».
 
@@ -654,7 +662,8 @@ async def panel_get(path: str, params: dict | None = None, panel: str = "") -> d
     path — например "/api/v1/admin/dashboard", "/api/v1/servers/<id>",
     "/api/v1/admin/expiring", "/api/v1/admin/users/<id>/connection-log".
     Разрешены /api/v1/admin/*, /api/v1/servers*, /api/v1/inbounds*,
-    /api/v1/outbounds*, /api/v1/users*, /api/v1/traffic*, /health.
+    /api/v1/outbounds*, /api/v1/users*, /health и любая GET-ручка из каталога
+    панели (panel_endpoints) — всё, что панель закрыла админ-доступом.
     panel — имя панели (panels_list); при одной панели можно не указывать.
     """
     return await _panel(panel_api.get, path, params or {}, timeout=60, panel_name=panel)
@@ -681,6 +690,199 @@ async def panel_action(path: str, confirm: bool = False, params: dict | None = N
     audit.record("panel_action", {"path": path, "params": params, "panel": panel}, res.get("ok", False),
                  res.get("detail", ""))
     return res
+
+
+# ── База, Redis, любая ручка панели ────────────────────────────────────────
+
+_DB_VIEWS = {"overview": "/api/v1/admin/db/overview", "tables": "/api/v1/admin/db/tables",
+             "activity": "/api/v1/admin/db/activity", "backup": "/api/v1/admin/db/backup"}
+_REDIS_VIEWS = {"overview": "/api/v1/admin/redis/overview", "keys": "/api/v1/admin/redis/keys",
+                "key": "/api/v1/admin/redis/key"}
+
+
+@mcp.tool()
+async def panel_db(view: str = "overview", panel: str = "") -> dict:
+    """PostgreSQL панели. view:
+    overview — размер, соединения по состояниям, долгие запросы, «idle in
+      transaction», заблокированные, кэш-хит, самые большие таблицы, миграция
+      (текущая против головы — up_to_date);
+    tables — все таблицы: строки, мёртвые строки, размер, когда вакуумились;
+    activity — кто сейчас в базе (pid, запрос, сколько идёт, кем заблокирован);
+    backup — последний бэкап: когда, размер, скольким админам доставлен, почему нет.
+    Данные — panel_sql. Снять запрос, VACUUM, бэкап сейчас — panel_maintenance.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    path = _DB_VIEWS.get(view)
+    if not path:
+        return {"ok": False, "error": "unknown_view", "detail": f"есть: {', '.join(_DB_VIEWS)}"}
+    return await _panel(panel_api.get, path, timeout=60, panel_name=panel)
+
+
+@mcp.tool()
+async def panel_sql(sql: str, limit: int = 100, panel: str = "") -> dict:
+    """SELECT к базе панели — только чтение: транзакция READ ONLY, 15 с на
+    запрос, до 500 строк. Один запрос; SELECT/WITH/EXPLAIN/SHOW.
+    Секретные колонки (sub_token, api_token, password_hash, …) приходят маской,
+    а назвать их в запросе нельзя. Таблицы и колонки — panel_db(view="tables")
+    или SELECT column_name FROM information_schema.columns WHERE table_name='users'.
+    Пример: SELECT status, count(*) FROM payments WHERE created_at > now() - interval '1 day' GROUP BY 1
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _panel(panel_api.post_read, "/api/v1/admin/db/query",
+                        {"sql": sql, "limit": max(1, min(limit, 500))}, panel_name=panel)
+
+
+@mcp.tool()
+async def panel_redis(view: str = "overview", pattern: str = "*", key: str = "", limit: int = 100,
+                      panel: str = "") -> dict:
+    """Redis панели. view:
+    overview — INFO (память, клиенты, вытеснения, сохранение), ключи по
+      префиксам (сколько, сколько без TTL), медленные команды;
+    keys — ключи по шаблону glob (pattern="geosite:*"): тип, TTL, размер;
+    key — значение одного ключа (key=<точное имя>), JSON разобран.
+    Ключи с токеном подписки или одноразовым кодом в имени показываются маской
+    и не читаются. Удалить ключ — panel_maintenance.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    path = _REDIS_VIEWS.get(view)
+    if not path:
+        return {"ok": False, "error": "unknown_view", "detail": f"есть: {', '.join(_REDIS_VIEWS)}"}
+    params = {"overview": {}, "keys": {"pattern": pattern, "limit": max(1, min(limit, 1000))},
+              "key": {"key": key}}[view]
+    return await _panel(panel_api.get, path, params, timeout=60, panel_name=panel)
+
+
+@mcp.tool()
+async def panel_endpoints(search: str = "", method: str = "", panel: str = "") -> dict:
+    """Каталог ВСЕХ админских ручек панели (их сотни): метод, путь, что делает,
+    параметры, поля тела. Когда готового инструмента нет — ищите здесь
+    (search="promo", "broadcast", "plans", method="POST"), читайте panel_get,
+    меняйте panel_call.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    try:
+        items = await panel_api.catalog(panel)
+    except panel_api.PanelError as e:
+        return _err(e)
+    if method:
+        items = [e for e in items if e.get("method") == method.upper()]
+    if search:
+        s = search.lower()
+        items = [e for e in items if s in e.get("path", "").lower() or s in (e.get("summary") or "").lower()
+                 or any(s in str(t).lower() for t in e.get("tags") or [])]
+    compact = []
+    for e in items:
+        row = {"method": e["method"], "path": e["path"], "summary": e.get("summary", "")}
+        if e.get("query"):
+            row["query"] = e["query"]
+        body = e.get("body") or {}
+        if body.get("fields"):
+            row["body"] = {n: ("*" if f.get("required") else "") + str(f.get("type", ""))
+                           for n, f in body["fields"].items()}
+        elif body:
+            row["body"] = body.get("type", "?")
+        if e["method"] != "GET":
+            row["risk"] = panel_api.risk_of(e["method"], e["path"])
+        compact.append(row)
+    return {"ok": True, "count": len(compact), "endpoints": panel_api._shrink(compact),
+            "legend": "body: * — обязательное поле"}
+
+
+async def _call(tool: str, method: str, path: str, body, params, confirm: bool, panel: str,
+                title: str = "") -> dict:
+    if not config.settings.allow_actions:
+        return {"ok": False, "error": "actions_disabled",
+                "detail": "действия выключены на хабе (NEXUS_ALLOW_ACTIONS=1 чтобы включить)"}
+    masked = edits._masked_values(body)
+    if masked:
+        return {"ok": False, "error": "masked_value",
+                "detail": "в теле маскированные значения из ответа панели (" + ", ".join(masked[:5]) +
+                          "): записав их, панель заменит настоящий секрет маской. Уберите эти поля — "
+                          "пустое значение секрета панель не меняет"}
+    try:
+        entry = await panel_api.check_call(method, path, body, panel)
+    except panel_api.PanelError as e:
+        return _err(e)
+    view = {"method": method.upper(), "path": path, "what": entry.get("summary", ""),
+            "risk": panel_api.risk_of(method, path)}
+    if params:
+        view["params"] = params
+    if body is not None:
+        view["body"] = panel_api.redact(body)
+    if title:
+        view["title"] = title
+    if not confirm:
+        return {"ok": True, "preview": True, **view,
+                "next": "перескажите человеку, что изменится; согласится — тот же вызов с confirm=true"}
+    res = await _panel(panel_api.request, method.upper(), panel_api._check_path(path), params or {},
+                       120.0, panel, body=body)
+    audit.record(tool, {"method": method.upper(), "path": path, "params": params,
+                        "body": panel_api.redact(body), "panel": panel}, res.get("ok", False),
+                 res.get("detail", ""))
+    return {**res, "call": view}
+
+
+@mcp.tool()
+async def panel_call(method: str, path: str, body: dict | list | None = None, params: dict | None = None,
+                     confirm: bool = False, panel: str = "") -> dict:
+    """Любое изменение через админ-API панели — то, что админ делает кнопками
+    в веб-панели, админ-боте или приложении: тарифы, промокоды, юзеры (блок,
+    продление, трафик, ноды), дилеры, рассылки, настройки, платежи, ноды.
+    Только по просьбе человека.
+
+    method — POST | PUT | PATCH | DELETE; path — из panel_endpoints (с
+    подставленными id); body — JSON тела по полям из каталога (лишнее поле
+    — отказ: панель молча выбросила бы его); params — query-параметры.
+    Без confirm — предпросмотр: что это за ручка и чем рискует, ничего не
+    меняет. Человек согласился — тот же вызов с confirm=true.
+    Нужен NEXUS_ALLOW_ACTIONS=1. Маски секретов из ответов («abcd…», «***»)
+    в body не передавать — хаб такое отвергнет.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    return await _call("panel_call", method, path, body, params, confirm, panel)
+
+
+MAINTENANCE_OPS = {
+    "db_backup": "бэкап базы сейчас (pg_dump → Telegram админам, в фоне; итог — panel_db view=backup)",
+    "db_vacuum": "VACUUM ANALYZE таблицы: args={table, full?} (full=true блокирует таблицу)",
+    "db_cancel": "снять повисший запрос: args={pid, terminate?} (terminate=true — оборвать сессию)",
+    "redis_delete": "удалить ключ Redis: args={key}",
+    "redis_delete_pattern": "удалить ключи по шаблону: args={pattern, expect} — expect = сколько "
+                            "нашёл panel_redis(view=keys); не совпало — ничего не удаляется",
+}
+
+
+@mcp.tool()
+async def panel_maintenance(op: str, args: dict | None = None, confirm: bool = False, panel: str = "") -> dict:
+    """Обслуживание базы и Redis панели — только по просьбе человека.
+
+    op: db_backup | db_vacuum | db_cancel | redis_delete | redis_delete_pattern
+    (что принимает каждый — в отказе с неизвестным op). Без confirm —
+    предпросмотр, с confirm=true — выполнить. Нужен NEXUS_ALLOW_ACTIONS=1.
+    panel — имя панели (panels_list); при одной панели можно не указывать.
+    """
+    a = args or {}
+    base = "/api/v1/admin"
+    try:
+        if op == "db_backup":
+            m, path, body, params = "POST", f"{base}/db/backup", None, None
+        elif op == "db_vacuum":
+            m, path, params = "POST", f"{base}/db/vacuum", None
+            body = {"table": str(a["table"]), **({"full": True} if a.get("full") else {})}
+        elif op == "db_cancel":
+            m, path, body = "POST", f"{base}/db/cancel/{int(a['pid'])}", None
+            params = {"terminate": "true"} if a.get("terminate") else None
+        elif op == "redis_delete":
+            m, path, body, params = "DELETE", f"{base}/redis/key", None, {"key": str(a["key"])}
+        elif op == "redis_delete_pattern":
+            m, path, body = "DELETE", f"{base}/redis/keys", None
+            params = {"pattern": str(a["pattern"]), "expect": int(a["expect"])}
+        else:
+            return {"ok": False, "error": "unknown_op",
+                    "detail": "; ".join(f"{k} — {v}" for k, v in MAINTENANCE_OPS.items())}
+    except (KeyError, TypeError, ValueError) as e:
+        return {"ok": False, "error": "bad_args", "detail": f"{op}: {MAINTENANCE_OPS[op]} (не хватает {e})"}
+    return await _call("panel_maintenance", m, path, body, params, confirm, panel, title=MAINTENANCE_OPS[op])
 
 
 # ── Действия ───────────────────────────────────────────────────────────────

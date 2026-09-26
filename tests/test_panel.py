@@ -217,3 +217,178 @@ def test_restart_services_match_panel(vgx3d):
     panel_set = set(re.findall(r'"([^"]+)"', m.group(1)))
     hub = re.search(r"restart/\(([^)]*)\)", "".join(panel.ACTION_PATTERNS)).group(1)
     assert set(hub.split("|")) == panel_set
+
+
+# ── Каталог ручек, panel_call, база и Redis ────────────────────────────────
+
+CATALOG = {"count": 5, "endpoints": [
+    {"method": "GET", "path": "/api/v1/routing/presets", "summary": "пресеты", "path_params": [],
+     "query": [], "body": None, "tags": []},
+    {"method": "PATCH", "path": "/api/v1/admin/plans/{plan_id}", "summary": "Изменить тариф",
+     "path_params": ["plan_id"], "query": [],
+     "body": {"model": "PlanUpdate", "fields": {"price": {"required": False, "type": "number"},
+                                                "title": {"required": False, "type": "string"}}},
+     "tags": []},
+    {"method": "POST", "path": "/api/v1/admin/users/bulk", "summary": "Массовое действие", "path_params": [],
+     "query": [], "body": None, "tags": []},
+    {"method": "POST", "path": "/api/v1/admin/users/{user_id}", "summary": "юзер", "path_params": ["user_id"],
+     "query": [], "body": None, "tags": []},
+    {"method": "DELETE", "path": "/api/v1/admin/redis/key", "summary": "удалить ключ", "path_params": [],
+     "query": ["key"], "body": None, "tags": []},
+    {"method": "POST", "path": "/api/v1/admin/devices/enroll", "summary": "вход", "path_params": [],
+     "query": [], "body": None, "tags": []},
+]}
+
+
+@pytest.fixture
+def panel_on(hub_settings, monkeypatch):
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    panel._catalog_cache.clear()
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append((req.method, req.url.path, req.url.query.decode(), req.content.decode()))
+        if req.url.path == panel.CATALOG_PATH:
+            return httpx.Response(200, json=CATALOG)
+        if req.url.path == "/api/v1/admin/db/query":
+            return httpx.Response(200, json={"columns": ["id", "sub_token"],
+                                             "rows": [{"id": 1, "sub_token": "realtokenvalue123456"}]})
+        return httpx.Response(200, json={"ok": True, "api_token": "z" * 30})
+
+    _mock(monkeypatch, handler)
+    return seen
+
+
+def test_match_endpoint_prefers_exact_template():
+    items = CATALOG["endpoints"]
+    assert panel.match_endpoint(items, "POST", "/api/v1/admin/users/bulk")["summary"] == "Массовое действие"
+    assert panel.match_endpoint(items, "POST", f"/api/v1/admin/users/{UUID}")["summary"] == "юзер"
+    assert panel.match_endpoint(items, "PATCH", "/api/v1/admin/plans/7/x") is None
+    assert panel.match_endpoint(items, "DELETE", "/api/v1/admin/plans/7") is None
+
+
+def test_panel_get_reads_catalog_routes_outside_admin(panel_on):
+    asyncio.run(panel.get("/api/v1/routing/presets"))
+    assert ("GET", "/api/v1/routing/presets") in [(m, p) for m, p, *_ in panel_on]
+    with pytest.raises(panel.PanelError):
+        asyncio.run(panel.get("/api/v1/sub/abc"))
+
+
+def test_panel_call_preview_then_apply(hub_settings, panel_on):
+    from nexus_mcp import server
+
+    hub_settings.allow_actions = True
+    r = asyncio.run(server.panel_call("PATCH", "/api/v1/admin/plans/7", {"price": 199}))
+    assert r["ok"] and r["preview"] and r["what"] == "Изменить тариф"
+    assert not [x for x in panel_on if x[0] == "PATCH"]          # предпросмотр ничего не шлёт
+
+    r = asyncio.run(server.panel_call("PATCH", "/api/v1/admin/plans/7", {"price": 199}, confirm=True))
+    assert r["ok"] and r["data"]["api_token"] == "zzzz…"         # ответ маскируется
+    assert ("PATCH", "/api/v1/admin/plans/7", "", '{"price":199}') in panel_on
+
+
+@pytest.mark.parametrize("method,path,body,why", [
+    ("PATCH", "/api/v1/admin/plans/7", {"cost": 1}, "полей cost"),
+    ("PATCH", "/api/v1/admin/plans/7", {"title": "abcd…"}, "маскированные"),
+    ("POST", "/api/v1/admin/devices/enroll", None, "устройств"),
+    ("POST", "/api/v1/admin/nothing", None, "нет среди админских"),
+    ("GET", "/api/v1/admin/plans/7", None, "panel_get"),
+    ("POST", "/api/v1/admin/db/query", {"sql": "select 1"}, "panel_sql"),
+])
+def test_panel_call_refusals_have_reasons(hub_settings, panel_on, method, path, body, why):
+    from nexus_mcp import server
+
+    hub_settings.allow_actions = True
+    r = asyncio.run(server.panel_call(method, path, body, confirm=True))
+    assert r["ok"] is False and why in r["detail"], r
+    assert not [x for x in panel_on if x[0] != "GET"]
+
+
+def test_panel_call_gated_by_flag(hub_settings, panel_on):
+    from nexus_mcp import server
+
+    r = asyncio.run(server.panel_call("PATCH", "/api/v1/admin/plans/7", {"price": 1}, confirm=True))
+    assert r["error"] == "actions_disabled"
+
+
+def test_catalog_missing_on_old_panel_says_update(hub_settings, monkeypatch):
+    from nexus_mcp import server
+
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    panel._catalog_cache.clear()
+    _mock(monkeypatch, lambda req: httpx.Response(404, json={"detail": "Not Found"}))
+    r = asyncio.run(server.panel_endpoints())
+    assert r["ok"] is False and "обновите панель" in r["detail"]
+
+
+def test_panel_endpoints_filters_and_marks_risk(panel_on):
+    from nexus_mcp import server
+
+    r = asyncio.run(server.panel_endpoints(search="users"))
+    assert [e["path"] for e in r["endpoints"]] == ["/api/v1/admin/users/bulk", "/api/v1/admin/users/{user_id}"]
+    assert "массовое" in r["endpoints"][0]["risk"][0]
+    r = asyncio.run(server.panel_endpoints(search="plans"))
+    assert r["endpoints"][0]["body"] == {"price": "number", "title": "string"}
+
+
+def test_panel_sql_goes_as_read_post(panel_on):
+    from nexus_mcp import server
+
+    r = asyncio.run(server.panel_sql("SELECT 1", limit=9999))
+    assert r["ok"] and r["data"]["rows"][0]["sub_token"] == "real…"   # и хаб маскирует
+    m, p, _, body = panel_on[-1]
+    assert (m, p) == ("POST", "/api/v1/admin/db/query") and json.loads(body) == {"sql": "SELECT 1", "limit": 500}
+
+
+def test_panel_maintenance_maps_ops(hub_settings, panel_on):
+    from nexus_mcp import server
+
+    hub_settings.allow_actions = True
+    r = asyncio.run(server.panel_maintenance("redis_delete", {"key": "resync_lock"}))
+    assert r["preview"] and r["params"] == {"key": "resync_lock"} and "удаление" in r["risk"]
+    r = asyncio.run(server.panel_maintenance("redis_delete", {"key": "resync_lock"}, confirm=True))
+    assert r["ok"] and ("DELETE", "/api/v1/admin/redis/key", "key=resync_lock", "") in panel_on
+    assert asyncio.run(server.panel_maintenance("db_vacuum", {}))["error"] == "bad_args"
+    assert asyncio.run(server.panel_maintenance("drop_all"))["error"] == "unknown_op"
+
+
+def test_db_and_redis_views(panel_on):
+    from nexus_mcp import server
+
+    assert asyncio.run(server.panel_db("tables"))["ok"]
+    assert asyncio.run(server.panel_db("nope"))["error"] == "unknown_view"
+    asyncio.run(server.panel_redis("keys", pattern="geosite:*", limit=5))
+    assert ("GET", "/api/v1/admin/redis/keys", "pattern=geosite%3A%2A&limit=5", "") in panel_on
+
+
+# ── Сторож: ручки базы/Redis/каталога и поля их тел — те же, что в панели ──
+
+DATASTORE = "brain/app/api/v1/admin/datastore.py"
+
+
+def test_datastore_routes_exist(vgx3d):
+    from nexus_mcp import server
+
+    text = (vgx3d / DATASTORE).read_text(encoding="utf-8")
+    routes = set(re.findall(r'@router\.(get|post|delete)\(\s*"([^"]+)"', text))
+    wanted = {("get", p.removeprefix("/api/v1/admin")) for p in
+              list(server._DB_VIEWS.values()) + list(server._REDIS_VIEWS.values()) + [panel.CATALOG_PATH]}
+    wanted |= {("post", "/db/query"), ("post", "/db/backup"), ("post", "/db/vacuum"),
+               ("post", "/db/cancel/{pid}"), ("delete", "/redis/key"), ("delete", "/redis/keys")}
+    assert wanted <= routes, wanted - routes
+    assert 'include_router(datastore_router' in (vgx3d / "brain/app/api/v1/admin/__init__.py").read_text()
+    # Поля тела и параметры, которые шлёт panel_maintenance / panel_sql.
+    assert "class QueryBody" in text and "sql: str" in text and "limit: int" in text
+    assert "class VacuumBody" in text and "table: str" in text and "full: bool" in text
+    assert "terminate: bool" in text and "expect: int" in text
+    assert re.search(r'ADMIN_HEADER = "x-admin-token"', text)
+
+
+def test_secret_mask_rule_matches_panel(vgx3d):
+    """Маска хаба по имени поля не слабее маски панели для запросов к базе."""
+    text = (vgx3d / DATASTORE).read_text(encoding="utf-8")
+    cols = re.search(r"SECRET_COLUMNS = \(([^)]*)\)", text).group(1)
+    for col in re.findall(r'"([a-z_0-9]+)"', cols):
+        assert panel._SECRET_KEY.search(col), col

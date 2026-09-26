@@ -37,6 +37,14 @@ PAID_TOOLS = ("sim_probe", "sim_vless", "sim_geo")
 # Правка конфигурации ноды: план (без confirm) только читает и идёт сразу,
 # применение (confirm=true) ждёт кнопки.
 EDIT_TOOLS = ("node_edit",)
+# Изменения через админ-API панели и обслуживание базы/Redis: предпросмотр
+# (без confirm) идёт сразу, выполнение (confirm=true) ждёт кнопки.
+PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance")
+
+MAINTENANCE_TITLES = {
+    "db_backup": "бэкап базы сейчас", "db_vacuum": "VACUUM таблицы", "db_cancel": "снять запрос в базе",
+    "redis_delete": "удалить ключ Redis", "redis_delete_pattern": "удалить ключи Redis по шаблону",
+}
 
 EDIT_OPS = {
     "routing": "маршрутизация", "swap_outbound": "переключить выход", "settings": "настройки ноды",
@@ -135,6 +143,19 @@ def describe_action(tool: str, inp: dict) -> str:
         params = inp.get("params")
         tail = f" {json.dumps(params, ensure_ascii=False)}" if params else ""
         return f"Панель {panel}: POST {inp.get('path', '?')}{tail}"
+    if tool == "panel_call":
+        panel = inp.get("panel") or "единственная"
+        body = inp.get("body")
+        tail = f" {json.dumps(body, ensure_ascii=False)[:200]}" if body else ""
+        params = inp.get("params")
+        q = f" {json.dumps(params, ensure_ascii=False)[:120]}" if params else ""
+        return f"Панель {panel}: {str(inp.get('method', '?')).upper()} {inp.get('path', '?')}{q}{tail}"
+    if tool == "panel_maintenance":
+        panel = inp.get("panel") or "единственная"
+        op = inp.get("op", "?")
+        args = inp.get("args") or {}
+        detail = ", ".join(f"{k}={v}" for k, v in args.items())[:160]
+        return f"Панель {panel}: {MAINTENANCE_TITLES.get(op, op)}" + (f" · {detail}" if detail else "")
     return tool
 
 
@@ -456,7 +477,7 @@ class Runner:
         if not name.startswith(MCP_PREFIX):
             return False, "В чате доступны только инструменты хаба nexus"
         tool = short_tool(name)
-        paid = tool in PAID_TOOLS + EDIT_TOOLS and bool(tool_input.get("confirm"))
+        paid = tool in PAID_TOOLS + EDIT_TOOLS + PANEL_WRITE_TOOLS and bool(tool_input.get("confirm"))
         if tool not in ACTION_TOOLS and not paid:
             return True, tool_input
         title = describe_action(tool, tool_input)
