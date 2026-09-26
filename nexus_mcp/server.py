@@ -27,6 +27,7 @@ from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbo
 from nexus_mcp import node_edit as edits
 from nexus_mcp import links as sublinks
 from nexus_mcp import relay
+from nexus_mcp import probe_sub
 from nexus_mcp import sweep as sub_sweep
 from nexus_mcp import panel as panel_api
 from nexus_mcp.inventory import InventoryError
@@ -64,6 +65,8 @@ panel=<имя>, а ноды называются «панель/имя».
 3. Уточнять: node_logs, node_run(recipe=...), probe_check.
    «Что из подписки открывается из дома» целиком — subscription_check(probe=<домашний>):
    каждая строка подписки с пробника (роутер владельца), e2e=True — ещё и сквозная.
+   Подписки у панели нет — probe_subscription(panel=…): хаб сам заведёт служебного
+   юзера nexus-probe на всех нодах (без confirm — план, с confirm=true — по кнопке).
 4. Действия (node_action) — только после согласия человека, с confirm=true.
    Смена порта/транспорта/IP уезжает в подписки всех юзеров ноды — это предлагать,
    а не делать.
@@ -305,6 +308,27 @@ async def subscription_check(probe: str = HUB, e2e: bool = False, panel: str = "
     if st.get("running"):
         st["next"] = f"subscription_check(probe='{probe}', start=False) — через минуту"
     return st
+
+
+@mcp.tool()
+async def probe_subscription(panel: str = "", confirm: bool = False) -> dict:
+    """Тестовая подписка панели для subscription_check — хаб заводит её сам.
+
+    В панели появляется служебный юзер nexus-probe: без срока и лимита трафика,
+    на всех активных нодах; перед каждым прогоном хаб досыпает ему новые ноды.
+    Ссылка остаётся на хабе. panel — имя панели; пусто — все панели хаба.
+    Без confirm — план и текущее состояние (бесплатно, ничего не меняет);
+    confirm=true — завести/найти и запомнить (в чате ждёт кнопки «Разрешить»).
+    """
+    try:
+        if not confirm:
+            return {**await probe_sub.plan(panel), "now": probe_sub.listing()}
+        res = await probe_sub.ensure(panel)
+    except probe_sub.ProbeSubError as e:
+        return _err(e)
+    audit.record("probe_subscription", {"panel": panel}, res.get("ok", False))
+    res["next"] = "subscription_check(probe=<пробник из probes_list>) — прогон с роутера"
+    return res
 
 
 @mcp.tool()
@@ -1127,6 +1151,25 @@ async def hub_sweep(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "detail": str(e)}, status_code=409)
     audit.record("subscription_check", {"probe": probe, "e2e": bool(body.get("e2e")), "via": "app"}, True)
     return JSONResponse(st, status_code=202)
+
+
+@mcp.custom_route("/hub/subs", methods=["GET", "POST"])
+async def hub_subs(request: Request) -> JSONResponse:
+    """Подписки для проверки по панелям; POST {panel} — завести (кнопка в
+    приложении — согласие человека, как «Разрешить» в чате)."""
+    try:
+        if request.method == "GET":
+            return JSONResponse({"ok": True, "panels": probe_sub.listing()})
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            body = {}
+        panel = str((body or {}).get("panel") or "") if isinstance(body, dict) else ""
+        res = await probe_sub.ensure(panel)
+    except probe_sub.ProbeSubError as e:
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=409)
+    audit.record("probe_subscription", {"panel": panel, "via": "app"}, res.get("ok", False))
+    return JSONResponse(res)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])

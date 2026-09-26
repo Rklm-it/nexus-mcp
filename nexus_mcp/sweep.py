@@ -97,9 +97,10 @@ def sources(panel: str = "") -> list[tuple[str, str]]:
 
 def no_sub_hint(panel: str) -> str:
     who = panel or "<панель>"
-    return ("Нет подписки для проверки. Нужна подписка тестового юзера, привязанного ко всем нодам: "
-            f"на хабе nexus-mcp-panels sub {who} https://…/sub/<токен> "
-            "(или NEXUS_TEST_SUB_URL в /etc/nexus-mcp.env)")
+    return ("Нет подписки для проверки. Хаб заведёт её сам: probe_subscription"
+            f"(panel='{panel}') в чате или «Завести» в приложении (Проверка из дома) — "
+            "служебный юзер nexus-probe на всех нодах. Или свою ссылку: "
+            f"nexus-mcp-panels sub {who} https://…/sub/<токен>")
 
 
 # ── Строки подписки ────────────────────────────────────────────────────────
@@ -209,6 +210,10 @@ async def sweep(probe: str = HUB, panel: str = "", e2e: bool = False,
     srcs = sources(panel)
     uris: list[tuple[str, str]] = []
     errors: list[str] = []
+    # Ноды, появившиеся после заведения тестового юзера, — в его подписку.
+    from nexus_mcp import probe_sub
+
+    errors += await probe_sub.refresh_all(panel)
     for pname, url in srcs:
         try:
             got = await links.fetch_links(url)

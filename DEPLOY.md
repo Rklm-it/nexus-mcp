@@ -225,8 +225,10 @@ wget -qO- https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/probe/openwrt
 должен быть домашним.
 
 Какие строки подписки открываются с пробника — `subscription_check(probe=…)` (или
-кнопка «Проверить» в приложении). Нужна подписка тестового юзера: у панели —
-`nexus-mcp-panels sub <панель> https://…/sub/<токен>`, или `NEXUS_TEST_SUB_URL`.
+кнопка «Проверить» в приложении). Подписку для этого хаб заводит сам: служебный
+юзер `nexus-probe` в каждой панели — `probe_subscription` в чате или «Завести» в
+приложении (Проверка из дома → Подписки панелей). Своя ссылка вместо него —
+`nexus-mcp-panels sub <панель> https://…/sub/<токен>` или `NEXUS_TEST_SUB_URL`.
 
 **Linux / компьютер с python3:**
 ```bash

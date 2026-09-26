@@ -39,7 +39,7 @@ PAID_TOOLS = ("sim_probe", "sim_vless", "sim_geo")
 EDIT_TOOLS = ("node_edit",)
 # Изменения через админ-API панели и обслуживание базы/Redis: предпросмотр
 # (без confirm) идёт сразу, выполнение (confirm=true) ждёт кнопки.
-PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance")
+PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance", "probe_subscription")
 
 MAINTENANCE_TITLES = {
     "db_backup": "бэкап базы сейчас", "db_vacuum": "VACUUM таблицы", "db_cancel": "снять запрос в базе",
@@ -150,6 +150,10 @@ def describe_action(tool: str, inp: dict) -> str:
         params = inp.get("params")
         q = f" {json.dumps(params, ensure_ascii=False)[:120]}" if params else ""
         return f"Панель {panel}: {str(inp.get('method', '?')).upper()} {inp.get('path', '?')}{q}{tail}"
+    if tool == "probe_subscription":
+        panel = inp.get("panel") or "все панели"
+        return (f"Панель {panel}: завести служебного юзера nexus-probe (без срока, на всех нодах) "
+                "для проверки подписки из дома")
     if tool == "panel_maintenance":
         panel = inp.get("panel") or "единственная"
         op = inp.get("op", "?")

@@ -205,11 +205,11 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
     # Реестр пробников живёт в процессе nexus-mcp: ходим к нему по 127.0.0.1
     # с секретом MCP. Приложение секрета не знает — только токен чата.
 
-    async def _hub(method: str, path: str, **kw) -> JSONResponse:
+    async def _hub(method: str, path: str, timeout: float = 20, **kw) -> JSONResponse:
         import httpx
 
         try:
-            async with httpx.AsyncClient(timeout=20, transport=_hub_transport) as c:
+            async with httpx.AsyncClient(timeout=timeout, transport=_hub_transport) as c:
                 r = await c.request(method, s.hub_url + path, **kw,
                                     headers={"Authorization": f"Bearer {s.mcp_secret}"})
         except httpx.HTTPError as e:
@@ -230,6 +230,11 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         if request.method == "POST":
             return await _hub("POST", "/hub/sweep", json=await _body(request))
         return await _hub("GET", "/hub/sweep", params={"probe": request.query_params.get("probe") or "hub"})
+
+    async def probe_subs(request: Request):
+        if request.method == "POST":
+            return await _hub("POST", "/hub/subs", json=await _body(request), timeout=180)
+        return await _hub("GET", "/hub/subs")
 
     async def probe_setup(request: Request):
         """Команда установки пробника на роутер OpenWrt — готовая к копированию."""
@@ -271,6 +276,7 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         Route("/chat/api/probes", guarded(probes), methods=["GET"]),
         Route("/chat/api/probes/sweep", guarded(probe_sweep), methods=["GET", "POST"]),
         Route("/chat/api/probes/setup", guarded(probe_setup), methods=["GET"]),
+        Route("/chat/api/probes/subs", guarded(probe_subs), methods=["GET", "POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.runner = runner

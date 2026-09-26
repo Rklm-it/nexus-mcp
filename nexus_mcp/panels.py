@@ -149,7 +149,8 @@ def rename(old: str, new: str) -> dict:
     if busy:
         raise PanelConfigError(f"имя «{new}» уже занято: {busy} (регистр букв не различается)")
     file_panels = [p for p in _read_file() if p["name"] != old]
-    entry = {k: v for k, v in src.items() if k in ("url", "token", "gate", "basic_auth", "aliases", "sub_url") and v}
+    entry = {k: v for k, v in src.items()
+             if k in ("url", "token", "gate", "basic_auth", "aliases", "sub_url", "sub_user_id") and v}
     entry["name"] = new
     aliases = [a for a in entry.get("aliases", []) if a.lower() != new.lower()]
     if old.lower() != new.lower() and old not in aliases:
@@ -160,9 +161,11 @@ def rename(old: str, new: str) -> dict:
     return public_view(entry)
 
 
-def set_sub(name: str, url: str) -> dict:
+def set_sub(name: str, url: str, user_id: str = "") -> dict:
     """Подписка тестового юзера панели — из неё прогон подписки (sweep.py)
-    берёт ссылки. «-» стирает. Панель из окружения переносится в файл."""
+    берёт ссылки. «-» стирает. Панель из окружения переносится в файл.
+    user_id — служебный юзер, которого завёл сам хаб (probe_sub.py): его
+    хаб перед прогоном привязывает к новым нодам; ручной ссылке — не ставится."""
     url = (url or "").strip()
     if url != "-" and not re.match(r"^https?://\S+$", url):
         raise PanelConfigError(f"«{url}» — не ссылка подписки (https://…/sub/<токен>); стереть — «-»")
@@ -173,6 +176,8 @@ def set_sub(name: str, url: str) -> dict:
     entry = {k: v for k, v in src.items() if k in ("name", "url", "token", "gate", "basic_auth", "aliases") and v}
     if url != "-":
         entry["sub_url"] = url
+        if user_id:
+            entry["sub_user_id"] = user_id
     _write([p for p in _read_file() if p["name"] != name] + [entry])
     return public_view(entry)
 

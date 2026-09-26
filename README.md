@@ -138,6 +138,7 @@ python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ро�
 | `node_logs` | журнал vpn-cell / xray / hysteria-server |
 | `probes_list`, `probe_check` | точки обзора и одиночная проба (tcp / banner / tls / http) |
 | `subscription_check` | вся подписка с точки обзора (роутер дома): что открывается, что режут (filtered), что лежит; `e2e=True` — ещё и сквозная; то же — экран «Проверка из дома» в Nexus Admin |
+| `probe_subscription` | тестовая подписка панели для `subscription_check`: хаб сам заводит служебного юзера `nexus-probe` на всех нодах (без confirm — план; пусто — все панели), перед прогоном досыпает ему новые ноды |
 | `panel_reachability`, `check_from_russia` | вердикт самой панели и проверка с check-host |
 | `fix_playbook` | что делать при симптоме: наш журнал и опыт владельцев VPN-сервисов, со ссылками и степенью доверия |
 | `panels_list` | панели хаба (без токенов); при нескольких у инструментов панели параметр `panel`, ноды называются `панель/имя` |
