@@ -28,6 +28,10 @@ class ChatSettings:
     # машине, мимо Caddy.
     mcp_url: str = field(default_factory=lambda: "http://127.0.0.1:%s/mcp" % _env("NEXUS_MCP_PORT", "8765"))
     mcp_secret: str = field(default_factory=lambda: _env("NEXUS_MCP_SECRET"))
+    # Браузер mcp-browser рядом (свой сервис, свой секрет из /etc/mcp-browser.env):
+    # поиск, сайты, соцсети. Секрета нет — чат работает без веба.
+    web_url: str = field(default_factory=lambda: "http://127.0.0.1:%s/mcp" % _env("MCP_BROWSER_PORT", "8767"))
+    web_secret: str = field(default_factory=lambda: _env("MCP_BROWSER_SECRET"))
     # Токен домашних пробников: приложение показывает команду установки на
     # роутер (пробник открывает только /probe/*, не чат и не MCP).
     probe_token: str = field(default_factory=lambda: (_list("NEXUS_PROBE_TOKENS") or [""])[0])

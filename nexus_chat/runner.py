@@ -28,6 +28,11 @@ logger = logging.getLogger("nexus_chat")
 
 MCP_NAME = "nexus"
 MCP_PREFIX = f"mcp__{MCP_NAME}__"
+# Браузер mcp-browser (поиск, сайты, соцсети) — второй сервер, если стоит.
+WEB_NAME = "web"
+WEB_PREFIX = f"mcp__{WEB_NAME}__"
+# Публикация и удаление постов: предпросмотр идёт сразу, confirm=true ждёт кнопки.
+SOCIAL_TOOLS = ("social_post", "social_delete")
 
 # Инструменты хаба, которые что-то меняют. Остальные только читают.
 ACTION_TOOLS = ("node_action", "panel_action")
@@ -78,7 +83,10 @@ def with_panel(text: str, panel: str) -> str:
 
 
 def short_tool(name: str) -> str:
-    return name[len(MCP_PREFIX):] if name.startswith(MCP_PREFIX) else name
+    for prefix in (MCP_PREFIX, WEB_PREFIX):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
 
 
 def _edit_detail(op: str, args: dict) -> str:
@@ -110,6 +118,14 @@ def _edit_detail(op: str, args: dict) -> str:
 
 def describe_action(tool: str, inp: dict) -> str:
     """Одна строка для кнопки «Разрешить»: что именно произойдёт."""
+    if tool == "social_post":
+        where = f"{inp.get('network', '?')} {inp.get('target') or '(канал по умолчанию)'}"
+        text = " ".join(str(inp.get("text") or "").split())
+        imgs = len(inp.get("images") or [])
+        return f"Опубликовать в {where}: «{text[:120]}{'…' if len(text) > 120 else ''}»" + \
+            (f" + картинок: {imgs}" if imgs else "")
+    if tool == "social_delete":
+        return f"Удалить пост {inp.get('post_id', '?')} в {inp.get('network', '?')} {inp.get('target') or ''}".strip()
     if tool == "node_edit":
         op = inp.get("op", "?")
         detail = _edit_detail(op, inp.get("args") or {})
@@ -354,9 +370,13 @@ class Runner:
         async def can_use_tool(name: str, tool_input: dict, _ctx: Any = None):
             return await self.decide_tool(chat_id, name, tool_input)
 
+        servers = {MCP_NAME: {"type": "http", "url": s.mcp_url,
+                              "headers": {"Authorization": f"Bearer {s.mcp_secret}"}}}
+        if s.web_secret:
+            servers[WEB_NAME] = {"type": "http", "url": s.web_url,
+                                 "headers": {"Authorization": f"Bearer {s.web_secret}"}}
         return {
-            "mcp_servers": {MCP_NAME: {"type": "http", "url": s.mcp_url,
-                                       "headers": {"Authorization": f"Bearer {s.mcp_secret}"}}},
+            "mcp_servers": servers,
             "system_prompt": prompts.SYSTEM_PROMPT,
             "resume": resume,
             "cwd": str(s.work_dir),
@@ -478,10 +498,16 @@ class Runner:
         return _permission(ok, value)
 
     async def _decide(self, chat_id: str, name: str, tool_input: dict) -> tuple[bool, Any]:
-        if not name.startswith(MCP_PREFIX):
-            return False, "В чате доступны только инструменты хаба nexus"
+        web = bool(self.settings.web_secret) and name.startswith(WEB_PREFIX)
+        if not name.startswith(MCP_PREFIX) and not web:
+            return False, "В чате доступны только инструменты хаба nexus и браузера web"
         tool = short_tool(name)
-        paid = tool in PAID_TOOLS + EDIT_TOOLS + PANEL_WRITE_TOOLS and bool(tool_input.get("confirm"))
+        if web:
+            paid = tool in SOCIAL_TOOLS and bool(tool_input.get("confirm"))
+        else:
+            paid = tool in PAID_TOOLS + EDIT_TOOLS + PANEL_WRITE_TOOLS and bool(tool_input.get("confirm"))
+        if web and not paid:
+            return True, tool_input
         if tool not in ACTION_TOOLS and not paid:
             return True, tool_input
         title = describe_action(tool, tool_input)

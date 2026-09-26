@@ -14,7 +14,7 @@
 #
 # Домен необязателен: без --domain берётся <IP>.sslip.io. Порт сам уйдёт на
 # 9443, если 443 занят (нода с xray). Прочее: [--domain d] [--port p]
-# [--no-caddy] [--no-xray] [--no-chat] [--bsbord-key bsk_live_…] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
+# [--no-caddy] [--no-xray] [--no-chat] [--bsbord-key bsk_live_…] [--with-browser] [--foreground]. Из скачанной копии: bash install.sh <те же флаги>.
 #
 # Что делает: код в /opt/nexus-mcp/app, venv, SSH-ключ хаба, секреты,
 # /etc/nexus-mcp.env, systemd, xray для сквозной проверки, Caddy с
@@ -43,7 +43,7 @@ trap 'exit 130' INT TERM
 # Без доступа к репо git должен отказать сразу, а не молча ждать логина.
 export GIT_TERMINAL_PROMPT=0
 
-DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1; WITH_CHAT=1; BSBORD_KEY=""
+DOMAIN=""; PORT="443"; PORT_SET=0; BRAIN_URL=""; BRAIN_TOKEN=""; BRAIN_GATE=""; WITH_CADDY=1; WITH_XRAY=1; WITH_CHAT=1; WITH_BROWSER=0; BSBORD_KEY=""
 REPO_URL="https://github.com/Rklm-it/nexus-mcp.git"; BRANCH="main"; GH_TOKEN="${GH_TOKEN:-}"
 BASE=/opt/nexus-mcp; ETC=/etc/nexus-mcp; ENVF=/etc/nexus-mcp.env; STATE=/var/lib/nexus-mcp
 FOREGROUND=0; ARGS=("$@")
@@ -68,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --no-xray)     WITH_XRAY=0; shift ;;
         --no-chat)     WITH_CHAT=0; shift ;;
         --bsbord-key)  BSBORD_KEY="$2"; shift 2 ;;
+        --with-browser) WITH_BROWSER=1; shift ;;
         --foreground)  FOREGROUND=1; shift ;;
         -h|--help)     [ -f "${BASH_SOURCE[0]:-}" ] && sed -n 2,23p "${BASH_SOURCE[0]}"; FINISHED=1; exit 0 ;;
         *) die "неизвестный параметр: $1" ;;
@@ -392,7 +393,7 @@ if [ "$WITH_CADDY" = "1" ]; then
         chmod +x /usr/local/bin/caddy
     fi
     CADDY_BIN="$(command -v caddy)"
-    mkdir -p /etc/caddy-nexus-mcp
+    mkdir -p /etc/caddy-nexus-mcp /etc/caddy-nexus-mcp/sites
     # Реле нода → хаб → панель для нод, до которых путь к панели режется
     # (nexus_mcp/relay.py). Файл маршрутов пересобирает и nexus-mcp-panels.
     if ! ( cd "$APP" && set -a && . "$ENVF" && set +a && \
@@ -407,6 +408,8 @@ if [ "$WITH_CADDY" = "1" ]; then
 }
 $DOMAIN:$PORT {
     import /etc/caddy-nexus-mcp/relay.caddy
+    # Соседние сервисы на том же домене (браузер mcp-browser — /browser/*).
+    import /etc/caddy-nexus-mcp/sites/*.caddy
     handle /chat/* {
         reverse_proxy 127.0.0.1:8766 {
             flush_interval -1
@@ -444,6 +447,21 @@ EOF
         curl -fsS --connect-timeout 5 -m 10 "$HUBURL/healthz" >/dev/null 2>&1 && break
         sleep 5
     done
+fi
+
+# ── Браузер mcp-browser (отдельный сервис рядом) ─────────────────────────────
+# Свой репозиторий, свой пользователь и секрет: браузер открывает чужие сайты
+# и не должен видеть ключи к нодам. Встаёт на домен хаба, путь /browser/.
+if [ "$WITH_BROWSER" = "1" ]; then
+    log "Браузер mcp-browser: поиск, сайты, соцсети"
+    if BI="$(mktemp)" && timeout 120 curl -fsSL --connect-timeout 15 -o "$BI" \
+            https://raw.githubusercontent.com/Rklm-it/mcp-browser-cl/main/install.sh \
+            && bash "$BI"; then
+        :
+    else
+        warn "mcp-browser не встал — хаб работает без него. Отдельно: bash <(curl -fsSL https://raw.githubusercontent.com/Rklm-it/mcp-browser-cl/main/install.sh)"
+    fi
+    rm -f "$BI"
 fi
 
 # ── Итог ─────────────────────────────────────────────────────────────────────

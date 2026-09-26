@@ -507,6 +507,37 @@ def test_paid_sim_check_needs_button_only_for_the_run(chat_settings):
     asyncio.run(go())
 
 
+def test_web_tools_pass_and_posts_wait_for_button(chat_settings):
+    """Браузер mcp-browser рядом: чтение и браузер идут сразу, предпросмотр
+    поста — сразу, публикация (confirm=true) — только по кнопке. Без секрета
+    браузера его инструменты чату закрыты."""
+    async def go():
+        runner, client, _ = _setup(chat_settings, None)
+        cid = runner.store.create_chat()["id"]
+        ok, _ = await runner._decide(cid, "mcp__web__web_search", {"query": "xray reality"})
+        assert not ok  # браузер не стоит — секрета нет
+        chat_settings.web_secret = "w" * 32
+        assert set(runner._options(cid, None)["mcp_servers"]) == {"nexus", "web"}
+        for tool, inp in (("web_search", {"query": "xray reality"}),
+                          ("browser_act", {"session": "s1", "action": "click", "ref": 3}),
+                          ("social_post", {"network": "telegram", "text": "Привет"})):
+            ok, val = await runner._decide(cid, f"mcp__web__{tool}", inp)
+            assert ok and val == inp, tool
+        assert runner.store.pending_approvals() == []
+
+        inp = {"network": "telegram", "target": "@chan", "text": "Новый   сервер\nв Германии", "images": ["https://x/1.png"],
+               "confirm": True, "plan_hash": "abc"}
+        task = asyncio.create_task(runner._decide(cid, "mcp__web__social_post", inp))
+        ev = await _wait_type(client, cid, "approval")
+        assert ev["data"]["title"] == "Опубликовать в telegram @chan: «Новый сервер в Германии» + картинок: 1"
+        assert ev["data"]["tool"] == "social_post"
+        await client.post(f"/chat/api/approvals/{ev['data']['approval_id']}", json={"allow": True}, headers=AUTH)
+        ok, val = await task
+        assert ok and val["plan_hash"] == "abc" and val["confirm"] is True
+
+    asyncio.run(go())
+
+
 def test_start_without_hub_tools_is_reported(chat_settings):
     """Claude стартовал без инструментов хаба — в ленте причина, а не
     молчаливые догадки модели («No such tool available: panels_list»)."""

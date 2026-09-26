@@ -75,6 +75,14 @@ else
     echo "6) SIM-проверки bschekbot (операторы РФ, белые списки): ключ не задан —"
     echo "   NEXUS_BSBORD_KEY=bsk_live_… в $ENVF (кабинет bsbord.com → API, тариф Bronze+)"
 fi
+if command -v mcp-browser >/dev/null 2>&1 && [ -r /etc/mcp-browser.env ]; then
+    echo "7) Браузер (поиск, сайты, соцсети) — второй коннектор claude.ai; в чате приложения он уже есть:"
+    echo "     $(mcp-browser url)"
+    echo "   Состояние, Telegram/VK, входы в соцсети: mcp-browser"
+else
+    echo "7) Браузер (поиск, сайты, соцсети) не стоит. Поставить рядом:"
+    echo "     bash <(curl -fsSL https://raw.githubusercontent.com/Rklm-it/mcp-browser-cl/main/install.sh)"
+fi
 echo
 echo "Меню хаба (панели, ноды, ключи, секреты, журналы): nexus-hub"
 echo "Настройки: $ENVF → systemctl restart nexus-mcp nexus-chat"
