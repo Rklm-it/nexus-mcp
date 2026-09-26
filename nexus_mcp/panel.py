@@ -190,6 +190,40 @@ def compact_health(data: Any) -> Any:
     return {**data, "groups": groups}
 
 
+VERSIONS_PATH = "/api/v1/admin/system/versions"
+
+# С какой версии brain есть ручка: без этого «обновите панель» на панели,
+# которую только что обновили, выглядит ложью — а она обновилась до версии
+# мастера лицензии, где ручки ещё нет.
+MIN_BRAIN = [
+    (r"/api/v1/admin/(db|redis)/.*|/api/v1/admin/meta/endpoints", "3.104.9"),
+]
+
+
+async def _brain_version(p: dict) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10.0, auth=_brain_auth(p)) as c:
+            r = await c.get(p["url"] + VERSIONS_PATH, headers=_brain_headers(p))
+        return str((r.json().get("brain") or {}).get("version") or "") if r.status_code == 200 else ""
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return ""
+
+
+async def outdated_hint(p: dict, path: str) -> str:
+    """404 «Not Found» от FastAPI — ручки нет в этой сборке brain (своя 404
+    ручки приходит со своим detail). Назвать версию панели и откуда она
+    берёт обновление."""
+    have = await _brain_version(p)
+    need = next((v for pat, v in MIN_BRAIN if re.fullmatch(pat, path)), "")
+    out = f" — в сборке brain панели {p['name']}"
+    out += f" (v{have})" if have else ""
+    out += " нет такой ручки"
+    out += f", она появилась в v{need}" if need else ""
+    return (out + ". Обновите панель; панель по лицензии качает образы у мастера — если после "
+            "обновления версия та же, сначала обновите brain мастера («Обновить Brain» на мастере), "
+            "затем «Обновить» у панели")
+
+
 async def request(method: str, path: str, params: dict | None = None,
                   timeout: float = 30.0, panel_name: str = "", compact=None,
                   body: Any = None, raw: bool = False) -> Any:
@@ -218,6 +252,8 @@ async def request(method: str, path: str, params: dict | None = None,
             data = r.json()
         except ValueError:
             data = None
+        if r.status_code == 404 and data == {"detail": "Not Found"} and path != VERSIONS_PATH:
+            hint = await outdated_hint(p, path)
         raise PanelError(f"панель {p['name']} ответила {r.status_code} на {method} {path}: {detail}{hint}",
                          r.status_code, data)
     if r.status_code == 204 or not r.content:
@@ -331,8 +367,9 @@ async def catalog(panel_name: str = "", fresh: bool = False) -> list[dict]:
         data = await request("GET", CATALOG_PATH, None, 30.0, panel_name, raw=True)
     except PanelError as e:
         if e.status == 404:
-            raise PanelError(f"панель {key} без каталога ручек ({CATALOG_PATH}): обновите панель — "
-                             "до обновления работают только готовые инструменты и panel_get по /api/v1/admin/*",
+            why = str(e).partition(" — ")[2] or "обновите панель"
+            raise PanelError(f"панель {key} без каталога ручек ({CATALOG_PATH}): {why}. "
+                             "До обновления работают только готовые инструменты и panel_get по /api/v1/admin/*",
                              404) from e
         raise
     items = data.get("endpoints") if isinstance(data, dict) else None
