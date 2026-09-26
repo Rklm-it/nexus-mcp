@@ -44,6 +44,9 @@ def listing() -> list[dict]:
         # /api за паролем Caddy, а обхода (gate) хаб не знает: телефон до
         # такой панели не дойдёт, даже если хаб его зарегистрирует.
         "password_only": bool(p.get("basic_auth")) and not p.get("gate"),
+        # Мастер brain — в приложении отдельным разделом (выпуск версии
+        # для клиентов лицензии): nexus-mcp-panels master <имя>.
+        "master": bool(p.get("master")),
     } for p in _panels()]
 
 

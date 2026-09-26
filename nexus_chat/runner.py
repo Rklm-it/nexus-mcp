@@ -39,7 +39,15 @@ PAID_TOOLS = ("sim_probe", "sim_vless", "sim_geo")
 EDIT_TOOLS = ("node_edit",)
 # Изменения через админ-API панели и обслуживание базы/Redis: предпросмотр
 # (без confirm) идёт сразу, выполнение (confirm=true) ждёт кнопки.
-PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance", "probe_subscription")
+PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance", "probe_subscription",
+                     "master_job", "master_clients_update", "panel_update")
+
+MASTER_JOB_TITLES = {
+    "brain": "обновить brain мастера (git pull и пересборка)",
+    "frontend": "пересобрать фронт мастера",
+    "build": "собрать образ для клиентов лицензии",
+    "release": "выпуск: brain → фронт → образ для клиентов",
+}
 
 MAINTENANCE_TITLES = {
     "db_backup": "бэкап базы сейчас", "db_vacuum": "VACUUM таблицы", "db_cancel": "снять запрос в базе",
@@ -154,6 +162,20 @@ def describe_action(tool: str, inp: dict) -> str:
         panel = inp.get("panel") or "все панели"
         return (f"Панель {panel}: завести служебного юзера nexus-probe (без срока, на всех нодах) "
                 "для проверки подписки из дома")
+    if tool == "master_job":
+        panel = inp.get("panel") or "мастер"
+        kind = inp.get("kind", "?")
+        tail = " и разослать обновление клиентам" if inp.get("notify_clients") and kind in ("build", "release") else ""
+        return f"Мастер {panel}: {MASTER_JOB_TITLES.get(kind, kind)}{tail}"
+    if tool == "master_clients_update":
+        panel = inp.get("panel") or "мастер"
+        ids = inp.get("ids") or []
+        who = f"клиентам {', '.join(map(str, ids[:6]))}" if ids else "всем отставшим клиентам"
+        if ids and inp.get("only_behind") is False:
+            who += " (даже на той же версии)"
+        return f"Мастер {panel}: разослать «обновись» {who}"
+    if tool == "panel_update":
+        return f"Обновить панель {inp.get('panel', '?')} образами мастера (3–10 мин, панель перезапустится)"
     if tool == "panel_maintenance":
         panel = inp.get("panel") or "единственная"
         op = inp.get("op", "?")

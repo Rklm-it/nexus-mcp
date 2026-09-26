@@ -197,6 +197,7 @@ VERSIONS_PATH = "/api/v1/admin/system/versions"
 # мастера лицензии, где ручки ещё нет.
 MIN_BRAIN = [
     (r"/api/v1/admin/(db|redis)/.*|/api/v1/admin/meta/endpoints", "3.104.9"),
+    (r"/api/v1/admin/master/.*", "3.104.10"),
 ]
 
 
@@ -324,6 +325,9 @@ CALL_DENY = {
     r"/api/v1/admin/verify": "проверка входа, не действие",
     r"/api/v1/admin/meta/.*": "каталог — panel_endpoints",
     r"/api/v1/admin/db/query": "запрос к базе — panel_sql",
+    r"/api/v1/admin/master/.*": "задачи мастера — master_job и master_clients_update",
+    r"/api/v1/admin/brain/self-update": "обновление brain мастера — master_job(kind=\"brain\")",
+    r"/api/v1/admin/system/update": "обновление панели — panel_update",
 }
 
 # Чем рискует правка — строка в предпросмотре и на кнопке «Разрешить».
