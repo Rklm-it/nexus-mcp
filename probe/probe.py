@@ -27,11 +27,19 @@
     http    — GET по URL мимо любых прокси
     e2e     — поднять xray-клиент с конфигом от хаба и открыть сайт через
               него: работает ли протокол на самом деле
+    batch   — пачка лёгких проб (tcp/banner/tls/http) параллельно, одним
+              заданием: прогон всей подписки не упирается в очередь
+
+Роутер (OpenWrt) — probe/openwrt/install.sh: python3-light, служба procd.
+Памяти там мало, поэтому сквозная проверка идёт по одной и отказывается
+запускать xray, если свободной памяти меньше NEXUS_PROBE_MIN_MEM_MB
+(по умолчанию 48): лучше «не проверили», чем OOM, убивший домашний интернет.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import platform
@@ -41,11 +49,22 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
-PROBE_VERSION = "1.0.0"
+PROBE_VERSION = "1.1.0"
+
+# Лёгкие пробы, которые можно гнать пачкой. e2e сюда не входит: каждая —
+# отдельный процесс xray, на роутере это десятки мегабайт.
+BATCH_KINDS = ("tcp", "banner", "tls", "http")
+BATCH_MAX = 200
+BATCH_PARALLEL_MAX = 16
+
+# Бандл корней OpenWrt (пакет ca-bundle). Python там собран без своего пути
+# к сертификатам, и проверка TLS хаба падает на ровном месте.
+CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem")
 
 # Куда ходим в сквозной проверке: крошечный ответ 204, есть у всех клиентов.
 E2E_DEFAULT_URL = "https://www.gstatic.com/generate_204"
@@ -84,18 +103,63 @@ def _ms(t0: float) -> float:
     return round((time.monotonic() - t0) * 1000, 1)
 
 
+# FakeIP sing-box (podkop на OpenWrt и родня): имя из их списков резолвится в
+# 198.18.0.0/15, и соединение уходит в VPN роутера. Проба тогда зеленеет
+# картиной VPN, а не провайдера — поэтому адрес, куда ушли, едет в ответ.
+FAKEIP_NETS = (("198.18.0.0", 15),)
+
+
+def _is_fakeip(ip: str) -> bool:
+    try:
+        packed = int.from_bytes(socket.inet_aton(ip), "big")
+    except OSError:
+        return False
+    for net, bits in FAKEIP_NETS:
+        base = int.from_bytes(socket.inet_aton(net), "big")
+        mask = (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF
+        if packed & mask == base & mask:
+            return True
+    return False
+
+
+def _peer(host: str, port: int) -> dict:
+    """Куда на самом деле пойдёт соединение: адрес и признак FakeIP."""
+    try:
+        infos = socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
+    except OSError:
+        return {}
+    ip = infos[0][4][0] if infos else ""
+    out = {"peer": ip} if ip and ip != host else {}
+    if ip and _is_fakeip(ip):
+        out["fakeip"] = True
+    return out
+
+
 # ── Пробы ───────────────────────────────────────────────────────────────────
 
 def probe_tcp(host: str, port: int, timeout: float = 7.0) -> dict:
     """Открывается ли TCP-соединение."""
+    peer = _peer(host, port)
     t0 = time.monotonic()
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
-            return {"ok": True, "ms": _ms(t0)}
+            return {"ok": True, "ms": _ms(t0), **peer}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "ms": _ms(t0), "error": _kind(e), "detail": str(e)[:200]}
+        return {"ok": False, "ms": _ms(t0), "error": _kind(e), "detail": str(e)[:200], **peer}
 
 
+def _with_peer(fn):
+    """Добавить в ответ пробы адрес, куда ушло соединение (см. _peer)."""
+    def wrapped(host, port, *a, **kw):
+        res = fn(host, port, *a, **kw)
+        res.update(_peer(host, port))
+        return res
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+@_with_peer
 def probe_banner(host: str, port: int = 22, timeout: float = 8.0) -> dict:
     """Пришли ли данные ОТ сервера после соединения.
 
@@ -130,6 +194,7 @@ def probe_banner(host: str, port: int = 22, timeout: float = 8.0) -> dict:
             pass
 
 
+@_with_peer
 def probe_tls(host: str, port: int = 443, sni: str | None = None,
               timeout: float = 8.0, alpn: list | None = None) -> dict:
     """Полное TLS-рукопожатие. Сертификат не проверяем: нам важно, дошли ли
@@ -272,10 +337,74 @@ def find_xray(explicit: str | None = None) -> str | None:
     found = shutil.which("xray") or shutil.which("xray.exe")
     if found:
         return found
-    for cand in ("/usr/local/bin/xray", "/usr/bin/xray", "/opt/xray/xray"):
+    # /tmp/nexus-xray — роутер: флеша мало, xray качается в память при старте.
+    for cand in ("/usr/local/bin/xray", "/usr/bin/xray", "/opt/xray/xray",
+                 "/tmp/nexus-xray/xray", "/usr/share/nexus-probe/xray"):
         if os.path.isfile(cand):
             return cand
     return None
+
+
+# ── xray по требованию (роутер) ────────────────────────────────────────────
+# На флеш роутера xray (~30 МБ) не влезает, а держать его в /tmp постоянно —
+# отдать 30 МБ ОЗУ из 256 навсегда. Поэтому: качаем zip в память перед
+# сквозной проверкой и удаляем после XRAY_IDLE_S простоя.
+
+XRAY_TMP_DIR = "/tmp/nexus-xray"
+XRAY_IDLE_S = 600
+# zip (~12 МБ) + распакованный xray (~30 МБ) + его работа.
+XRAY_FETCH_MIN_MEM_MB = 110
+_XRAY_URL = os.environ.get("NEXUS_XRAY_URL", "")
+_XRAY_FETCH_LOCK = threading.Lock()
+_xray_last_used = 0.0
+
+
+def fetch_xray(url: str, timeout: float = 120.0) -> tuple[str | None, str]:
+    """Скачать и распаковать xray в XRAY_TMP_DIR. (путь, причина отказа)."""
+    import zipfile
+
+    with _XRAY_FETCH_LOCK:
+        path = os.path.join(XRAY_TMP_DIR, "xray")
+        if os.path.isfile(path):
+            return path, ""
+        avail = mem_available_mb()
+        if avail is not None and avail < XRAY_FETCH_MIN_MEM_MB:
+            return None, (f"свободно {avail} МБ ОЗУ, для скачивания xray нужно {XRAY_FETCH_MIN_MEM_MB} МБ "
+                          "(zip + распакованный + работа)")
+        os.makedirs(XRAY_TMP_DIR, exist_ok=True)
+        zpath = os.path.join(XRAY_TMP_DIR, "xray.zip")
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                 urllib.request.HTTPSHandler(context=hub_ssl_context()))
+            req = urllib.request.Request(url, headers={"User-Agent": f"nexus-probe/{PROBE_VERSION}"})
+            with opener.open(req, timeout=timeout) as resp, open(zpath, "wb") as f:
+                shutil.copyfileobj(resp, f, 256 * 1024)
+            with zipfile.ZipFile(zpath) as z:
+                name = next((n for n in z.namelist() if os.path.basename(n) == "xray"), None)
+                if not name:
+                    return None, "в архиве нет файла xray"
+                with z.open(name) as src, open(path + ".part", "wb") as dst:
+                    shutil.copyfileobj(src, dst, 256 * 1024)
+            os.chmod(path + ".part", 0o755)
+            os.replace(path + ".part", path)
+            return path, ""
+        except Exception as e:  # noqa: BLE001 — причина уходит в ответ пробы
+            shutil.rmtree(XRAY_TMP_DIR, ignore_errors=True)
+            return None, f"xray не скачался с {url}: {str(e)[:160]}"
+        finally:
+            try:
+                os.remove(zpath)
+            except OSError:
+                pass
+
+
+def drop_idle_xray() -> None:
+    """Освободить память: скачанный xray не нужен после простоя."""
+    if not _XRAY_URL or not os.path.isdir(XRAY_TMP_DIR):
+        return
+    if time.time() - _xray_last_used < XRAY_IDLE_S or _E2E_LOCK.locked():
+        return
+    shutil.rmtree(XRAY_TMP_DIR, ignore_errors=True)
 
 
 def probe_e2e(config: dict, url: str = E2E_DEFAULT_URL, timeout: float = 15.0,
@@ -286,10 +415,54 @@ def probe_e2e(config: dict, url: str = E2E_DEFAULT_URL, timeout: float = 15.0,
     подписки). Входы в нём заменяем одним SOCKS на свободном порту: чужие
     фиксированные порты 10808/10809 могут быть заняты домашним клиентом.
     """
+    global _xray_last_used
     xray = find_xray(xray_bin)
+    if not xray and _XRAY_URL:
+        xray, why = fetch_xray(_XRAY_URL)
+        if not xray:
+            return {"ok": False, "error": "no_xray", "detail": why}
     if not xray:
         return {"ok": False, "error": "no_xray",
                 "detail": "xray не найден: укажите --xray или положите его в PATH"}
+    _xray_last_used = time.time()
+    with _E2E_LOCK:
+        # Память смотрим уже под замком: пока ждали очереди, её могли занять.
+        avail = mem_available_mb()
+        need = min_mem_mb()
+        if avail is not None and avail < need:
+            return {"ok": False, "error": "low_memory",
+                    "detail": f"свободно {avail} МБ, xray запускается от {need} МБ "
+                              "(NEXUS_PROBE_MIN_MEM_MB): на роутере это защита от OOM"}
+        try:
+            return _probe_e2e(xray, config, url, timeout)
+        finally:
+            _xray_last_used = time.time()
+
+
+# Одна сквозная проверка за раз: два xray на роутере с 256 МБ — уже риск.
+_E2E_LOCK = threading.Lock()
+
+
+def mem_available_mb() -> int | None:
+    """MemAvailable из /proc/meminfo; None — не Linux или не прочитать."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def min_mem_mb() -> int:
+    try:
+        return int(os.environ.get("NEXUS_PROBE_MIN_MEM_MB") or 48)
+    except ValueError:
+        return 48
+
+
+def _probe_e2e(xray: str, config: dict, url: str, timeout: float) -> dict:
     port = _free_port()
     cfg = json.loads(json.dumps(config))
     cfg["inbounds"] = [{
@@ -366,6 +539,8 @@ def run_job(kind: str, args: dict, xray_bin: str | None = None) -> dict:
         if kind == "e2e":
             return probe_e2e(a["config"], a.get("url") or E2E_DEFAULT_URL,
                              float(a.get("timeout", 15)), xray_bin)
+        if kind == "batch":
+            return run_batch(a.get("jobs") or [], int(a.get("parallel") or 8))
         if kind == "info":
             return {"ok": True, **probe_info(xray_bin)}
     except KeyError as e:
@@ -373,12 +548,66 @@ def run_job(kind: str, args: dict, xray_bin: str | None = None) -> dict:
     return {"ok": False, "error": "unknown_kind", "detail": f"неизвестное задание: {kind}"}
 
 
+def run_batch(jobs: list, parallel: int = 8) -> dict:
+    """Пачка лёгких проб параллельно; результаты — в порядке заданий.
+
+    Одно задание вместо сотни: очередь пробника не копит проб, у каждой из
+    которых на хабе тикает свой таймаут, и прогон подписки не зависит от того,
+    успевает ли пробник по одной.
+    """
+    if not isinstance(jobs, list) or not jobs:
+        return {"ok": False, "error": "bad_args", "detail": "пустая пачка"}
+    if len(jobs) > BATCH_MAX:
+        return {"ok": False, "error": "bad_args", "detail": f"в пачке больше {BATCH_MAX} проб"}
+
+    def one(job) -> dict:
+        if not isinstance(job, dict) or job.get("kind") not in BATCH_KINDS:
+            kind = job.get("kind") if isinstance(job, dict) else job
+            return {"ok": False, "error": "bad_args", "detail": f"в пачке только {', '.join(BATCH_KINDS)}, а не {kind}"}
+        t0 = time.monotonic()
+        try:
+            r = run_job(job["kind"], job.get("args") or {})
+        except Exception as e:  # noqa: BLE001 — одна проба не роняет пачку
+            r = {"ok": False, "error": "error", "detail": str(e)[:200]}
+        r.setdefault("took_ms", _ms(t0))
+        return r
+
+    workers = max(1, min(int(parallel or 1), BATCH_PARALLEL_MAX, len(jobs)))
+    t0 = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(one, jobs))
+    return {"ok": True, "results": results, "ms": _ms(t0)}
+
+
+ROUTER_VPN_SERVICES = ("podkop", "passwall", "passwall2", "sing-box", "openclash", "mihomo", "ssclash")
+
+
+def router_vpn() -> str:
+    """Включённый на роутере VPN-клиент (OpenWrt): он может завернуть и
+    трафик самого пробника. Пусто — не нашли (или не OpenWrt)."""
+    rc = "/etc/rc.d"
+    try:
+        enabled = os.listdir(rc)
+    except OSError:
+        return ""
+    for svc in ROUTER_VPN_SERVICES:
+        # /etc/rc.d/S99podkop — включён; K… — только остановка при выключении.
+        if any(n.startswith("S") and n[1:].lstrip("0123456789") == svc for n in enabled):
+            return svc
+    return ""
+
+
 def probe_info(xray_bin: str | None = None) -> dict:
     return {
         "version": PROBE_VERSION,
         "platform": platform.platform(),
         "python": platform.python_version(),
-        "xray": find_xray(xray_bin),
+        # Скачиваемый по требованию — тоже «есть»: хаб по этому полю решает,
+        # предлагать ли сквозную проверку.
+        "xray": find_xray(xray_bin) or ("по требованию" if _XRAY_URL else None),
+        "batch": True,
+        "mem_available_mb": mem_available_mb(),
+        "router_vpn": router_vpn(),
     }
 
 
@@ -392,28 +621,63 @@ def _call(hub: str, token: str, method: str, path: str, body: dict | None = None
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                  "User-Agent": f"nexus-probe/{PROBE_VERSION}"},
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                         urllib.request.HTTPSHandler(context=hub_ssl_context()))
     with opener.open(req, timeout=timeout) as resp:
         raw = resp.read()
         return json.loads(raw) if raw else {}
 
 
+def hub_ssl_context() -> ssl.SSLContext:
+    """Проверка сертификата хаба — всегда. На OpenWrt у Python нет своего
+    пути к корням, поэтому берём бандл системы, если по умолчанию пусто."""
+    ctx = ssl.create_default_context()
+    if not os.environ.get("SSL_CERT_FILE") and not ctx.get_ca_certs():
+        for path in CA_BUNDLES:
+            if os.path.isfile(path):
+                ctx.load_verify_locations(cafile=path)
+                break
+    return ctx
+
+
 def serve(hub: str, token: str, name: str, xray_bin: str | None) -> None:
+    """Опрос хаба. Задания выполняются в фоне: пока идёт сквозная проверка
+    (десятки секунд), пробник продолжает забирать и выполнять лёгкие."""
     from urllib.parse import quote
 
     info = probe_info(xray_bin)
-    print(f"[nexus-probe] {name} → {hub} (xray: {info['xray'] or 'нет'})", flush=True)
+    print(f"[nexus-probe] {name} → {hub} (xray: {info['xray'] or 'нет'}, "
+          f"версия {PROBE_VERSION})", flush=True)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+    def work(job: dict) -> None:
+        t0 = time.monotonic()
+        try:
+            result = run_job(job.get("kind", ""), job.get("args") or {}, xray_bin)
+        except Exception as e:  # noqa: BLE001 — упавшая проба = ответ с причиной
+            result = {"ok": False, "error": "error", "detail": str(e)[:200]}
+        result.setdefault("took_ms", _ms(t0))
+        for attempt in range(3):
+            try:
+                _call(hub, token, "POST", "/probe/result",
+                      {"name": name, "id": job.get("id"), "result": result}, timeout=20)
+                return
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2:
+                    print(f"[nexus-probe] результат {job.get('id')} не отправлен: {e}",
+                          file=sys.stderr, flush=True)
+                time.sleep(1 + attempt)
+
     backoff = 2.0
     while True:
         try:
+            info["mem_available_mb"] = mem_available_mb()
+            info["xray"] = find_xray(xray_bin) or ("по требованию" if _XRAY_URL else None)
+            drop_idle_xray()
             resp = _call(hub, token, "POST", f"/probe/poll?name={quote(name)}", {"info": info})
             backoff = 2.0
             for job in resp.get("jobs", []):
-                t0 = time.monotonic()
-                result = run_job(job.get("kind", ""), job.get("args") or {}, xray_bin)
-                result.setdefault("took_ms", _ms(t0))
-                _call(hub, token, "POST", "/probe/result",
-                      {"name": name, "id": job.get("id"), "result": result}, timeout=20)
+                pool.submit(work, job)
         except urllib.error.HTTPError as e:
             # 401/403 — неверный токен: повторять бессмысленно, но и падать
             # молча нельзя — пишем причину и ждём дольше.
@@ -435,6 +699,9 @@ def main() -> None:
     p.add_argument("--name", default=socket.gethostname(),
                    help="имя пробника, лучше с провайдером: «ростелеком-дом»")
     p.add_argument("--xray", default=None, help="путь к xray для сквозной проверки")
+    p.add_argument("--xray-url", default=os.environ.get("NEXUS_XRAY_URL", ""),
+                   help="zip с xray: качать в /tmp перед сквозной проверкой и удалять после "
+                        "простоя (роутер, где xray не влезает на флеш)")
     p.add_argument("--once", default=None, metavar="HOST",
                    help="не подключаться к хабу, а один раз проверить HOST и выйти")
     a = p.parse_args()
@@ -447,6 +714,8 @@ def main() -> None:
         return
     if not a.token:
         p.error("нужен --token (или переменная NEXUS_PROBE_TOKEN)")
+    global _XRAY_URL
+    _XRAY_URL = a.xray_url or ""
     serve(a.hub, a.token, a.name, a.xray)
 
 

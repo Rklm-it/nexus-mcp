@@ -28,6 +28,10 @@ logger = logging.getLogger("nexus_chat")
 
 API_VERSION = 1
 
+# Транспорт к nexus-mcp (127.0.0.1). Тесты подставляют ASGI самого хаба —
+# проверяется связка целиком, а не заглушка ответа.
+_hub_transport = None
+
 
 def _eq(a: str, b: str) -> bool:
     return bool(a) and bool(b) and hmac.compare_digest(a.encode(), b.encode())
@@ -197,6 +201,49 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
                                                  str(body.get("public_key") or ""),
                                                  str(body.get("label") or "")))
 
+    # ── Проверка подписки с пробников (домашний роутер) ──
+    # Реестр пробников живёт в процессе nexus-mcp: ходим к нему по 127.0.0.1
+    # с секретом MCP. Приложение секрета не знает — только токен чата.
+
+    async def _hub(method: str, path: str, **kw) -> JSONResponse:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=20, transport=_hub_transport) as c:
+                r = await c.request(method, s.hub_url + path, **kw,
+                                    headers={"Authorization": f"Bearer {s.mcp_secret}"})
+        except httpx.HTTPError as e:
+            return _err(502, f"хаб (nexus-mcp) не отвечает на 127.0.0.1: {type(e).__name__} — "
+                             "systemctl status nexus-mcp")
+        try:
+            data = r.json()
+        except ValueError:
+            return _err(502, f"хаб ответил {r.status_code} не JSON: {r.text[:120]}")
+        if r.status_code == 404 and isinstance(data, dict) and data.get("detail") == "not found":
+            return _err(404, "хаб старый: нет /hub/* — обновите хаб установщиком nexus-mcp")
+        return JSONResponse(data, status_code=r.status_code)
+
+    async def probes(request: Request):
+        return await _hub("GET", "/hub/probes")
+
+    async def probe_sweep(request: Request):
+        if request.method == "POST":
+            return await _hub("POST", "/hub/sweep", json=await _body(request))
+        return await _hub("GET", "/hub/sweep", params={"probe": request.query_params.get("probe") or "hub"})
+
+    async def probe_setup(request: Request):
+        """Команда установки пробника на роутер OpenWrt — готовая к копированию."""
+        if not s.probe_token:
+            return _err(409, "на хабе нет токена пробников (NEXUS_PROBE_TOKENS в /etc/nexus-mcp.env)")
+        hub = str(request.base_url).rstrip("/")
+        name = (request.query_params.get("name") or "роутер-дом").strip()[:40]
+        name = "".join(c for c in name if c.isalnum() or c in "-_") or "router"
+        xray = "tmp" if request.query_params.get("xray", "1") != "0" else "no"
+        cmd = (f"wget -qO- {s.probe_src}/probe/openwrt/install.sh | sh -s -- "
+               f"--hub {hub} --token {s.probe_token} --name {name} --xray {xray} --src {s.probe_src}")
+        return JSONResponse({"ok": True, "hub": hub, "name": name, "command": cmd,
+                             "remove": f"wget -qO- {s.probe_src}/probe/openwrt/install.sh | sh -s -- --remove"})
+
     async def healthz(request: Request):
         return JSONResponse({"ok": True, "service": "nexus-chat", "logged_in": s.logged_in})
 
@@ -221,6 +268,9 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         Route("/chat/api/audit", guarded(audit), methods=["POST"]),
         Route("/chat/api/panels", guarded(panels), methods=["GET"]),
         Route("/chat/api/panels/{name}/enroll", guarded(panel_enroll), methods=["POST"]),
+        Route("/chat/api/probes", guarded(probes), methods=["GET"]),
+        Route("/chat/api/probes/sweep", guarded(probe_sweep), methods=["GET", "POST"]),
+        Route("/chat/api/probes/setup", guarded(probe_setup), methods=["GET"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.runner = runner

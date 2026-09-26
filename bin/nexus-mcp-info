@@ -42,6 +42,8 @@ echo
 echo "3) Домашний пробник (компьютер или роутер дома):"
 echo "     python3 probe.py --hub $HUB --token $PROBE --name <провайдер-дом>"
 echo "   probe.py: /opt/nexus-mcp/app/probe/probe.py"
+echo "   Роутер OpenWrt (или кнопка «Подключить роутер» в приложении, Ноды → Проверка из дома):"
+echo "     wget -qO- https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/probe/openwrt/install.sh | sh -s -- --hub $HUB --token $PROBE --name роутер-дом --xray tmp"
 echo
 echo "4) Панели хаба (добавить ещё: nexus-mcp-panels add <имя> <url> <токен>):"
 if command -v nexus-mcp-panels >/dev/null 2>&1; then

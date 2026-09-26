@@ -90,7 +90,8 @@ def resolve(name: str = "") -> dict:
 def public_view(p: dict) -> dict:
     """Для вывода: без токена и пароля."""
     return {"name": p["name"], "url": p["url"], "gate": bool(p.get("gate")),
-            "basic_auth": bool(p.get("basic_auth")), "aliases": list(p.get("aliases") or [])}
+            "basic_auth": bool(p.get("basic_auth")), "aliases": list(p.get("aliases") or []),
+            "sub": bool(p.get("sub_url"))}
 
 
 # ── Команда управления ─────────────────────────────────────────────────────
@@ -148,7 +149,7 @@ def rename(old: str, new: str) -> dict:
     if busy:
         raise PanelConfigError(f"имя «{new}» уже занято: {busy} (регистр букв не различается)")
     file_panels = [p for p in _read_file() if p["name"] != old]
-    entry = {k: v for k, v in src.items() if k in ("url", "token", "gate", "basic_auth", "aliases") and v}
+    entry = {k: v for k, v in src.items() if k in ("url", "token", "gate", "basic_auth", "aliases", "sub_url") and v}
     entry["name"] = new
     aliases = [a for a in entry.get("aliases", []) if a.lower() != new.lower()]
     if old.lower() != new.lower() and old not in aliases:
@@ -156,6 +157,23 @@ def rename(old: str, new: str) -> dict:
     entry["aliases"] = aliases
     file_panels.append(entry)
     _write(file_panels)
+    return public_view(entry)
+
+
+def set_sub(name: str, url: str) -> dict:
+    """Подписка тестового юзера панели — из неё прогон подписки (sweep.py)
+    берёт ссылки. «-» стирает. Панель из окружения переносится в файл."""
+    url = (url or "").strip()
+    if url != "-" and not re.match(r"^https?://\S+$", url):
+        raise PanelConfigError(f"«{url}» — не ссылка подписки (https://…/sub/<токен>); стереть — «-»")
+    everything = all_panels()
+    src = next((p for p in everything if p["name"] == name), None)
+    if src is None:
+        raise PanelConfigError(f"панели «{name}» нет. Есть: {', '.join(p['name'] for p in everything)}")
+    entry = {k: v for k, v in src.items() if k in ("name", "url", "token", "gate", "basic_auth", "aliases") and v}
+    if url != "-":
+        entry["sub_url"] = url
+    _write([p for p in _read_file() if p["name"] != name] + [entry])
     return public_view(entry)
 
 
@@ -192,6 +210,9 @@ def main(argv: list[str] | None = None) -> int:
     rn = sub.add_parser("rename", help="переименовать; старое имя остаётся адресом реле")
     rn.add_argument("old")
     rn.add_argument("new")
+    sb = sub.add_parser("sub", help="подписка тестового юзера панели: из неё проверка нод из дома")
+    sb.add_argument("name")
+    sb.add_argument("url", help="ссылка подписки (https://…/sub/<токен>); «-» — стереть")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "list":
@@ -199,7 +220,8 @@ def main(argv: list[str] | None = None) -> int:
                 v = public_view(p)
                 how = "gate" if v["gate"] else ("basic_auth" if v["basic_auth"] else "")
                 al = f"  прежние имена: {', '.join(v['aliases'])}" if v["aliases"] else ""
-                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}{al}")
+                sb = "  подписка: есть" if v["sub"] else ""
+                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}{al}{sb}")
         elif args.cmd == "add":
             v = add(args.name, args.url, args.token, args.basic, args.gate)
             print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
@@ -208,6 +230,9 @@ def main(argv: list[str] | None = None) -> int:
             v = rename(args.old, args.new)
             print(f"переименована: {args.old} → {v['name']} (ноды на реле /relay/{args.old} связь не теряют)")
             _refresh_relay()
+        elif args.cmd == "sub":
+            v = set_sub(args.name, args.url)
+            print(f"{v['name']}: подписка для проверки {'задана' if v['sub'] else 'стёрта'}")
         elif args.cmd == "remove":
             gone = next((p for p in _read_file() if p["name"] == args.name), None)
             if not remove(args.name):

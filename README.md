@@ -117,6 +117,10 @@ bash <(curl -fsSL --connect-timeout 15 https://raw.githubusercontent.com/Rklm-it
 python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ростелеком-дом --xray ./xray
 ```
 
+Роутер с OpenWrt — одной командой, которую выдаёт приложение (Ноды → «Проверка
+из дома» → «Подключить роутер»): `probe/openwrt/install.sh`, подробности и
+оговорка про podkop — DEPLOY.md, шаг 7.
+
 В `--name` лучше писать провайдера: в отчёте будет видно, у кого что режут.
 Проверить пробник без хаба: `python3 probe.py --once <IP ноды>`.
 
@@ -133,6 +137,7 @@ python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ро�
 | `node_run` | готовые рецепты: overview, logs, listening, firewall, xray_test, env (без секретов), capture (видит ли нода пакеты клиента), brain_path |
 | `node_logs` | журнал vpn-cell / xray / hysteria-server |
 | `probes_list`, `probe_check` | точки обзора и одиночная проба (tcp / banner / tls / http) |
+| `subscription_check` | вся подписка с точки обзора (роутер дома): что открывается, что режут (filtered), что лежит; `e2e=True` — ещё и сквозная; то же — экран «Проверка из дома» в Nexus Admin |
 | `panel_reachability`, `check_from_russia` | вердикт самой панели и проверка с check-host |
 | `fix_playbook` | что делать при симптоме: наш журнал и опыт владельцев VPN-сервисов, со ссылками и степенью доверия |
 | `panels_list` | панели хаба (без токенов); при нескольких у инструментов панели параметр `panel`, ноды называются `панель/имя` |

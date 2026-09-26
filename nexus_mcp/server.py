@@ -27,6 +27,7 @@ from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbo
 from nexus_mcp import node_edit as edits
 from nexus_mcp import links as sublinks
 from nexus_mcp import relay
+from nexus_mcp import sweep as sub_sweep
 from nexus_mcp import panel as panel_api
 from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, ProbeError, registry
@@ -53,6 +54,8 @@ panel=<имя>, а ноды называются «панель/имя».
    Для домашних нод добавляй probes=[имена домашних пробников] (probes_list):
    дата-центр хаба видит РФ не так, как домашние провайдеры.
 3. Уточнять: node_logs, node_run(recipe=...), probe_check.
+   «Что из подписки открывается из дома» целиком — subscription_check(probe=<домашний>):
+   каждая строка подписки с пробника (роутер владельца), e2e=True — ещё и сквозная.
 4. Действия (node_action) — только после согласия человека, с confirm=true.
    Смена порта/транспорта/IP уезжает в подписки всех юзеров ноды — это предлагать,
    а не делать.
@@ -263,6 +266,37 @@ async def probe_check(probe: str, target: str, kind: str = "tls", port: int = 44
     except ProbeError as e:
         return _err(e)
     return {"probe": probe, "kind": kind, "target": host, **res}
+
+
+@mcp.tool()
+async def subscription_check(probe: str = HUB, e2e: bool = False, panel: str = "",
+                             start: bool = True) -> dict:
+    """Какие строки подписки открываются с точки обзора — все ноды разом.
+
+    probe — пробник из probes_list (домашний роутер — правда о домашнем
+    интернете; hub — дата-центр). e2e=True — ещё и сквозная проверка через xray
+    (минуты; нужен xray у пробника). panel — чья подписка, если панелей несколько.
+    Прогон идёт фоном: ответ — итог или running с прогрессом; повторный вызов
+    с start=False читает состояние, не запуская новый. Статусы строк: ok,
+    reachable (адрес доступен, сквозной не было), filtered (TCP есть, данные
+    режутся), down, refused, dns, broken (адрес доступен, протокол не работает),
+    unchecked (UDP без сквозной).
+    """
+    try:
+        st = sub_sweep.sweeps.start(probe, panel, e2e) if start else sub_sweep.sweeps.state(probe)
+    except (sub_sweep.SweepError, ProbeError) as e:
+        return _err(e)
+    cur = sub_sweep.sweeps.running.get(probe)
+    if start and cur and not cur["task"].done():
+        try:
+            await asyncio.wait_for(asyncio.shield(cur["task"]), JOB_WAIT)
+        except asyncio.TimeoutError:
+            pass
+        st = sub_sweep.sweeps.state(probe)
+    audit.record("subscription_check", {"probe": probe, "e2e": e2e, "panel": panel, "start": start}, True)
+    if st.get("running"):
+        st["next"] = f"subscription_check(probe='{probe}', start=False) — через минуту"
+    return st
 
 
 @mcp.tool()
@@ -866,6 +900,33 @@ async def probe_result(request: Request) -> JSONResponse:
     return JSONResponse({"accepted": accepted})
 
 
+# ── HTTP для чата/приложения: прогон подписки ───────────────────────────────
+# Под секретом MCP (не токеном пробника): nexus-chat зовёт их с 127.0.0.1.
+
+@mcp.custom_route("/hub/probes", methods=["GET"])
+async def hub_probes(request: Request) -> JSONResponse:
+    return JSONResponse({"ok": True, "probes": registry.list()})
+
+
+@mcp.custom_route("/hub/sweep", methods=["GET", "POST"])
+async def hub_sweep(request: Request) -> JSONResponse:
+    if request.method == "GET":
+        probe = (request.query_params.get("probe") or HUB).strip()[:64]
+        return JSONResponse(sub_sweep.sweeps.state(probe))
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    probe = str(body.get("probe") or HUB).strip()[:64]
+    try:
+        st = sub_sweep.sweeps.start(probe, str(body.get("panel") or ""), bool(body.get("e2e")))
+    except (sub_sweep.SweepError, ProbeError) as e:
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=409)
+    audit.record("subscription_check", {"probe": probe, "e2e": bool(body.get("e2e")), "via": "app"}, True)
+    return JSONResponse(st, status_code=202)
+
+
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "service": "nexus-mcp"})
@@ -878,7 +939,7 @@ def _eq(a: str, b: str) -> bool:
 
 
 class AuthMiddleware:
-    """/mcp/<секрет> или Bearer <секрет> — MCP; Bearer <токен пробника> — /probe/*.
+    """/mcp/<секрет> или Bearer <секрет> — MCP и /hub/*; Bearer <токен пробника> — /probe/*.
 
     Всё остальное, кроме /healthz, — 404: хаб не должен выдавать, что он такое.
     """
@@ -907,6 +968,12 @@ class AuthMiddleware:
             if any(_eq(tok, t) for t in self.probe_tokens) or _eq(tok, self.secret):
                 return await self.app(scope, receive, send)
             return await _deny(send, 401, "неверный токен пробника")
+        if path.startswith("/hub/"):
+            # Токен пробника сюда не пускает: он лежит на роутере, а прогон
+            # показывает всю подписку.
+            if _eq(self._bearer(scope), self.secret):
+                return await self.app(scope, receive, send)
+            return await _deny(send, 401, "нужен секрет")
         if path == "/mcp" or path == "/mcp/":
             if _eq(self._bearer(scope), self.secret):
                 return await self.app(scope, receive, send)

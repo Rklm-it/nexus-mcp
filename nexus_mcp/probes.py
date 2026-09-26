@@ -107,6 +107,9 @@ class Registry:
                 "remote_addr": p.remote_addr,
                 "xray": bool((p.info or {}).get("xray")),
                 "platform": (p.info or {}).get("platform"),
+                "version": (p.info or {}).get("version"),
+                "router_vpn": (p.info or {}).get("router_vpn") or "",
+                "mem_available_mb": (p.info or {}).get("mem_available_mb"),
                 "queued": p.queue.qsize(),
             })
         return out

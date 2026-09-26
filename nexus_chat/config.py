@@ -28,6 +28,12 @@ class ChatSettings:
     # машине, мимо Caddy.
     mcp_url: str = field(default_factory=lambda: "http://127.0.0.1:%s/mcp" % _env("NEXUS_MCP_PORT", "8765"))
     mcp_secret: str = field(default_factory=lambda: _env("NEXUS_MCP_SECRET"))
+    # Токен домашних пробников: приложение показывает команду установки на
+    # роутер (пробник открывает только /probe/*, не чат и не MCP).
+    probe_token: str = field(default_factory=lambda: (_list("NEXUS_PROBE_TOKENS") or [""])[0])
+    # Откуда роутер качает установщик и probe.py (репозиторий хаба публичный).
+    probe_src: str = field(default_factory=lambda: _env(
+        "NEXUS_PROBE_SRC", "https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main").rstrip("/"))
 
     state_dir: Path = field(
         default_factory=lambda: Path(_env("NEXUS_STATE_DIR", "/var/lib/nexus-mcp")) / "chat")
@@ -45,6 +51,11 @@ class ChatSettings:
         default_factory=lambda: int(_env("NEXUS_CHAT_APPROVAL_MIN", "30")) * 60)
     # Одновременных ответов на весь хаб: подписка одна, лимиты общие.
     max_parallel: int = field(default_factory=lambda: int(_env("NEXUS_CHAT_PARALLEL", "2")))
+
+    @property
+    def hub_url(self) -> str:
+        """Сам хаб (nexus-mcp) мимо Caddy: его HTTP-ручки /hub/*."""
+        return self.mcp_url.rsplit("/mcp", 1)[0]
 
     @property
     def db_path(self) -> Path:

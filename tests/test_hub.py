@@ -369,7 +369,7 @@ def test_probe_file_is_stdlib_only():
     text = (Path(__file__).resolve().parents[1] / "probe" / "probe.py").read_text(encoding="utf-8")
     imports = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z_]+)", text, re.M))
     stdlib = {"argparse", "json", "os", "platform", "shutil", "socket", "ssl", "subprocess", "sys",
-              "tempfile", "time", "urllib", "__future__"}
+              "tempfile", "time", "urllib", "__future__", "concurrent", "threading", "zipfile"}
     assert imports <= stdlib, imports - stdlib
 
 

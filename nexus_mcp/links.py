@@ -35,8 +35,8 @@ def decode_subscription(body: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if "://" in ln]
 
 
-async def fetch_links() -> list[str]:
-    url = config.settings.test_sub_url
+async def fetch_links(url: str = "") -> list[str]:
+    url = url or config.settings.test_sub_url
     if not url:
         raise LinksError("нет подписки для проверки: задайте NEXUS_TEST_SUB_URL "
                          "(подписка тестового юзера, привязанного ко всем нодам)")
