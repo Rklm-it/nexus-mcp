@@ -644,3 +644,113 @@ def test_usage_periods_follow_timezone(tmp_path):
     assert sm["periods"]["all"]["input"] == 1110 and sm["periods"]["all"]["audit_answers"] == 1
     text = "\n".join(usage.lines(sm))
     assert "Сегодня" in text and "Этот месяц" in text and "Лимит подписки" in text
+
+
+# ── Панели для приложения: список и вход телефона через хаб ─────────────────
+
+def _fake_panel(monkeypatch, handler):
+    """Панель — MockTransport: проверяем, ЧТО хаб отправил панели и что вернул
+    телефону, а не сам факт вызова (инвариант 28)."""
+    from nexus_chat import devices
+
+    real = httpx.AsyncClient
+
+    def factory(*a, **kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(devices, "_client", factory)
+
+
+def _panels_file(hub_settings, tmp_path, panels):
+    import json as _json
+
+    hub_settings.panels_file = tmp_path / "panels.json"
+    hub_settings.panels_file.write_text(_json.dumps({"panels": panels}))
+
+
+def test_panels_listing_has_no_secrets(chat_settings, hub_settings, tmp_path):
+    _panels_file(hub_settings, tmp_path, [
+        {"name": "main", "url": "https://a.example/", "token": "SECRET-T1", "gate": "SECRET-G"},
+        {"name": "vip", "url": "https://a.example/vip", "token": "SECRET-T2", "gate": "SECRET-G"},
+        {"name": "old", "url": "https://c.example", "token": "SECRET-T3", "basic_auth": "u:SECRET-P"}])
+
+    async def script(opts, prompt):
+        yield ResultMessage()
+
+    async def go():
+        _, client, _ = _setup(chat_settings, script)
+        assert (await client.get("/chat/api/panels")).status_code == 401
+        r = await client.get("/chat/api/panels", headers=AUTH)
+        assert r.status_code == 200
+        assert "SECRET" not in r.text
+        assert r.json()["panels"] == [
+            {"name": "main", "url": "https://a.example", "password_only": False},
+            {"name": "vip", "url": "https://a.example/vip", "password_only": False},
+            {"name": "old", "url": "https://c.example", "password_only": True}]
+
+    asyncio.run(go())
+
+
+def test_enroll_through_hub_keeps_token_on_hub(chat_settings, hub_settings, tmp_path, monkeypatch):
+    """Хаб регистрирует ключ телефона своим токеном; телефону — id устройства
+    и gate, но не токен панели и не сессия, выданная хабу."""
+    import json as _json
+
+    _panels_file(hub_settings, tmp_path, [
+        {"name": "vip", "url": "https://a.example/vip", "token": "PANEL-TOKEN", "gate": "G1"}])
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(200, json={"ok": True, "device": {"id": "dev-42", "label": "x"}, "gate": True},
+                              headers={"set-cookie": "nexus_admin_session=HUB-SESSION; Path=/"})
+
+    _fake_panel(monkeypatch, handler)
+
+    async def script(opts, prompt):
+        yield ResultMessage()
+
+    async def go():
+        _, client, _ = _setup(chat_settings, script)
+        r = await client.post("/chat/api/panels/vip/enroll",
+                              json={"public_key": "K" * 90, "label": "Nexus Admin · Pixel"}, headers=AUTH)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["device"]["id"] == "dev-42" and body["gate"] == "G1"
+        assert body["panel"] == {"name": "vip", "url": "https://a.example/vip"}
+        assert "PANEL-TOKEN" not in r.text and "HUB-SESSION" not in r.text
+        req = seen[0]
+        assert str(req.url) == "https://a.example/vip/api/v1/admin/devices/enroll"
+        assert req.headers["x-admin-token"] == "PANEL-TOKEN"
+        assert "nexus_gate=G1" in req.headers["cookie"]
+        sent = _json.loads(req.content)
+        assert sent["public_key"] == "K" * 90
+        assert sent["label"].endswith("через хаб") and len(sent["label"]) <= 120
+
+        # Чужое имя и пустой ключ — отказ с причиной, до панели не доходит.
+        r = await client.post("/chat/api/panels/nope/enroll", json={"public_key": "K" * 90}, headers=AUTH)
+        assert r.status_code == 404 and "nope" in r.json()["detail"]
+        r = await client.post("/chat/api/panels/vip/enroll", json={}, headers=AUTH)
+        assert r.status_code == 422
+        assert len(seen) == 1
+
+    asyncio.run(go())
+
+
+def test_enroll_refusal_reason_reaches_app(chat_settings, hub_settings, tmp_path, monkeypatch):
+    """403 панели — это «токен хаба устарел», а не 403/401 чата: иначе
+    приложение решит, что неверен токен чата."""
+    _panels_file(hub_settings, tmp_path, [{"name": "main", "url": "https://a.example", "token": "old"}])
+    _fake_panel(monkeypatch, lambda req: httpx.Response(403, json={"detail": "Invalid or missing X-Admin-Token"}))
+
+    async def script(opts, prompt):
+        yield ResultMessage()
+
+    async def go():
+        _, client, _ = _setup(chat_settings, script)
+        r = await client.post("/chat/api/panels/main/enroll", json={"public_key": "K" * 90}, headers=AUTH)
+        assert r.status_code == 502
+        assert "не приняла токен хаба" in r.json()["detail"]
+
+    asyncio.run(go())

@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from nexus_chat import config, usage
+from nexus_chat import config, devices, usage
 from nexus_chat.runner import Runner, panel_names
 from nexus_chat.store import Store, StoreError
 
@@ -188,6 +188,15 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
     async def audit(request: Request):
         return JSONResponse({"ok": True, "chat": await runner.run_audit("по кнопке")}, status_code=202)
 
+    async def panels(request: Request):
+        return JSONResponse({"ok": True, "panels": devices.listing()})
+
+    async def panel_enroll(request: Request):
+        body = await _body(request)
+        return JSONResponse(await devices.enroll(request.path_params["name"],
+                                                 str(body.get("public_key") or ""),
+                                                 str(body.get("label") or "")))
+
     async def healthz(request: Request):
         return JSONResponse({"ok": True, "service": "nexus-chat", "logged_in": s.logged_in})
 
@@ -210,6 +219,8 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         Route("/chat/api/inbox", guarded(inbox), methods=["GET"]),
         Route("/chat/api/usage", guarded(usage_full), methods=["GET"]),
         Route("/chat/api/audit", guarded(audit), methods=["POST"]),
+        Route("/chat/api/panels", guarded(panels), methods=["GET"]),
+        Route("/chat/api/panels/{name}/enroll", guarded(panel_enroll), methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.runner = runner
