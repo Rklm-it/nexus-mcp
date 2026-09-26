@@ -156,8 +156,8 @@ async def _wait_done(client, cid, timeout=5.0) -> list[dict]:
     raise AssertionError(f"ответ не закончился: {[e['type'] for e in events]}")
 
 
-async def _wait_type(client, cid, etype, timeout=5.0) -> dict:
-    after, v = 0, -1
+async def _wait_type(client, cid, etype, timeout=5.0, after=0) -> dict:
+    v = -1
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         body = (await client.get(f"/chat/api/chats/{cid}/events",
@@ -752,5 +752,34 @@ def test_enroll_refusal_reason_reaches_app(chat_settings, hub_settings, tmp_path
         r = await client.post("/chat/api/panels/main/enroll", json={"public_key": "K" * 90}, headers=AUTH)
         assert r.status_code == 502
         assert "не приняла токен хаба" in r.json()["detail"]
+
+    asyncio.run(go())
+
+
+def test_panel_write_needs_button_only_to_apply(chat_settings):
+    """panel_call/panel_maintenance: предпросмотр идёт сразу, выполнение — по
+    кнопке, и на кнопке видно, что именно и где."""
+    async def go():
+        runner, client, _ = _setup(chat_settings, None)
+        cid = runner.store.create_chat()["id"]
+        inp = {"method": "patch", "path": "/api/v1/admin/plans/7", "body": {"price": 199}, "panel": "main"}
+        ok, val = await runner._decide(cid, "mcp__nexus__panel_call", inp)
+        assert ok and val == inp and runner.store.pending_approvals() == []
+
+        task = asyncio.create_task(runner._decide(cid, "mcp__nexus__panel_call", {**inp, "confirm": True}))
+        ev = await _wait_type(client, cid, "approval")
+        assert ev["data"]["title"] == 'Панель main: PATCH /api/v1/admin/plans/7 {"price": 199}'
+        await client.post(f"/chat/api/approvals/{ev['data']['approval_id']}", json={"allow": True}, headers=AUTH)
+        ok, val = await task
+        assert ok and val["confirm"] is True
+
+        task = asyncio.create_task(runner._decide(cid, "mcp__nexus__panel_maintenance",
+                                                  {"op": "redis_delete", "args": {"key": "resync_lock"},
+                                                   "confirm": True}))
+        ev = await _wait_type(client, cid, "approval", after=ev["seq"])
+        assert ev["data"]["title"] == "Панель единственная: удалить ключ Redis · key=resync_lock"
+        await client.post(f"/chat/api/approvals/{ev['data']['approval_id']}", json={"allow": False}, headers=AUTH)
+        ok, _ = await task
+        assert not ok
 
     asyncio.run(go())
