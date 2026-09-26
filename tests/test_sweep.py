@@ -197,7 +197,7 @@ def test_sweep_e2e_without_xray_says_so(monkeypatch, hub_settings):
     calls = _fake_world(monkeypatch, hub_settings, ANSWERS, xray=False)
     res = asyncio.run(sweep.sweep("home", e2e=True))
     assert res["e2e"] is False
-    assert any("нет xray" in n for n in res["notes"])
+    assert any("нет ни xray, ни sing-box" in n for n in res["notes"])
     assert all(c[1] != "e2e" for c in calls)
 
 

@@ -23,12 +23,13 @@ UDP-строки (hysteria2) первой ступенью не проверяю
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import time
 import uuid
 from urllib.parse import urlparse
 
-from nexus_mcp import config, inventory, links, panels
+from nexus_mcp import config, inventory, links, panels, singbox
 from nexus_mcp.probes import HUB, ProbeError, registry
 
 # Статус строки. Порядок — от хорошего к плохому; приложение держит копию
@@ -60,6 +61,27 @@ REASONS = {
     "down": "до адреса не открывается ни одно соединение: нода лежит или IP закрыт целиком",
     "dns": "имя не резолвится с этой сети",
 }
+
+
+# Строка за Cloudflare: проба первой ступени доходит до CF, а не до ноды.
+CDN_REASONS = {
+    "reachable": "Cloudflare доступен с этой сети; дойдёт ли до ноды — покажет сквозная проверка",
+    "ok": "открывается (через Cloudflare)",
+}
+# https://www.cloudflare.com/ips-v4
+CLOUDFLARE_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
+    "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
+    "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+))
+
+
+def is_cloudflare(ip: str) -> bool:
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in n for n in CLOUDFLARE_NETS if n.version == a.version)
 
 
 class SweepError(Exception):
@@ -188,13 +210,31 @@ async def _run_batch(probe: str, jobs: list[dict]) -> list[dict]:
     return list(await asyncio.gather(*[one(j) for j in jobs]))
 
 
-async def _node_index() -> dict[str, dict]:
-    """IP → нода панели: строку подписки подписываем именем ноды."""
+async def _load_nodes() -> list[dict]:
     try:
         nodes, _errors = await inventory.load_nodes()
     except Exception:  # noqa: BLE001 — без панели группируем по адресу
-        return {}
-    return {str(n["ip"]): n for n in nodes if n.get("ip")}
+        return []
+    return nodes
+
+
+def node_by_name(host: str, panel: str, nodes: list[dict]) -> dict | None:
+    """Строка за CDN: адрес — edge Cloudflare, по IP ноду не найти. Имя в
+    домене — имя ноды (eng41s2.pablo.stream → JonyX/eng41s2): сперва в панели
+    строки, потом в любой. Двусмысленность — не угадываем."""
+    label = (host or "").split(".", 1)[0].lower()
+    if not label or label.replace(".", "").isdigit():
+        return None
+
+    def short(n: dict) -> str:
+        return str(n.get("name") or "").rsplit("/", 1)[-1].lower()
+
+    hits = [n for n in nodes if label in (short(n), short(n).split("-", 1)[0])]
+    same = [n for n in hits if str(n.get("name") or "").startswith(f"{panel}/")] if panel else []
+    for group in (same, hits):
+        if len(group) == 1:
+            return group[0]
+    return None
 
 
 def _resolve_all(hosts: list[str]) -> dict[str, list[str]]:
@@ -236,12 +276,18 @@ async def sweep(probe: str = HUB, panel: str = "", e2e: bool = False,
 
     # Имя ноды по IP (домен строки резолвим тут же, на хабе: для группировки,
     # не для проверки — проба идёт по имени с точки обзора).
-    index = await _node_index()
+    all_nodes = await _load_nodes()
+    index = {str(n["ip"]): n for n in all_nodes if n.get("ip")}
     resolved = await asyncio.to_thread(_resolve_all, sorted({r["host"] for r in rows if r["host"]}))
     for r in rows:
         node = index.get(r["host"])
         if node is None:
             node = next((index[ip] for ip in resolved.get(r["host"], []) if ip in index), None)
+        ips = resolved.get(r["host"], [])
+        if ips and all(is_cloudflare(ip) for ip in ips):
+            r["cdn"] = "Cloudflare"
+        if node is None and r.get("cdn"):
+            node = node_by_name(r["host"], r["panel"], all_nodes)
         r["node"] = node["name"] if node else ""
 
     # 1. Доступность — одной пачкой.
@@ -255,6 +301,9 @@ async def sweep(probe: str = HUB, panel: str = "", e2e: bool = False,
         rows[i]["ms"] = res.get("ms")
         if res.get("peer"):
             rows[i]["peer"] = res["peer"]
+            # CF видит пробник, а не хаб: у провайдера мог быть свой DNS
+            if is_cloudflare(res["peer"]):
+                rows[i]["cdn"] = "Cloudflare"
     for r in rows:
         r.setdefault("status", "unchecked")
     progress.update(done=len(rows))
@@ -271,21 +320,29 @@ async def sweep(probe: str = HUB, panel: str = "", e2e: bool = False,
                 e2e_note = f"сквозная проверка — первые {MAX_E2E} строк из {len(cand)}"
                 cand = cand[:MAX_E2E]
             progress.update(stage="e2e", done=0, total=len(cand))
+            not_run: list[str] = []
             for r in cand:
-                res = await registry.run(probe, "e2e", {"config": links.config_for(r["uri"])},
+                cfg = links.config_for(r["uri"])
+                res = await registry.run(probe, "e2e", {"config": cfg, "singbox": singbox.config(cfg)},
                                          timeout=E2E_JOB_TIMEOUT)
                 r["e2e"] = _short(res)
                 if res.get("ok"):
                     r["status"] = "ok"
                     r["ms"] = res.get("ms")
                 elif res.get("error") in ("probe_timeout", "no_xray", "low_memory", "xray_failed"):
-                    pass  # проверка не состоялась — статус первой ступени остаётся
+                    # проверка не состоялась — статус первой ступени остаётся
+                    not_run.append(f"{r['remark']}: {res.get('detail') or res.get('error')}")
                 else:
                     r["status"] = "broken"
                 progress["done"] = progress.get("done", 0) + 1
+            if not_run:
+                e2e_note = (f"сквозная не состоялась для {len(not_run)} из {len(cand)} строк — "
+                            + "; ".join(not_run[:3]) + (" …" if len(not_run) > 3 else ""))
 
     for r in rows:
         r["reason"] = REASONS.get(r["status"], "")
+        if r.get("cdn"):
+            r["reason"] = CDN_REASONS.get(r["status"], r["reason"] + " (адрес — Cloudflare)")
         r.pop("uri", None)  # в ссылке UUID юзера: на экран и в лог не нужно
 
     groups: dict[str, dict] = {}
@@ -333,15 +390,15 @@ def _e2e_unavailable(probe: str) -> str:
             return ""
         return "у хаба нет xray (NEXUS_XRAY) — проверена только доступность"
     info = next((p for p in registry.list() if p["name"] == probe), None)
-    if info and not info.get("xray"):
-        return (f"у пробника {probe} нет xray — проверена только доступность "
+    if info and not info.get("xray") and not info.get("singbox"):
+        return (f"у пробника {probe} нет ни xray, ни sing-box — проверена только доступность "
                 "(на роутере: установщик с --xray tmp)")
     return ""
 
 
 def _short(r: dict) -> dict:
     """Результат пробы без лишнего: лог xray — только хвост."""
-    keep = ("ok", "ms", "error", "stage", "detail", "status", "connect_ms", "xray_log")
+    keep = ("ok", "ms", "error", "stage", "detail", "status", "connect_ms", "xray_log", "engine")
     out = {k: r[k] for k in keep if k in r}
     if "xray_log" in out:
         out["xray_log"] = str(out["xray_log"])[-300:]

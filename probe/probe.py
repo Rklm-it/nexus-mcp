@@ -25,8 +25,10 @@
               нет» — ровно та фильтрация, что режет пакеты с нагрузкой
     tls     — полное TLS-рукопожатие: данные в обе стороны
     http    — GET по URL мимо любых прокси
-    e2e     — поднять xray-клиент с конфигом от хаба и открыть сайт через
-              него: работает ли протокол на самом деле
+    e2e     — поднять клиент (xray или sing-box) с конфигом от хаба и открыть
+              сайт через него: работает ли протокол на самом деле. На роутере
+              с podkop sing-box уже стоит — ничего не качаем
+    update  — хаб прислал свою версию probe.py: заменить себя и перезапуститься
     batch   — пачка лёгких проб (tcp/banner/tls/http) параллельно, одним
               заданием: прогон всей подписки не упирается в очередь
 
@@ -54,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 
-PROBE_VERSION = "1.1.0"
+PROBE_VERSION = "1.2.0"
 
 # Лёгкие пробы, которые можно гнать пачкой. e2e сюда не входит: каждая —
 # отдельный процесс xray, на роутере это десятки мегабайт.
@@ -275,14 +277,14 @@ def _socks5_connect(port: int, host: str, dport: int, timeout: float) -> socket.
     s.sendall(b"\x05\x01\x00")
     if s.recv(2) != b"\x05\x00":
         s.close()
-        raise OSError("SOCKS5: xray не принял приветствие")
+        raise OSError("SOCKS5: клиент (xray/sing-box) не принял приветствие")
     hb = host.encode("idna")
     s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + int(dport).to_bytes(2, "big"))
     head = s.recv(4)
     if len(head) < 4 or head[1] != 0:
         code = head[1] if len(head) > 1 else -1
         s.close()
-        raise OSError(f"SOCKS5: xray не смог соединиться с {host}:{dport} (код {code})")
+        raise OSError(f"SOCKS5: клиент не смог соединиться с {host}:{dport} через ноду (код {code})")
     atyp = head[3]
     if atyp == 1:
         s.recv(4 + 2)
@@ -340,6 +342,20 @@ def find_xray(explicit: str | None = None) -> str | None:
     # /tmp/nexus-xray — роутер: флеша мало, xray качается в память при старте.
     for cand in ("/usr/local/bin/xray", "/usr/bin/xray", "/opt/xray/xray",
                  "/tmp/nexus-xray/xray", "/usr/share/nexus-probe/xray"):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def find_singbox() -> str | None:
+    """sing-box: на роутере с podkop он уже на флеше — сквозная без скачивания."""
+    cand = os.environ.get("NEXUS_SINGBOX")
+    if cand and os.path.isfile(cand):
+        return cand
+    found = shutil.which("sing-box")
+    if found:
+        return found
+    for cand in ("/usr/bin/sing-box", "/usr/local/bin/sing-box"):
         if os.path.isfile(cand):
             return cand
     return None
@@ -408,35 +424,48 @@ def drop_idle_xray() -> None:
 
 
 def probe_e2e(config: dict, url: str = E2E_DEFAULT_URL, timeout: float = 15.0,
-              xray_bin: str | None = None) -> dict:
-    """Поднять xray-клиент с готовым конфигом и открыть `url` через него.
+              xray_bin: str | None = None, singbox: dict | None = None) -> dict:
+    """Поднять клиент с готовым конфигом и открыть `url` через него.
 
     `config` — полный клиентский xray-конфиг (хаб собирает его из ссылки
-    подписки). Входы в нём заменяем одним SOCKS на свободном порту: чужие
-    фиксированные порты 10808/10809 могут быть заняты домашним клиентом.
+    подписки), `singbox` — тот же профиль для sing-box (None — в sing-box не
+    перекладывается). Ядро: xray, если он уже есть; иначе sing-box, если есть
+    он (роутер с podkop); иначе xray по требованию. Входы заменяем одним SOCKS
+    на свободном порту: чужие 10808/10809 может занимать домашний клиент.
     """
     global _xray_last_used
-    xray = find_xray(xray_bin)
-    if not xray and _XRAY_URL:
-        xray, why = fetch_xray(_XRAY_URL)
-        if not xray:
+    engine, binary = "xray", find_xray(xray_bin)
+    if not binary and singbox:
+        sb = find_singbox()
+        if sb:
+            engine, binary = "sing-box", sb
+    if not binary and _XRAY_URL:
+        binary, why = fetch_xray(_XRAY_URL)
+        if not binary:
             return {"ok": False, "error": "no_xray", "detail": why}
-    if not xray:
+    if not binary:
         return {"ok": False, "error": "no_xray",
-                "detail": "xray не найден: укажите --xray или положите его в PATH"}
-    _xray_last_used = time.time()
+                "detail": "нет ни xray, ни sing-box: укажите --xray или положите xray в PATH"}
+    if engine == "xray":
+        _xray_last_used = time.time()
     with _E2E_LOCK:
         # Память смотрим уже под замком: пока ждали очереди, её могли занять.
         avail = mem_available_mb()
         need = min_mem_mb()
         if avail is not None and avail < need:
             return {"ok": False, "error": "low_memory",
-                    "detail": f"свободно {avail} МБ, xray запускается от {need} МБ "
+                    "detail": f"свободно {avail} МБ, {engine} запускается от {need} МБ "
                               "(NEXUS_PROBE_MIN_MEM_MB): на роутере это защита от OOM"}
         try:
-            return _probe_e2e(xray, config, url, timeout)
+            if engine == "sing-box":
+                res = _probe_e2e_singbox(binary, singbox or {}, url, timeout)
+            else:
+                res = _probe_e2e(binary, config, url, timeout)
+            res["engine"] = engine
+            return res
         finally:
-            _xray_last_used = time.time()
+            if engine == "xray":
+                _xray_last_used = time.time()
 
 
 # Одна сквозная проверка за раз: два xray на роутере с 256 МБ — уже риск.
@@ -470,22 +499,35 @@ def _probe_e2e(xray: str, config: dict, url: str, timeout: float) -> dict:
         "settings": {"auth": "noauth", "udp": False},
     }]
     cfg["log"] = {"loglevel": "warning"}
+    return _run_client([xray, "run", "-c"], "xray", cfg, port, url, timeout)
+
+
+def _probe_e2e_singbox(singbox: str, config: dict, url: str, timeout: float) -> dict:
+    port = _free_port()
+    cfg = json.loads(json.dumps(config))
+    cfg["inbounds"] = [{"type": "socks", "tag": "socks", "listen": "127.0.0.1", "listen_port": port}]
+    cfg.setdefault("log", {"level": "warn"})
+    return _run_client([singbox, "run", "-c"], "sing-box", cfg, port, url, timeout)
+
+
+def _run_client(cmd: list, engine: str, cfg: dict, port: int, url: str, timeout: float) -> dict:
+    """Запустить клиент с конфигом и открыть `url` через его SOCKS."""
     tmpdir = tempfile.mkdtemp(prefix="nexus-probe-")
     path = os.path.join(tmpdir, "config.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
     proc = subprocess.Popen(
-        [xray, "run", "-c", path],
+        [*cmd, path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     try:
-        # Ждём, пока xray откроет порт (или умрёт на разборе конфига).
+        # Ждём, пока клиент откроет порт (или умрёт на разборе конфига).
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 out = (proc.stdout.read() or b"").decode("utf-8", "replace") if proc.stdout else ""
                 return {"ok": False, "error": "xray_failed",
-                        "detail": "xray не запустился с этим конфигом", "xray_log": out[-800:]}
+                        "detail": f"{engine} не запустился с этим конфигом", "xray_log": out[-800:]}
             try:
                 socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
                 break
@@ -538,7 +580,9 @@ def run_job(kind: str, args: dict, xray_bin: str | None = None) -> dict:
             return probe_http(a["url"], float(a.get("timeout", 10)))
         if kind == "e2e":
             return probe_e2e(a["config"], a.get("url") or E2E_DEFAULT_URL,
-                             float(a.get("timeout", 15)), xray_bin)
+                             float(a.get("timeout", 15)), xray_bin, a.get("singbox"))
+        if kind == "update":
+            return self_update(a["code"], str(a.get("version") or ""))
         if kind == "batch":
             return run_batch(a.get("jobs") or [], int(a.get("parallel") or 8))
         if kind == "info":
@@ -597,6 +641,40 @@ def router_vpn() -> str:
     return ""
 
 
+# ── Обновление от хаба ─────────────────────────────────────────────────────
+# Хаб присылает свою версию probe.py (ту же, что гоняет у себя), и пробник
+# на роутере обновляется сам — без SSH и без GitHub. Выключить:
+# NEXUS_PROBE_NO_UPDATE=1.
+
+def self_update(code: str, version: str) -> dict:
+    """Заменить свой файл кодом от хаба. Перезапуск — после отправки ответа
+    (serve смотрит на restart)."""
+    import ast
+
+    if os.environ.get("NEXUS_PROBE_NO_UPDATE"):
+        return {"ok": False, "error": "disabled", "detail": "обновление выключено (NEXUS_PROBE_NO_UPDATE)"}
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        return {"ok": False, "error": "bad_args", "detail": f"присланный probe.py не разбирается: {e}"}
+    if f'PROBE_VERSION = "{version}"' not in code:
+        return {"ok": False, "error": "bad_args", "detail": f"в присланном коде нет версии {version}"}
+    me = os.path.abspath(__file__)
+    try:
+        with open(me + ".part", "w", encoding="utf-8") as f:
+            f.write(code)
+        os.replace(me + ".part", me)
+    except OSError as e:
+        return {"ok": False, "error": "error", "detail": f"не записать {me}: {e}"}
+    return {"ok": True, "from": PROBE_VERSION, "to": version, "restart": True}
+
+
+def _restart() -> None:
+    """Перезапустить себя тем же процессом (procd/systemd не нужны)."""
+    print("[nexus-probe] обновился — перезапуск", flush=True)
+    os.execv(sys.executable, [sys.executable, "-u", os.path.abspath(__file__), *sys.argv[1:]])
+
+
 def probe_info(xray_bin: str | None = None) -> dict:
     return {
         "version": PROBE_VERSION,
@@ -605,7 +683,9 @@ def probe_info(xray_bin: str | None = None) -> dict:
         # Скачиваемый по требованию — тоже «есть»: хаб по этому полю решает,
         # предлагать ли сквозную проверку.
         "xray": find_xray(xray_bin) or ("по требованию" if _XRAY_URL else None),
+        "singbox": find_singbox(),
         "batch": True,
+        "self_update": not os.environ.get("NEXUS_PROBE_NO_UPDATE"),
         "mem_available_mb": mem_available_mb(),
         "router_vpn": router_vpn(),
     }
@@ -647,7 +727,7 @@ def serve(hub: str, token: str, name: str, xray_bin: str | None) -> None:
 
     info = probe_info(xray_bin)
     print(f"[nexus-probe] {name} → {hub} (xray: {info['xray'] or 'нет'}, "
-          f"версия {PROBE_VERSION})", flush=True)
+          f"sing-box: {info['singbox'] or 'нет'}, версия {PROBE_VERSION})", flush=True)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     def work(job: dict) -> None:
@@ -661,12 +741,14 @@ def serve(hub: str, token: str, name: str, xray_bin: str | None) -> None:
             try:
                 _call(hub, token, "POST", "/probe/result",
                       {"name": name, "id": job.get("id"), "result": result}, timeout=20)
-                return
+                break
             except Exception as e:  # noqa: BLE001
                 if attempt == 2:
                     print(f"[nexus-probe] результат {job.get('id')} не отправлен: {e}",
                           file=sys.stderr, flush=True)
                 time.sleep(1 + attempt)
+        if result.get("restart"):
+            _restart()
 
     backoff = 2.0
     while True:

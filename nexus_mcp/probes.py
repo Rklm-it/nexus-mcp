@@ -37,6 +37,13 @@ def probe_lib() -> ModuleType:
     return mod
 
 
+def _ver(v: object) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v or "").split("."))
+    except ValueError:
+        return ()
+
+
 @dataclass
 class Probe:
     name: str
@@ -44,6 +51,8 @@ class Probe:
     info: dict = field(default_factory=dict)
     remote_addr: str = ""
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Версия, до которой уже отправляли обновление: не слать его на каждый опрос.
+    update_sent: str = ""
 
 
 class ProbeError(Exception):
@@ -73,6 +82,7 @@ class Registry:
         p.remote_addr = remote_addr
         if info:
             p.info = info
+        self._maybe_update(p)
         jobs: list[dict] = []
         try:
             jobs.append(await asyncio.wait_for(p.queue.get(), timeout=hold))
@@ -82,6 +92,21 @@ class Registry:
             jobs.append(p.queue.get_nowait())
         p.last_seen = time.time()
         return jobs
+
+    def _maybe_update(self, p: Probe) -> None:
+        """Пробник старее хаба и умеет обновляться — шлём ему probe.py хаба.
+        Один раз на версию: откажется (нет прав на запись, выключено) —
+        будет работать старой, а не биться в цикле."""
+        info = p.info or {}
+        if not info.get("self_update"):
+            return
+        lib = probe_lib()
+        mine = lib.PROBE_VERSION
+        if p.update_sent == mine or not _ver(info.get("version")) or _ver(info.get("version")) >= _ver(mine):
+            return
+        p.update_sent = mine
+        code = Path(lib.__file__).read_text(encoding="utf-8")
+        p.queue.put_nowait({"id": f"update-{mine}", "kind": "update", "args": {"code": code, "version": mine}})
 
     def result(self, name: str, job_id: str, result: dict) -> bool:
         p = self.probes.get(name)
@@ -106,6 +131,7 @@ class Registry:
                 "last_seen_s": age,
                 "remote_addr": p.remote_addr,
                 "xray": bool((p.info or {}).get("xray")),
+                "singbox": bool((p.info or {}).get("singbox")),
                 "platform": (p.info or {}).get("platform"),
                 "version": (p.info or {}).get("version"),
                 "router_vpn": (p.info or {}).get("router_vpn") or "",
@@ -117,6 +143,8 @@ class Registry:
     async def run(self, probe: str, kind: str, args: dict, timeout: float = 40.0) -> dict:
         """Выполнить задание на пробнике и дождаться результата."""
         if probe == HUB:
+            if kind == "update":
+                raise ProbeError("хаб не обновляет сам себя этим заданием")
             lib = probe_lib()
             from nexus_mcp import config
 

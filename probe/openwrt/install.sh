@@ -120,7 +120,7 @@ import importlib, sys
 missing = []
 for m in ("json", "socket", "ssl", "subprocess", "tempfile", "threading", "shutil", "platform",
           "argparse", "zipfile", "concurrent.futures", "urllib.request", "urllib.parse",
-          "encodings.idna"):
+          "encodings.idna", "ast"):
     try:
         importlib.import_module(m)
     except Exception as e:
