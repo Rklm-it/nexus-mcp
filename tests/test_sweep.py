@@ -669,7 +669,7 @@ def test_openwrt_installer_counts_real_package_size(tmp_path):
     r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
     assert r.returncode == 0, r.stdout + r.stderr
     # 3000000+500000+2000000+60000+200000+1800000+150000+400000+1900000+100000 = 10110000 Б
-    assert "python3 с модулями: 10 МБ (по спискам opkg)" in r.stdout
+    assert "python3 с модулями: 10 МБ (по спискам opkg); свободно: флеш 9 МБ, ОЗУ 59 МБ\n" in r.stdout
     calls = log.read_text(encoding="utf-8")
     assert "-d nexuspy install python3-light" in calls
 

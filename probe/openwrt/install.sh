@@ -188,7 +188,9 @@ else
     case "$need_kb" in ''|*[!0-9]*) need_kb="$NEED_FLASH_KB"; how="оценка" ;; *) how="по спискам $PM" ;; esac
     free_kb="$(df -k "$ROOT/overlay" 2>/dev/null | awk 'NR==2 {print $4}')"
     mem_kb="$(awk '/^MemAvailable:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null)"
-    say "python3 с модулями: $(( (need_kb + 1023) / 1024 )) МБ ($how); свободно: флеш ${free_kb:+$((free_kb / 1024)) МБ}${free_kb:-?}, ОЗУ ${mem_kb:+$((mem_kb / 1024)) МБ}${mem_kb:-?}"
+    free_txt="?"; [ -n "$free_kb" ] && free_txt="$((free_kb / 1024)) МБ"
+    mem_txt="?"; [ -n "$mem_kb" ] && mem_txt="$((mem_kb / 1024)) МБ"
+    say "python3 с модулями: $(( (need_kb + 1023) / 1024 )) МБ ($how); свободно: флеш $free_txt, ОЗУ $mem_txt"
     short=0
     [ -n "$free_kb" ] && [ "$free_kb" -lt $((need_kb + FLASH_RESERVE_KB)) ] && short=1
     if [ "$PYMODE" = flash ] && [ "$short" = 1 ]; then
@@ -200,7 +202,7 @@ else
         [ "$PM" = opkg ] || die "python3 в ОЗУ ставится только через opkg, а здесь $PM. Освободите на флеше $(( (need_kb + FLASH_RESERVE_KB) / 1024 )) МБ и повторите"
         need_ram=$((need_kb + RAM_RESERVE_KB))
         [ -n "$mem_kb" ] && [ "$mem_kb" -ge "$need_ram" ] \
-            || die "в ОЗУ не хватает места: свободно ${mem_kb:+$((mem_kb / 1024)) МБ}${mem_kb:-?}, а python3 ($(( (need_kb + 1023) / 1024 )) МБ) с запасом на работу роутера — $((need_ram / 1024)) МБ. Освободите на флеше $(( (need_kb + FLASH_RESERVE_KB) / 1024 )) МБ (opkg remove …) и повторите"
+            || die "в ОЗУ не хватает места: свободно $mem_txt, а python3 ($(( (need_kb + 1023) / 1024 )) МБ) с запасом на работу роутера — $((need_ram / 1024)) МБ. Освободите на флеше $(( (need_kb + FLASH_RESERVE_KB) / 1024 )) МБ (opkg remove …) и повторите"
         PY_DEST="$PY_TMP"
         pm_add() { opkg --add-dest "nexuspy:$PY_DEST" -d nexuspy install "$@"; }
         say "python3 будет в ОЗУ ($PY_DEST): флеш не тратится, после перезагрузки роутера служба поставит его заново сама (нужен интернет, ~1 мин)"
