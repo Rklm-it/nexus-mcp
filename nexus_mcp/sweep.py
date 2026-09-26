@@ -68,11 +68,13 @@ CDN_REASONS = {
     "reachable": "Cloudflare доступен с этой сети; дойдёт ли до ноды — покажет сквозная проверка",
     "ok": "открывается (через Cloudflare)",
 }
-# https://www.cloudflare.com/ips-v4
+# https://www.cloudflare.com/ips-v4 и ips-v6 (хаб часто ходит к CF по IPv6)
 CLOUDFLARE_NETS = tuple(ipaddress.ip_network(n) for n in (
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18",
     "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17",
     "162.158.0.0/15", "104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+    "2a06:98c0::/29", "2c0f:f248::/32",
 ))
 
 
@@ -283,11 +285,8 @@ async def sweep(probe: str = HUB, panel: str = "", e2e: bool = False,
         node = index.get(r["host"])
         if node is None:
             node = next((index[ip] for ip in resolved.get(r["host"], []) if ip in index), None)
-        ips = resolved.get(r["host"], [])
-        if ips and all(is_cloudflare(ip) for ip in ips):
+        if any(is_cloudflare(ip) for ip in resolved.get(r["host"], [])):
             r["cdn"] = "Cloudflare"
-        if node is None and r.get("cdn"):
-            node = node_by_name(r["host"], r["panel"], all_nodes)
         r["node"] = node["name"] if node else ""
 
     # 1. Доступность — одной пачкой.
@@ -306,6 +305,10 @@ async def sweep(probe: str = HUB, panel: str = "", e2e: bool = False,
                 rows[i]["cdn"] = "Cloudflare"
     for r in rows:
         r.setdefault("status", "unchecked")
+        # За CDN по IP ноду не найти — по имени в домене (CF мог увидеть только пробник).
+        if not r["node"] and r.get("cdn"):
+            node = node_by_name(r["host"], r["panel"], all_nodes)
+            r["node"] = node["name"] if node else ""
     progress.update(done=len(rows))
 
     # 2. Сквозная — по одной, только если попросили и у пробника есть xray.

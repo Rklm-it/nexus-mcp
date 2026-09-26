@@ -116,6 +116,7 @@ def test_cf_rows_map_to_nodes_by_name():
     assert sweep.node_by_name("nl41s2.pablo.stream", "", nodes) is None  # две — не угадываем
     assert sweep.node_by_name("mia31s2.pablo.stream", "pablo-vps", nodes) is None
     assert sweep.is_cloudflare("104.21.70.134") and sweep.is_cloudflare("172.67.223.206")
+    assert sweep.is_cloudflare("2606:4700:3033::6815:4686")  # хаб видит CF по IPv6
     assert not sweep.is_cloudflare("45.141.118.103") and not sweep.is_cloudflare("x")
 
 
@@ -144,7 +145,8 @@ def test_sweep_cf_row_gets_node_reason_and_singbox(monkeypatch, hub_settings):
     monkeypatch.setattr(links, "fetch_links", fetch)
     monkeypatch.setattr(sweep.inventory, "load_nodes", load_nodes)
     monkeypatch.setattr(registry, "run", run)
-    monkeypatch.setattr(sweep.links, "_resolve", lambda h: {"104.21.70.134"})
+    # хаб резолвит в IPv6 CF и в IPv4 не CF-адрес — всё равно строка за CF
+    monkeypatch.setattr(sweep.links, "_resolve", lambda h: {"2606:4700:3031::ac43:dfce"})
     monkeypatch.setattr(registry, "list", lambda: [
         {"name": HUB, "online": True},
         {"name": "home", "online": True, "xray": None, "singbox": True, "remote_addr": "93.157.23.116"}])
@@ -158,3 +160,27 @@ def test_sweep_cf_row_gets_node_reason_and_singbox(monkeypatch, hub_settings):
     assert e2e and e2e[0]["singbox"]["outbounds"][0]["type"] == "vless"
     # сквозная не состоялась — это видно в заметках, а не молча
     assert any("сквозная не состоялась" in n and "51 МБ" in n for n in res["notes"])
+
+
+def test_xray_e2e_drops_routing_that_needs_geoip(monkeypatch):
+    """Живой случай: xray на хабе без geoip.dat не запускался с geoip:private."""
+    lib = probe_lib()
+    seen = {}
+    monkeypatch.setattr(lib, "_run_client", lambda cmd, eng, cfg, port, url, t: seen.update(cfg=cfg) or {"ok": True})
+    lib._probe_e2e("/bin/xray", links.config_for(f"vless://{U}@1.2.3.4:443?type=tcp&security=none#x"), "http://x/", 1)
+    assert "routing" not in seen["cfg"] and seen["cfg"]["outbounds"][0]["tag"] == "proxy"
+
+
+def test_singbox_has_own_memory_floor_and_waits(monkeypatch):
+    lib = probe_lib()
+    monkeypatch.delenv("NEXUS_PROBE_SINGBOX_MIN_MEM_MB", raising=False)
+    monkeypatch.setenv("NEXUS_PROBE_MIN_MEM_MB", "48")  # так пишет установщик роутера
+    assert lib.min_mem_mb("sing-box") == 32 and lib.min_mem_mb() == 48
+    mem = iter([30, 31, 47])
+    monkeypatch.setattr(lib, "mem_available_mb", lambda: next(mem))
+    monkeypatch.setattr(lib.time, "sleep", lambda s: None)
+    monkeypatch.setattr(lib, "find_xray", lambda explicit=None: None)
+    monkeypatch.setattr(lib, "find_singbox", lambda: "/usr/bin/sing-box")
+    monkeypatch.setattr(lib, "_probe_e2e_singbox", lambda b, c, u, t: {"ok": True})
+    r = lib.probe_e2e({}, "http://x/", 1, None, {"outbounds": []})
+    assert r == {"ok": True, "engine": "sing-box"}  # 47 ≥ 32 после ожидания

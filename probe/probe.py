@@ -56,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 
-PROBE_VERSION = "1.2.0"
+PROBE_VERSION = "1.2.1"
 
 # Лёгкие пробы, которые можно гнать пачкой. e2e сюда не входит: каждая —
 # отдельный процесс xray, на роутере это десятки мегабайт.
@@ -450,12 +450,18 @@ def probe_e2e(config: dict, url: str = E2E_DEFAULT_URL, timeout: float = 15.0,
         _xray_last_used = time.time()
     with _E2E_LOCK:
         # Память смотрим уже под замком: пока ждали очереди, её могли занять.
+        # Прошлый клиент мог ещё не отдать память — ждём немного, а не отказ.
+        need = min_mem_mb(engine)
         avail = mem_available_mb()
-        need = min_mem_mb()
+        deadline = time.monotonic() + E2E_MEM_WAIT_S
+        while avail is not None and avail < need and time.monotonic() < deadline:
+            time.sleep(1)
+            avail = mem_available_mb()
         if avail is not None and avail < need:
             return {"ok": False, "error": "low_memory",
                     "detail": f"свободно {avail} МБ, {engine} запускается от {need} МБ "
-                              "(NEXUS_PROBE_MIN_MEM_MB): на роутере это защита от OOM"}
+                              f"({'NEXUS_PROBE_SINGBOX_MIN_MEM_MB' if engine == 'sing-box' else 'NEXUS_PROBE_MIN_MEM_MB'}): "
+                              "на роутере это защита от OOM"}
         try:
             if engine == "sing-box":
                 res = _probe_e2e_singbox(binary, singbox or {}, url, timeout)
@@ -484,11 +490,19 @@ def mem_available_mb() -> int | None:
     return None
 
 
-def min_mem_mb() -> int:
+# Сколько ждать, пока прошлый клиент отдаст память, прежде чем отказать.
+E2E_MEM_WAIT_S = 8
+
+
+def min_mem_mb(engine: str = "xray") -> int:
+    """Порог свободной памяти для запуска клиента. sing-box (~20 МБ) легче
+    xray, и на роутере с podkop свободно бывает ~50 МБ — порог у него свой."""
+    var, default = (("NEXUS_PROBE_SINGBOX_MIN_MEM_MB", 32) if engine == "sing-box"
+                    else ("NEXUS_PROBE_MIN_MEM_MB", 48))
     try:
-        return int(os.environ.get("NEXUS_PROBE_MIN_MEM_MB") or 48)
+        return int(os.environ.get(var) or default)
     except ValueError:
-        return 48
+        return default
 
 
 def _probe_e2e(xray: str, config: dict, url: str, timeout: float) -> dict:
@@ -499,6 +513,9 @@ def _probe_e2e(xray: str, config: dict, url: str, timeout: float) -> dict:
         "settings": {"auth": "noauth", "udp": False},
     }]
     cfg["log"] = {"loglevel": "warning"}
+    # Маршрутизация клиентского профиля (geoip:private → direct) проверке не
+    # нужна, а без geoip.dat рядом с xray он с ней не запускается вовсе.
+    cfg.pop("routing", None)
     return _run_client([xray, "run", "-c"], "xray", cfg, port, url, timeout)
 
 
