@@ -673,6 +673,69 @@ def test_ssh_argv_with_via_is_valid_for_ssh(hub_settings):
         assert "proxycommand ssh -i" in cfg.stdout
 
 
+# ── Адрес SSH с портом (ноды за пробросом портов) ──────────────────────────
+
+@pytest.mark.parametrize("ssh_host,ssh_port,host,port", [
+    ("45.141.118.103", 22, "45.141.118.103", 22),
+    ("45.141.118.103", 2222, "45.141.118.103", 2222),
+    ("45.141.118.103:19003", 22, "45.141.118.103", 19003),
+    ("45.141.118.103:19003", 2222, "45.141.118.103", 19003),     # явный порт сильнее ssh_port
+    ("node.example.com:2200", 22, "node.example.com", 2200),
+    ("[2001:db8::7]:19003", 22, "2001:db8::7", 19003),
+    ("[2001:db8::7]", 2222, "2001:db8::7", 2222),
+    ("2001:db8::7", 2222, "2001:db8::7", 2222),                   # голый IPv6 — адрес целиком
+    ("::1", 22, "::1", 22),
+])
+def test_ssh_argv_splits_port_from_host(hub_settings, ssh_host, ssh_port, host, port):
+    """«45.141.118.103:19003» из панели: ssh не резолвил строку целиком, а
+    порт терялся — шёл ssh_port."""
+    import shutil
+
+    node = {"name": "fw", "ssh_host": ssh_host, "ssh_port": ssh_port}
+    argv = ssh.ssh_argv(node)
+    assert argv[argv.index("-p") + 1] == str(port)
+    assert argv[-3] == f"root@{host}"
+    if shutil.which("ssh"):
+        # Настоящий ssh разбирает то же самое: hostname без порта, порт — наш.
+        cfg = subprocess.run(["ssh", "-G", *argv[1:-2]], capture_output=True, text=True)
+        assert cfg.returncode == 0, cfg.stderr
+        conf = dict(ln.split(" ", 1) for ln in cfg.stdout.splitlines() if " " in ln)
+        assert conf["hostname"] == host and conf["port"] == str(port) and conf["user"] == "root"
+
+
+@pytest.mark.parametrize("raw", ["host:abc", "host:0", "host:70000", ":19003", "[2001:db8::7]:x"])
+def test_unparsed_ssh_host_stays_as_is(raw):
+    """Не разобралось — строка целиком: ssh сам скажет, что не так, а не
+    уйдёт молча на другой адрес."""
+    assert ssh.split_host(raw, 22) == (raw, 22)
+
+
+def test_ssh_via_hop_with_port_in_host(hub_settings):
+    """Прыжок через ноду, у которой ssh_host с портом: было «host:19003:22»,
+    parse_via отказывал — и нода за прыжком падала в bad_via."""
+    by_panel = {"main": [{"id": "1", "name": "ger", "ip_address": "111.235.151.78"},
+                         {"id": "2", "name": "eng", "ip_address": "45.43.75.64"}]}
+    nodes = {n["name"]: n for n in inventory.merge(by_panel, {"nodes": [
+        {"name": "eng", "ssh_via": "ger"}, {"name": "ger", "ssh_host": "45.141.118.103:19003"}]})}
+    assert nodes["eng"]["ssh_via"] == "root@45.141.118.103:19003"
+    assert ssh.parse_via(nodes["eng"]["ssh_via"]) == ("root", "45.141.118.103", 19003)
+
+
+def test_reach_probes_ssh_on_port_from_host(monkeypatch):
+    from nexus_mcp import diagnose
+
+    seen = []
+
+    async def fake_run(probe, kind, args):
+        seen.append((kind, args["host"], args["port"]))
+        return {"ok": True}
+
+    monkeypatch.setattr(diagnose.registry, "run", fake_run)
+    node = {"name": "fw", "ip": "", "ssh_host": "45.141.118.103:19003", "ssh_port": 22}
+    asyncio.run(diagnose.reach("hub", node, [443]))
+    assert ("tcp", "45.141.118.103", 19003) in seen and ("tls", "45.141.118.103", 443) in seen
+
+
 def test_bad_via_is_a_reason_not_a_crash(hub_settings, tmp_path):
     key = tmp_path / "k"
     key.write_text("x")

@@ -247,7 +247,7 @@ async def probe_check(probe: str, target: str, kind: str = "tls", port: int = 44
     host = target
     try:
         n = await inventory.find_node(target)
-        host = n.get("ip") or n.get("ssh_host")
+        host = n.get("ip") or ssh.ssh_target(n)[0]
     except InventoryError:
         pass
     if kind == "http":
@@ -334,7 +334,7 @@ async def _node_targets(node: str) -> dict:
                 cf_links = [u for u in all_links if (urlparse(u).hostname or "") == cft[0]]
         except sublinks.LinksError:
             pass
-    ip = n.get("ip") or n.get("ssh_host")
+    ip = n.get("ip") or ssh.ssh_target(n)[0]
     targets = [f"{ip}:{p}" for p in diagnose.client_ports(n, node_links)]
     if cft:
         targets.append(f"{cft[0]}:{cft[1]}")

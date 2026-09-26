@@ -25,7 +25,7 @@ from typing import Any
 
 import httpx
 
-from nexus_mcp import config
+from nexus_mcp import config, ssh
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +176,9 @@ def merge(by_panel: dict[str, list[dict]], file_data: dict) -> list[dict]:
             continue
         hop = nodes.get(via) or next((m for m in out if m.get("short_name") == via), None)
         if hop is not None and hop is not n and hop.get("ssh_host"):
-            n["ssh_via"] = f"{hop.get('ssh_user') or config.settings.ssh_user}@{hop['ssh_host']}:" \
-                           f"{int(hop.get('ssh_port') or 22)}"
+            # ssh_host узла бывает «host:port» — иначе вышло бы «host:port:22».
+            host, port = ssh.ssh_target(hop)
+            n["ssh_via"] = f"{hop.get('ssh_user') or config.settings.ssh_user}@{host}:{port}"
     out.sort(key=lambda n: n["name"])
     return out
 

@@ -190,8 +190,8 @@ async def reach(probe: str, node: dict, ports: list[int],
                 cf: tuple[str, int] | None = None) -> dict:
     """TCP и данные к SSH-порту + TLS к клиентским портам с одной точки;
     с включённым Cloudflare-фронтом — ещё TLS до его адреса (cf_tls)."""
-    host = node.get("ip") or node.get("ssh_host")
-    sp = int(node.get("ssh_port") or 22)
+    ssh_host, sp = ssh.ssh_target(node)
+    host = node.get("ip") or ssh_host
     tasks = {
         "tcp_ssh": registry.run(probe, "tcp", {"host": host, "port": sp}),
         "banner_ssh": registry.run(probe, "banner", {"host": host, "port": sp}),

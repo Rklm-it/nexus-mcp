@@ -45,7 +45,8 @@ FAILURE_HINTS = {
     "timeout": "SSH не ответил вовремя: пакеты к ноде с хаба не доходят (фильтр по дороге) "
                "или нода выключена. Сверить с пробами TCP/баннер и с check-host. Нода жива, "
                "а дорога режется — заходить через живую ноду: \"ssh_via\" в nodes.json.",
-    "refused": "Порт SSH закрыт: sshd не запущен или слушает другой порт (поправка ssh_port в nodes.json).",
+    "refused": "Порт SSH закрыт: sshd не запущен или слушает другой порт (поправка ssh_port в nodes.json; "
+               "нода за пробросом портов — ssh_host «host:port»).",
     "unreachable": "Маршрута до ноды нет: IP сменился или машина удалена у хостера.",
     "auth": "Нода не принимает ключ хаба: публичный ключ не добавлен в authorized_keys ноды.",
     "hostkey": "Ключ хоста изменился: ноду переустановили, либо подмена. Проверить и удалить "
@@ -61,6 +62,42 @@ FAILURE_HINTS = {
 # user@host[:port] без лишних символов. Имя ноды inventory.merge уже заменил
 # на её адрес.
 _VIA_RE = re.compile(r"^(?:([a-z_][a-z0-9_-]{0,31})@)?([A-Za-z0-9.-]{1,253})(?::(\d{1,5}))?$")
+
+
+_BRACKETED = re.compile(r"^\[([^\[\]]+)\](?::(\d{1,5}))?$")
+
+
+def split_host(raw: str, default_port: int = 22) -> tuple[str, int]:
+    """Адрес SSH из панели или nodes.json → (хост, порт).
+
+    У нод за пробросом портов адрес пишут вместе с портом
+    («45.141.118.103:19003»): ssh такую строку целиком не резолвит, а порт
+    из неё терялся — шёл ssh_port (22). Явный порт в строке сильнее
+    ssh_port. IPv6 с портом — только в скобках «[addr]:port»; голый IPv6
+    («2001:db8::1») — это адрес целиком, двоеточия в нём не порт.
+    Не разобралось («host:abc», порт 0) — строка как есть: ssh сам покажет,
+    что с ней не так, а не молча уйдёт на другой адрес.
+    """
+    h = str(raw or "").strip()
+    m = _BRACKETED.match(h)
+    if m:
+        host, port = m.group(1), m.group(2)
+    elif h.count(":") == 1:
+        host, port = h.split(":")
+        if not port.isdigit():
+            return h, default_port
+    else:
+        return h, default_port
+    if port is None:
+        return host, default_port
+    if not 0 < int(port) < 65536 or not host:
+        return h, default_port
+    return host, int(port)
+
+
+def ssh_target(node: dict) -> tuple[str, int]:
+    """(хост, порт) SSH ноды: ssh_host с разобранным портом, иначе ssh_port."""
+    return split_host(node.get("ssh_host") or "", int(node.get("ssh_port") or 22))
 
 
 def parse_via(via: str) -> tuple[str, str, int] | None:
@@ -120,15 +157,16 @@ def ssh_argv(node: dict) -> list[str]:
     там, где режется «хаб → нода»."""
     s = config.settings
     s.state_dir.mkdir(parents=True, exist_ok=True)
-    argv = ["ssh", "-i", s.ssh_key, "-p", str(int(node.get("ssh_port") or 22)), *_common_opts()]
+    host, port = ssh_target(node)
+    argv = ["ssh", "-i", s.ssh_key, "-p", str(port), *_common_opts()]
     if node.get("ssh_via"):
         via = parse_via(str(node["ssh_via"]))
         if via is None:
             raise ValueError(node["ssh_via"])
-        user, host, port = via
-        proxy = ["ssh", "-i", s.ssh_key, "-p", str(port), *_common_opts(), "-W", "%h:%p", f"{user}@{host}"]
+        vuser, vhost, vport = via
+        proxy = ["ssh", "-i", s.ssh_key, "-p", str(vport), *_common_opts(), "-W", "%h:%p", f"{vuser}@{vhost}"]
         argv += ["-o", "ProxyCommand=" + " ".join(shlex.quote(x) for x in proxy)]
-    return argv + [f"{node.get('ssh_user') or s.ssh_user}@{node['ssh_host']}", "bash", "-s"]
+    return argv + [f"{node.get('ssh_user') or s.ssh_user}@{host}", "bash", "-s"]
 
 
 async def run_script(node: dict, script: str, timeout: float = 45.0) -> SshResult:
