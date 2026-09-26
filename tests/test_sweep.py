@@ -485,11 +485,14 @@ def _stub(bin_dir: Path, name: str, body: str) -> None:
     p.chmod(0o755)
 
 
-def _openwrt(tmp_path: Path, *, python_ok: bool = True, token_ok: bool = True):
+def _openwrt(tmp_path: Path, *, python_ok: bool = True, token_ok: bool = True,
+             free_kb: int = 18000, mem_kb: int = 400000):
     root = tmp_path / "root"
     for d in ("etc/config", "etc/init.d", "usr/share", "overlay"):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / "etc/openwrt_release").write_text("DISTRIB_DESCRIPTION='OpenWrt 24.10.5'\n")
+    (root / "proc").mkdir()
+    (root / "proc/meminfo").write_text(f"MemTotal: 1000000 kB\nMemAvailable: {mem_kb} kB\n")
     bins = tmp_path / "bin"
     bins.mkdir()
     log = tmp_path / "calls.log"
@@ -502,7 +505,7 @@ def _openwrt(tmp_path: Path, *, python_ok: bool = True, token_ok: bool = True):
     _stub(bins, "opkg", f'echo "opkg $*" >> {log}')
     _stub(bins, "uci", f'echo "uci $*" >> {log}')
     _stub(bins, "sleep", 'exit 0')
-    _stub(bins, "df", 'echo "Filesystem 1K-blocks Used Available"; echo "overlay 45000 27000 18000"')
+    _stub(bins, "df", f'echo "Filesystem 1K-blocks Used Available"; echo "overlay 45000 27000 {free_kb}"')
     msg = "[nexus-probe] роутер → hub" if token_ok else "[nexus-probe] хаб ответил 401: неверный токен пробника"
     _stub(bins, "logread", f'echo "{msg}"')
     # wget: probe.py — копия из «репозитория», healthz — ответ хаба
@@ -559,6 +562,41 @@ def test_openwrt_installer_names_missing_module_and_flash(tmp_path):
     assert "opkg install python3-light" in log.read_text(encoding="utf-8")
     assert "ssl" in r.stderr
     assert not (root / "etc/init.d/nexus-probe").exists()
+
+
+def test_openwrt_installer_puts_python_in_ram_when_flash_is_short(tmp_path):
+    """9 МБ флеша (живой случай: OpenWrt 24.10, aarch64) — python3 не отказ, а
+    ОЗУ: opkg ставит его в отдельный dest, служба стартует через run.sh,
+    который после перезагрузки ставит python3 заново."""
+    root, env, log, src = _openwrt(tmp_path, python_ok=False, free_kb=9216)
+    r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
+    calls = log.read_text(encoding="utf-8")
+    assert f"opkg --add-dest nexuspy:{root}/tmp/nexus-py -d nexuspy install python3-light" in calls
+    assert "python3-unicodedata" not in calls  # такого пакета в OpenWrt нет
+    assert "в ОЗУ" in r.stdout
+    # заглушка python3 всё равно «без ssl» — установка честно называет модуль
+    assert r.returncode != 0 and "ssl" in r.stderr
+
+
+def test_openwrt_installer_ram_mode_writes_runner(tmp_path):
+    root, env, log, src = _openwrt(tmp_path, free_kb=9216)
+    r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--python", "tmp",
+                       "--src", f"file://{src}")
+    assert r.returncode == 0, r.stderr
+    calls = log.read_text(encoding="utf-8")
+    assert "-d nexuspy install" in calls
+    assert f"uci set nexus-probe.main.python_dest={root}/tmp/nexus-py" in calls
+    run = (root / "usr/share/nexus-probe/run.sh").read_text(encoding="utf-8")
+    assert "NEXUS_PY_DEST" in run and "opkg --add-dest" in run
+    init = (root / "etc/init.d/nexus-probe").read_text(encoding="utf-8")
+    assert "/usr/share/nexus-probe/run.sh" in init and "NEXUS_PY_DEST=" in init
+
+
+def test_openwrt_installer_refuses_ram_mode_without_memory(tmp_path):
+    root, env, log, src = _openwrt(tmp_path, free_kb=9216, mem_kb=50000, python_ok=False)
+    r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
+    assert r.returncode != 0 and "ОЗУ" in r.stderr
+    assert not log.exists() or "install" not in log.read_text(encoding="utf-8")
 
 
 def test_openwrt_installer_rejects_bad_args_and_removes(tmp_path):

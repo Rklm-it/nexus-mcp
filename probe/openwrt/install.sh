@@ -11,13 +11,18 @@
 #   wget -qO- https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/probe/openwrt/install.sh \
 #     | sh -s -- --hub https://<хаб> --token <PROBE_TOKEN> --name роутер-дом [--xray tmp|auto|no]
 #
+#   --python auto — python3 на флеш, а если там меньше 12 МБ — в ОЗУ (по умолчанию);
+#   --python tmp  — python3 в ОЗУ (/tmp/nexus-py): флеш не тратится, после
+#                   перезагрузки роутера служба сама ставит его заново (нужен интернет);
+#   --python flash — только на флеш.
+#
 #   --xray tmp   — сквозная проверка: xray качается в ОЗУ перед проверкой и
 #                  удаляется после 10 минут простоя (на флеш он не влезает);
 #   --xray auto  — только если xray уже стоит на роутере (по умолчанию);
 #   --xray no    — только доступность (TCP/TLS), без сквозной.
 #   --remove     — удалить пробник (пакеты python3 остаются).
 #
-# Что ставится: python3-light и пять его модулей (~10 МБ флеша), служба
+# Что ставится: python3-light и его модули (~11 МБ флеша или ОЗУ), служба
 # /etc/init.d/nexus-probe (procd, перезапуск при падении), настройки в
 # /etc/config/nexus-probe. Логи: logread -e nexus-probe.
 #
@@ -27,7 +32,7 @@
 set -u
 
 SRC="https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main"
-HUB=""; TOKEN=""; NAME=""; XRAY="auto"; REMOVE=0
+HUB=""; TOKEN=""; NAME=""; XRAY="auto"; PYMODE="auto"; REMOVE=0
 # ROOT — только для теста установщика (tests/test_openwrt_install.py): прогон
 # секции с заглушками вместо чтения кода (инвариант 35 vgx3d). На роутере пуст.
 ROOT="${NEXUS_PROBE_ROOT:-}"
@@ -36,7 +41,12 @@ INIT="$ROOT/etc/init.d/nexus-probe"
 CFG="$ROOT/etc/config/nexus-probe"
 # Флеш под python3 и модули; меньше — установка не влезет и оставит полпакета.
 NEED_FLASH_KB=12000
-PKGS="python3-light python3-openssl python3-urllib python3-email python3-codecs python3-unicodedata python3-logging ca-bundle"
+# python3 в ОЗУ: сам python (~11 МБ в tmpfs) + запас на пробник и xray.
+NEED_RAM_KB=100000
+PY_TMP="$ROOT/tmp/nexus-py"
+# unicodedata (нужен encodings.idna → ssl) живёт в python3-codecs: отдельного
+# python3-unicodedata в OpenWrt нет, и opkg из-за него отказал бы целиком.
+PKGS="python3-light python3-openssl python3-urllib python3-email python3-codecs python3-logging ca-bundle"
 FINISHED=0
 
 say()  { echo "[nexus-probe] $*"; }
@@ -52,6 +62,7 @@ while [ $# -gt 0 ]; do
         --token)  need_arg "$@"; TOKEN="$2"; shift 2 ;;
         --name)   need_arg "$@"; NAME="$2"; shift 2 ;;
         --xray)   need_arg "$@"; XRAY="$2"; shift 2 ;;
+        --python) need_arg "$@"; PYMODE="$2"; shift 2 ;;
         --src)    need_arg "$@"; SRC="${2%/}"; shift 2 ;;
         --remove) REMOVE=1; shift ;;
         *) die "неизвестный параметр: $1" ;;
@@ -63,7 +74,7 @@ done
 
 if [ "$REMOVE" = 1 ]; then
     [ -x "$INIT" ] && { "$INIT" stop 2>/dev/null; "$INIT" disable 2>/dev/null; }
-    rm -rf "$INIT" "$DIR" "$CFG" "$ROOT/tmp/nexus-xray"
+    rm -rf "$INIT" "$DIR" "$CFG" "$ROOT/tmp/nexus-xray" "$PY_TMP"
     say "пробник удалён (python3 оставлен: opkg remove python3-light — если не нужен)"
     FINISHED=1
     exit 0
@@ -73,6 +84,7 @@ fi
 [ -n "$TOKEN" ] || die "нужен --token (NEXUS_PROBE_TOKENS на хабе)"
 case "$HUB" in https://*) ;; *) die "--hub должен начинаться с https:// (а не «$HUB»)" ;; esac
 case "$XRAY" in tmp|auto|no) ;; *) die "--xray: tmp | auto | no (а не «$XRAY»)" ;; esac
+case "$PYMODE" in auto|flash|tmp) ;; *) die "--python: auto | flash | tmp (а не «$PYMODE»)" ;; esac
 [ -n "$NAME" ] || NAME="роутер-$(cat /proc/sys/kernel/hostname 2>/dev/null || echo дом)"
 
 . "$ROOT/etc/openwrt_release" 2>/dev/null || true
@@ -87,10 +99,20 @@ else
     die "нет ни opkg, ни apk — не знаю, как ставить пакеты"
 fi
 
+# PY_DEST пуст — python3 системный (флеш); иначе — python3 в ОЗУ под PY_DEST.
+PY_DEST=""
+py() {
+    if [ -n "$PY_DEST" ] && [ -x "$PY_DEST/usr/bin/python3" ]; then
+        LD_LIBRARY_PATH="$PY_DEST/usr/lib:$PY_DEST/lib" PYTHONHOME="$PY_DEST/usr" "$PY_DEST/usr/bin/python3" "$@"
+    else
+        python3 "$@"
+    fi
+}
+
 py_check() {
     # Всё, что пробник импортирует. Отказ — с именем модуля: «python не
     # работает» не говорит, какой пакет доставить (инвариант 26).
-    python3 - <<'PY' 2>&1
+    py - <<'PY' 2>&1
 import importlib, sys
 missing = []
 for m in ("json", "socket", "ssl", "subprocess", "tempfile", "threading", "shutil", "platform",
@@ -106,19 +128,35 @@ if missing:
 PY
 }
 
-if command -v python3 >/dev/null 2>&1 && py_check >/dev/null 2>&1; then
+if [ "$PYMODE" != tmp ] && command -v python3 >/dev/null 2>&1 && py_check >/dev/null 2>&1; then
     say "python3 уже есть и подходит: $(python3 --version 2>&1)"
+elif [ "$PYMODE" != flash ] && [ -x "$PY_TMP/usr/bin/python3" ] && PY_DEST="$PY_TMP" && py_check >/dev/null 2>&1; then
+    say "python3 уже есть в ОЗУ ($PY_DEST): $(py --version 2>&1)"
 else
+    PY_DEST=""
     free_kb="$(df -k "$ROOT/overlay" 2>/dev/null | awk 'NR==2 {print $4}')"
-    if [ -n "$free_kb" ] && [ "$free_kb" -lt "$NEED_FLASH_KB" ]; then
-        die "на флеше свободно $((free_kb / 1024)) МБ, а python3 с модулями — около $((NEED_FLASH_KB / 1024)) МБ. Освободите место (opkg remove …) и повторите"
+    short=0
+    [ -n "$free_kb" ] && [ "$free_kb" -lt "$NEED_FLASH_KB" ] && short=1
+    if [ "$PYMODE" = flash ] && [ "$short" = 1 ]; then
+        die "на флеше свободно $((free_kb / 1024)) МБ, а python3 с модулями — около $((NEED_FLASH_KB / 1024)) МБ. Освободите место (opkg remove …) или поставьте python3 в ОЗУ: --python tmp"
+    fi
+    if [ "$PYMODE" = tmp ] || [ "$short" = 1 ]; then
+        [ "$short" = 1 ] && say "на флеше свободно $((free_kb / 1024)) МБ, python3 с модулями — около $((NEED_FLASH_KB / 1024)) МБ: ставлю его в ОЗУ"
+        # В ОЗУ ставит только opkg (--add-dest); apk так не умеет.
+        [ "$PM" = opkg ] || die "python3 в ОЗУ ставится только через opkg, а здесь $PM. Освободите на флеше $((NEED_FLASH_KB / 1024)) МБ и повторите"
+        mem_kb="$(awk '/^MemAvailable:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null)"
+        [ -n "$mem_kb" ] && [ "$mem_kb" -ge "$NEED_RAM_KB" ] \
+            || die "свободно ${mem_kb:+$((mem_kb / 1024)) МБ }ОЗУ, для python3 в ОЗУ нужно $((NEED_RAM_KB / 1024)) МБ. Освободите на флеше $((NEED_FLASH_KB / 1024)) МБ (opkg remove …) и повторите"
+        PY_DEST="$PY_TMP"
+        pm_add() { opkg --add-dest "nexuspy:$PY_DEST" -d nexuspy install "$@"; }
+        say "python3 будет в ОЗУ ($PY_DEST): флеш не тратится, после перезагрузки роутера служба поставит его заново сама (нужен интернет, ~1 мин)"
     fi
     say "ставлю python3 ($PM): $PKGS"
     pm_update >/tmp/nexus-probe-pm.log 2>&1 || { tail -5 /tmp/nexus-probe-pm.log >&2; die "$PM update не прошёл — есть ли интернет у роутера?"; }
     # shellcheck disable=SC2086
     pm_add $PKGS >>/tmp/nexus-probe-pm.log 2>&1 || { tail -8 /tmp/nexus-probe-pm.log >&2; die "пакеты не встали (лог: /tmp/nexus-probe-pm.log)"; }
     why="$(py_check)" || die "python3 встал, но не хватает модулей: $why"
-    say "python3 готов: $(python3 --version 2>&1)"
+    say "python3 готов: $(py --version 2>&1)"
 fi
 
 # ── 2. probe.py ────────────────────────────────────────────────────────────
@@ -129,7 +167,7 @@ if ! wget -q -T 20 -O "$DIR/probe.py.part" "$SRC/probe/probe.py"; then
     rm -f "$DIR/probe.py.part"
     die "probe.py не скачался с $SRC — GitHub недоступен с роутера? Можно указать зеркало: --src <адрес>"
 fi
-python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$DIR/probe.py.part" 2>/dev/null \
+py -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$DIR/probe.py.part" 2>/dev/null \
     || { rm -f "$DIR/probe.py.part"; die "скачался не probe.py (обрыв или страница-заглушка провайдера)"; }
 mv "$DIR/probe.py.part" "$DIR/probe.py"
 say "probe.py $(grep -m1 '^PROBE_VERSION' "$DIR/probe.py" | cut -d'"' -f2) → $DIR"
@@ -161,6 +199,32 @@ else
 fi
 
 # ── 4. служба ──────────────────────────────────────────────────────────────
+# Запуск через run.sh: python3 в ОЗУ после перезагрузки роутера пропадает —
+# run.sh ставит его заново и только потом запускает пробник.
+cat > "$DIR/run.sh" <<'RUNEOF'
+#!/bin/sh
+# Запуск пробника Nexus (probe/openwrt/install.sh). NEXUS_PY_DEST — python3
+# в ОЗУ: после перезагрузки его нет, ставим заново (нужен интернет).
+d="${NEXUS_PY_DEST:-}"
+if [ -n "$d" ]; then
+    export LD_LIBRARY_PATH="$d/usr/lib:$d/lib" PYTHONHOME="$d/usr" PATH="$d/usr/bin:$PATH"
+    [ -f "${SSL_CERT_FILE:-}" ] || export SSL_CERT_FILE="$d/etc/ssl/certs/ca-certificates.crt"
+    if ! "$d/usr/bin/python3" -c "import ssl, urllib.request, concurrent.futures" >/dev/null 2>&1; then
+        echo "[nexus-probe] python3 в ОЗУ нет (роутер перезагружался?) — ставлю в $d"
+        # shellcheck disable=SC2086
+        if ! { opkg update && opkg --add-dest "nexuspy:$d" -d nexuspy install $NEXUS_PY_PKGS; } >/tmp/nexus-probe-pm.log 2>&1; then
+            tail -n 5 /tmp/nexus-probe-pm.log
+            echo "[nexus-probe] python3 не встал (нет интернета?) — повтор через минуту"
+            sleep 60
+            exit 1
+        fi
+    fi
+    exec "$d/usr/bin/python3" -u /usr/share/nexus-probe/probe.py "$@"
+fi
+exec /usr/bin/python3 -u /usr/share/nexus-probe/probe.py "$@"
+RUNEOF
+chmod 755 "$DIR/run.sh"
+
 touch "$CFG"
 uci -q delete nexus-probe.main
 uci set nexus-probe.main=probe
@@ -170,6 +234,8 @@ uci set nexus-probe.main.name="$NAME"
 uci set nexus-probe.main.xray="$XRAY_BIN"
 uci set nexus-probe.main.xray_url="$XRAY_URL"
 uci set nexus-probe.main.min_mem_mb=48
+uci set nexus-probe.main.python_dest="$PY_DEST"
+uci set nexus-probe.main.python_pkgs="$PKGS"
 uci commit nexus-probe
 chmod 600 "$CFG"
 
@@ -181,7 +247,7 @@ STOP=10
 USE_PROCD=1
 
 start_service() {
-    local hub token name xray xray_url min_mem
+    local hub token name xray xray_url min_mem py_dest py_pkgs
     config_load nexus-probe
     config_get hub main hub
     config_get token main token
@@ -189,13 +255,16 @@ start_service() {
     config_get xray main xray
     config_get xray_url main xray_url
     config_get min_mem main min_mem_mb 48
+    config_get py_dest main python_dest
+    config_get py_pkgs main python_pkgs
     [ -n "$hub" ] && [ -n "$token" ] || { echo "nexus-probe: нет hub/token в /etc/config/nexus-probe" >&2; return 1; }
     procd_open_instance
-    procd_set_param command /usr/bin/python3 -u /usr/share/nexus-probe/probe.py --hub "$hub" --name "$name"
+    procd_set_param command /bin/sh /usr/share/nexus-probe/run.sh --hub "$hub" --name "$name"
     [ -n "$xray" ] && procd_append_param command --xray "$xray"
     [ -n "$xray_url" ] && procd_append_param command --xray-url "$xray_url"
     # Токен — окружением, а не аргументом: так его не видно в ps.
     procd_set_param env NEXUS_PROBE_TOKEN="$token" NEXUS_PROBE_MIN_MEM_MB="$min_mem" \
+        NEXUS_PY_DEST="$py_dest" NEXUS_PY_PKGS="$py_pkgs" \
         SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
     procd_set_param respawn 3600 10 0
     procd_set_param stdout 1

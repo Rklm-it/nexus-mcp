@@ -206,8 +206,11 @@ Claude: «проверь панель и красные ноды через nexu
 wget -qO- https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/probe/openwrt/install.sh \
   | sh -s -- --hub <адрес хаба> --token <PROBE_TOKEN> --name роутер-дом --xray tmp
 ```
-Ставит `python3-light` с пятью модулями (~10 МБ флеша; меньше 12 МБ свободно —
-откажет заранее, а не оставит полпакета), службу `/etc/init.d/nexus-probe`
+Ставит `python3-light` с модулями (~11 МБ). Если на флеше меньше 12 МБ, python3
+ставится в ОЗУ (`/tmp/nexus-py`, нужно ≥100 МБ свободной памяти): флеш не
+тратится, а после перезагрузки роутера служба сама ставит его заново (нужен
+интернет, около минуты). Выбрать явно: `--python flash` или `--python tmp`.
+Ещё ставится служба `/etc/init.d/nexus-probe`
 (procd, перезапуск при падении), настройки — `/etc/config/nexus-probe`, логи —
 `logread -e nexus-probe`. `--xray tmp`: xray (~30 МБ) на флеш не влезает,
 поэтому скачивается в ОЗУ перед сквозной проверкой и удаляется через 10 минут
