@@ -320,7 +320,38 @@ def test_catalog_missing_on_old_panel_says_update(hub_settings, monkeypatch):
     panel._catalog_cache.clear()
     _mock(monkeypatch, lambda req: httpx.Response(404, json={"detail": "Not Found"}))
     r = asyncio.run(server.panel_endpoints())
-    assert r["ok"] is False and "обновите панель" in r["detail"]
+    assert r["ok"] is False and "обновите панель" in r["detail"].lower()
+
+
+def test_missing_route_names_panel_version_and_master(hub_settings, monkeypatch):
+    """Панель «обновили», а ручки нет: клиент лицензии получил версию мастера.
+    Отказ называет версию панели, с какой версии ручка и что обновлять первым."""
+    from nexus_mcp import server
+
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    panel._catalog_cache.clear()
+
+    def handler(req: httpx.Request):
+        if req.url.path == panel.VERSIONS_PATH:
+            return httpx.Response(200, json={"brain": {"version": "3.104.7"}, "cells": []})
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    _mock(monkeypatch, handler)
+    for r in (asyncio.run(server.panel_endpoints()), asyncio.run(server.panel_db())):
+        assert r["ok"] is False
+        assert "v3.104.7" in r["detail"] and "v3.104.9" in r["detail"], r
+        assert "мастер" in r["detail"]
+
+
+def test_handler_404_is_not_called_outdated(hub_settings, monkeypatch):
+    """Своя 404 ручки (нет юзера) — не «старая панель»."""
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    _mock(monkeypatch, lambda req: httpx.Response(404, json={"detail": "Пользователь не найден"}))
+    with pytest.raises(panel.PanelError) as e:
+        asyncio.run(panel.request("GET", "/api/v1/admin/users/x"))
+    assert "нет такой ручки" not in str(e.value)
 
 
 def test_panel_endpoints_filters_and_marks_risk(panel_on):

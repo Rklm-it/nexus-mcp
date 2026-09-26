@@ -704,7 +704,8 @@ def test_panels_listing_has_no_secrets(chat_settings, hub_settings, tmp_path):
     _panels_file(hub_settings, tmp_path, [
         {"name": "main", "url": "https://a.example/", "token": "SECRET-T1", "gate": "SECRET-G"},
         {"name": "vip", "url": "https://a.example/vip", "token": "SECRET-T2", "gate": "SECRET-G"},
-        {"name": "old", "url": "https://c.example", "token": "SECRET-T3", "basic_auth": "u:SECRET-P"}])
+        {"name": "old", "url": "https://c.example", "token": "SECRET-T3", "basic_auth": "u:SECRET-P",
+         "master": True}])
 
     async def script(opts, prompt):
         yield ResultMessage()
@@ -716,9 +717,9 @@ def test_panels_listing_has_no_secrets(chat_settings, hub_settings, tmp_path):
         assert r.status_code == 200
         assert "SECRET" not in r.text
         assert r.json()["panels"] == [
-            {"name": "main", "url": "https://a.example", "password_only": False},
-            {"name": "vip", "url": "https://a.example/vip", "password_only": False},
-            {"name": "old", "url": "https://c.example", "password_only": True}]
+            {"name": "main", "url": "https://a.example", "password_only": False, "master": False},
+            {"name": "vip", "url": "https://a.example/vip", "password_only": False, "master": False},
+            {"name": "old", "url": "https://c.example", "password_only": True, "master": True}]
 
     asyncio.run(go())
 

@@ -15,6 +15,7 @@
     nexus-mcp-panels list
     nexus-mcp-panels add shop2 https://p2.example.com <VPN_ADMIN_TOKEN> --gate <VPN_PANEL_GATE_SECRET>
     nexus-mcp-panels remove shop2
+    nexus-mcp-panels master main on     # мастер brain: выпуск версии для клиентов лицензии
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ def public_view(p: dict) -> dict:
     """Для вывода: без токена и пароля."""
     return {"name": p["name"], "url": p["url"], "gate": bool(p.get("gate")),
             "basic_auth": bool(p.get("basic_auth")), "aliases": list(p.get("aliases") or []),
-            "sub": bool(p.get("sub_url"))}
+            "sub": bool(p.get("sub_url")), "master": bool(p.get("master"))}
 
 
 # ── Команда управления ─────────────────────────────────────────────────────
@@ -106,7 +107,8 @@ def _write(panels: list[dict]) -> None:
     os.replace(tmp, path)
 
 
-def add(name: str, url: str, token: str, basic_auth: str = "", gate: str = "") -> dict:
+def add(name: str, url: str, token: str, basic_auth: str = "", gate: str = "",
+        master: bool = False) -> dict:
     if not NAME_RE.match(name):
         raise PanelConfigError("имя: латиница в нижнем регистре, цифры, - и _, до 32 символов")
     if not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?(/[A-Za-z0-9._~/\-]*)?$", url.rstrip("/")):
@@ -122,9 +124,43 @@ def add(name: str, url: str, token: str, basic_auth: str = "", gate: str = "") -
         entry["gate"] = gate
     if basic_auth:
         entry["basic_auth"] = basic_auth
+    if master:
+        entry["master"] = True
     panels.append(entry)
     _write(panels)
     return public_view(entry)
+
+
+# Поля записи панели, которые переживают rename/sub (всё, кроме имени).
+_KEEP = ("url", "token", "gate", "basic_auth", "aliases", "sub_url", "sub_user_id", "master")
+
+
+def set_master(name: str, on: bool) -> dict:
+    """Отметить мастер brain — панель продавца, откуда клиенты лицензии
+    берут образы. Мастер один: отметка с другой панели снимается. Панель из
+    окружения переносится в файл."""
+    everything = all_panels()
+    src = next((p for p in everything if p["name"] == name), None)
+    if src is None:
+        raise PanelConfigError(f"панели «{name}» нет. Есть: {', '.join(p['name'] for p in everything)}")
+    entry = {k: v for k, v in src.items() if k in ("name", *_KEEP) and v}
+    entry.pop("master", None)
+    if on:
+        entry["master"] = True
+    rest = []
+    for p in _read_file():
+        if p["name"] == name:
+            continue
+        if on and p.get("master"):
+            p = {k: v for k, v in p.items() if k != "master"}
+        rest.append(p)
+    _write(rest + [entry])
+    return public_view(entry)
+
+
+def master() -> dict | None:
+    """Отмеченный мастер brain или None."""
+    return next((p for p in all_panels() if p.get("master")), None)
 
 
 def _taken(name: str, panels: list[dict], but: str = "") -> str | None:
@@ -150,7 +186,7 @@ def rename(old: str, new: str) -> dict:
         raise PanelConfigError(f"имя «{new}» уже занято: {busy} (регистр букв не различается)")
     file_panels = [p for p in _read_file() if p["name"] != old]
     entry = {k: v for k, v in src.items()
-             if k in ("url", "token", "gate", "basic_auth", "aliases", "sub_url", "sub_user_id") and v}
+             if k in _KEEP and v}
     entry["name"] = new
     aliases = [a for a in entry.get("aliases", []) if a.lower() != new.lower()]
     if old.lower() != new.lower() and old not in aliases:
@@ -173,7 +209,7 @@ def set_sub(name: str, url: str, user_id: str = "") -> dict:
     src = next((p for p in everything if p["name"] == name), None)
     if src is None:
         raise PanelConfigError(f"панели «{name}» нет. Есть: {', '.join(p['name'] for p in everything)}")
-    entry = {k: v for k, v in src.items() if k in ("name", "url", "token", "gate", "basic_auth", "aliases") and v}
+    entry = {k: v for k, v in src.items() if k in ("name", *_KEEP) and v and k not in ("sub_url", "sub_user_id")}
     if url != "-":
         entry["sub_url"] = url
         if user_id:
@@ -210,6 +246,11 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("token")
     a.add_argument("--gate", default="", help="VPN_PANEL_GATE_SECRET из .env панели (проход мимо basic_auth)")
     a.add_argument("--basic", default="", help="user:pass, если /api панели за basic_auth, а gate не задан")
+    a.add_argument("--master", action="store_true",
+                   help="это мастер brain (продавец): с него клиенты лицензии берут образы")
+    ms = sub.add_parser("master", help="отметить мастер brain (on) или снять отметку (off)")
+    ms.add_argument("name")
+    ms.add_argument("state", choices=("on", "off"), nargs="?", default="on")
     r = sub.add_parser("remove")
     r.add_argument("name")
     rn = sub.add_parser("rename", help="переименовать; старое имя остаётся адресом реле")
@@ -226,15 +267,19 @@ def main(argv: list[str] | None = None) -> int:
                 how = "gate" if v["gate"] else ("basic_auth" if v["basic_auth"] else "")
                 al = f"  прежние имена: {', '.join(v['aliases'])}" if v["aliases"] else ""
                 sb = "  подписка: есть" if v["sub"] else ""
-                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}{al}{sb}")
+                mst = "  [мастер]" if v["master"] else ""
+                print(f"{v['name']:<16} {v['url']}{f'  ({how})' if how else ''}{mst}{al}{sb}")
         elif args.cmd == "add":
-            v = add(args.name, args.url, args.token, args.basic, args.gate)
-            print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
+            v = add(args.name, args.url, args.token, args.basic, args.gate, args.master)
+            print(f"добавлена {v['name']} → {v['url']}{' (мастер brain)' if v['master'] else ''} (хаб подхватит сразу)")
             _refresh_relay()
         elif args.cmd == "rename":
             v = rename(args.old, args.new)
             print(f"переименована: {args.old} → {v['name']} (ноды на реле /relay/{args.old} связь не теряют)")
             _refresh_relay()
+        elif args.cmd == "master":
+            v = set_master(args.name, args.state == "on")
+            print(f"{v['name']}: {'мастер brain' if v['master'] else 'обычная панель'}")
         elif args.cmd == "sub":
             v = set_sub(args.name, args.url)
             print(f"{v['name']}: подписка для проверки {'задана' if v['sub'] else 'стёрта'}")

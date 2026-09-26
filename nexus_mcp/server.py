@@ -909,6 +909,205 @@ async def panel_maintenance(op: str, args: dict | None = None, confirm: bool = F
     return await _call("panel_maintenance", m, path, body, params, confirm, panel, title=MAINTENANCE_OPS[op])
 
 
+# ── Мастер brain: выпуск версии для клиентов лицензии ─────────────────────
+# Клиент лицензии по «Обновить» ставит архив образов с мастера, а не версию,
+# на которой работает мастер (vgx3d services/master_release.py). Выпуск —
+# brain мастера → фронт → архив (license/build.sh) → «обновись» клиентам.
+
+MASTER = "/api/v1/admin/master"
+MASTER_JOBS = {
+    "brain": "обновить brain мастера: git pull → снимок базы → пересборка → миграции (1–3 мин)",
+    "frontend": "пересобрать фронт мастера из кода на диске (2–5 мин)",
+    "build": "собрать архив образов для клиентов лицензии — license/build.sh (5–15 мин)",
+    "release": "выпуск целиком: brain → фронт → архив для клиентов (10–25 мин)",
+}
+
+
+def _master_panel(panel: str) -> str:
+    """Имя мастера: указанное, иначе отмеченное на хабе."""
+    if panel:
+        return panel
+    m = panels.master()
+    if m is None:
+        raise panels.PanelConfigError(
+            "мастер brain не отмечен на хабе: nexus-mcp-panels master <имя> (или укажите panel)")
+    return m["name"]
+
+
+def _actions_off() -> dict | None:
+    if not config.settings.allow_actions:
+        return {"ok": False, "error": "actions_disabled",
+                "detail": "действия выключены на хабе (NEXUS_ALLOW_ACTIONS=1 чтобы включить)"}
+    return None
+
+
+def _tail(text: str, lines: int = 40) -> str:
+    return "\n".join(str(text or "").splitlines()[-lines:])
+
+
+async def _master_overview(name: str) -> dict:
+    data = await panel_api.request("GET", f"{MASTER}/overview", None, 60.0, name)
+    if not isinstance(data, dict) or not data.get("is_master"):
+        raise panel_api.PanelError(
+            f"панель {name} — не мастер: это клиент лицензии, он обновляется образами мастера (panel_update)")
+    return data
+
+
+@mcp.tool()
+async def master_status(panel: str = "") -> dict:
+    """Мастер brain: версии мастера, кода на диске и архива образов, который
+    получат клиенты лицензии; клиенты и кто отстал; ход задач; что делать
+    дальше (hints — по порядку выпуска). С него начинать «почему клиент не
+    обновился»: чаще всего архив не пересобран и клиенту раздаётся старая версия.
+    panel — мастер; по умолчанию отмеченный на хабе (nexus-mcp-panels master).
+    """
+    try:
+        name = _master_panel(panel)
+        d = await _master_overview(name)
+    except (panel_api.PanelError, panels.PanelConfigError) as e:
+        return _err(e)
+    clients = d.get("clients") or {}
+    items = [{k: c.get(k) for k in ("id", "owner", "active", "version", "behind_image",
+                                    "update_requested", "silent_hours")}
+             for c in clients.get("items") or []]
+    jobs = {k: {"state": (j.get("progress") or {}).get("state"),
+                "stage": (j.get("progress") or {}).get("stage_title"),
+                "percent": (j.get("progress") or {}).get("percent"),
+                "error": (j.get("progress") or {}).get("error")}
+            for k, j in (d.get("jobs") or {}).items()}
+    return {"ok": True, "panel": name, "brain": d.get("brain"), "code": d.get("code"),
+            "image": d.get("image"), "clients": {**{k: clients.get(k) for k in ("total", "active", "behind")},
+                                                 "items": items},
+            "jobs": jobs, "busy": d.get("busy"), "hints": d.get("hints")}
+
+
+@mcp.tool()
+async def master_job(kind: str, notify_clients: bool = False, confirm: bool = False, panel: str = "") -> dict:
+    """Задача мастера brain — только по просьбе человека.
+
+    kind: brain | frontend | build | release (что делает каждая — в отказе с
+    неизвестным kind). notify_clients=true (build, release) — после сборки
+    архива сразу поставить клиентам «обновись» (только отставшим от архива).
+    Без confirm — предпросмотр с текущими версиями, с confirm=true — запуск.
+    Ход — master_job_status(kind). Пока задача идёт, вторую мастер не примет.
+    Нужен NEXUS_ALLOW_ACTIONS=1.
+    """
+    if kind not in MASTER_JOBS:
+        return {"ok": False, "error": "unknown_kind",
+                "detail": "; ".join(f"{k} — {v}" for k, v in MASTER_JOBS.items())}
+    if off := _actions_off():
+        return off
+    try:
+        name = _master_panel(panel)
+        if not confirm:
+            d = await _master_overview(name)
+            image = d.get("image") or {}
+            return {"ok": True, "preview": True, "panel": name, "kind": kind, "what": MASTER_JOBS[kind],
+                    "notify_clients": notify_clients and kind in ("build", "release"),
+                    "brain": (d.get("brain") or {}).get("version"),
+                    "code": (d.get("code") or {}).get("version"),
+                    "image": image.get("version") if image.get("exists") else None,
+                    "busy": d.get("busy"), "hints": d.get("hints"),
+                    "next": "перескажите человеку, что произойдёт; согласится — тот же вызов с confirm=true"}
+        data = await panel_api.request("POST", f"{MASTER}/jobs/{kind}", None, 60.0, name,
+                                       body={"notify_clients": bool(notify_clients)})
+    except (panel_api.PanelError, panels.PanelConfigError) as e:
+        if confirm:
+            audit.record("master_job", {"kind": kind, "panel": panel}, False, str(e))
+        return _err(e)
+    audit.record("master_job", {"kind": kind, "notify_clients": notify_clients, "panel": name}, True, "")
+    return {"ok": True, "panel": name, "kind": kind, "started": data,
+            "next": f"ход — master_job_status(kind=\"{kind}\"); brain мастера посреди задачи перезапускается "
+                    "и 20–60 с не отвечает — это не ошибка"}
+
+
+@mcp.tool()
+async def master_job_status(kind: str, panel: str = "") -> dict:
+    """Ход задачи мастера: этап, процент, ошибка и хвост лога текущего запуска.
+    kind: brain | frontend | build | release."""
+    if kind not in MASTER_JOBS:
+        return {"ok": False, "error": "unknown_kind", "detail": f"есть: {', '.join(MASTER_JOBS)}"}
+    try:
+        name = _master_panel(panel)
+        d = await panel_api.request("GET", f"{MASTER}/jobs/{kind}", None, 30.0, name)
+    except (panel_api.PanelError, panels.PanelConfigError) as e:
+        return _err(e)
+    return {"ok": True, "panel": name, "kind": kind, "running": d.get("running"),
+            "progress": d.get("progress"), "log_tail": _tail(d.get("logs"))}
+
+
+@mcp.tool()
+async def master_clients_update(ids: list[int] | None = None, only_behind: bool = True,
+                                confirm: bool = False, panel: str = "") -> dict:
+    """Разослать клиентам лицензии «обновись» — только по просьбе человека.
+    Клиент заберёт архив образов мастера на проверке лицензии (до 30 мин) и
+    обновится до ВЕРСИИ АРХИВА — если он старый, сначала master_job(build).
+    ids — id клиентов из master_status (пусто — все активные); only_behind —
+    только отставшим от архива. Без confirm — кого заденет; с confirm=true — выполнить.
+    """
+    if off := _actions_off():
+        return off
+    try:
+        name = _master_panel(panel)
+        if not confirm:
+            d = await _master_overview(name)
+            image = d.get("image") or {}
+            target = image.get("version") if image.get("exists") else None
+            items = (d.get("clients") or {}).get("items") or []
+            chosen = [c for c in items if c.get("active") and (not ids or c.get("id") in ids)
+                      and (not only_behind or not target or c.get("behind_image"))]
+            return {"ok": True, "preview": True, "panel": name, "target": target,
+                    "clients": [{"id": c["id"], "owner": c["owner"], "version": c.get("version")} for c in chosen],
+                    "warning": None if target else "архива нет или версия его неизвестна — сначала master_job(build)",
+                    "next": "перескажите, кого заденет; согласится — тот же вызов с confirm=true"}
+        data = await panel_api.request("POST", f"{MASTER}/clients/update", None, 30.0, name,
+                                       body={"ids": ids or None, "only_behind": only_behind})
+    except (panel_api.PanelError, panels.PanelConfigError) as e:
+        return _err(e)
+    audit.record("master_clients_update", {"ids": ids, "only_behind": only_behind, "panel": name}, True,
+                 f"marked={len(data.get('marked') or [])}")
+    return {"ok": True, "panel": name, **data}
+
+
+@mcp.tool()
+async def panel_update(panel: str, confirm: bool = False) -> dict:
+    """Обновить панель клиента лицензии сейчас — только по просьбе человека.
+    Панель скачает архив образов мастера и пересоздаст контейнеры (3–10 мин,
+    панель 20–60 с не отвечает). Встанет ВЕРСИЯ АРХИВА мастера: сначала
+    master_status — не старый ли он. Мастер так не обновляется — master_job.
+    Без confirm — текущая и ожидаемая версия; с confirm=true — запуск. Ход —
+    panel_get(path="/api/v1/admin/system/update/status").
+    """
+    if off := _actions_off():
+        return off
+    try:
+        versions = await panel_api.request("GET", "/api/v1/admin/system/versions", None, 60.0, panel)
+        have = ((versions or {}).get("brain") or {}).get("version")
+        target = None
+        m = panels.master()
+        if m is not None and m["name"] != panel:
+            try:
+                img = (await _master_overview(m["name"])).get("image") or {}
+                target = img.get("version") if img.get("exists") else None
+            except panel_api.PanelError:
+                target = None
+        if not confirm:
+            note = None
+            if have and target and have == target:
+                note = f"панель уже на версии архива мастера v{target} — обновление её только перезапустит"
+            elif target is None:
+                note = "версия архива мастера неизвестна (мастер не отмечен на хабе или архив без паспорта)"
+            return {"ok": True, "preview": True, "panel": panel, "version": have, "target": target,
+                    "note": note,
+                    "next": "перескажите; согласится — тот же вызов с confirm=true"}
+        data = await panel_api.request("POST", "/api/v1/admin/system/update", None, 60.0, panel)
+    except (panel_api.PanelError, panels.PanelConfigError) as e:
+        return _err(e)
+    audit.record("panel_update", {"panel": panel, "from": have, "to": target}, True, "")
+    return {"ok": True, "panel": panel, "from": have, "to": target, "started": data,
+            "next": "ход — panel_get(path=\"/api/v1/admin/system/update/status\")"}
+
+
 # ── Действия ───────────────────────────────────────────────────────────────
 
 ACTIONS = ("restart", "set_brain_url", "update_agent", "use_relay")
