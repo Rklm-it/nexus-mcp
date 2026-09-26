@@ -596,7 +596,102 @@ def test_openwrt_installer_refuses_ram_mode_without_memory(tmp_path):
     root, env, log, src = _openwrt(tmp_path, free_kb=9216, mem_kb=50000, python_ok=False)
     r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
     assert r.returncode != 0 and "ОЗУ" in r.stderr
-    assert not log.exists() or "install" not in log.read_text(encoding="utf-8")
+    calls = log.read_text(encoding="utf-8")
+    assert "opkg install" not in calls and "nexuspy install" not in calls
+
+
+_LISTS = """Package: python3-light
+Version: 3.11.14-r1
+Depends: libc, python3-base, libbz2, zlib
+Installed-Size: 3000000
+
+Package: python3-base
+Depends: libc, libpython3-3.11
+Installed-Size: 500000
+
+Package: libpython3-3.11
+Depends: libc, libpthread, zlib
+Installed-Size: 2000000
+
+Package: libbz2-1.0
+Provides: libbz2
+Depends: libc
+Installed-Size: 60000
+
+Package: python3-openssl
+Depends: libc, python3-light, libopenssl3 (>= 3.0), ca-certs | ca-bundle
+Installed-Size: 200000
+
+Package: libopenssl3
+Depends: libc
+Installed-Size: 1800000
+
+Package: python3-urllib
+Depends: libc, python3-light, python3-email
+Installed-Size: 150000
+
+Package: python3-email
+Depends: libc, python3-light
+Installed-Size: 400000
+
+Package: python3-codecs
+Depends: libc, python3-light
+Installed-Size: 1900000
+
+Package: python3-logging
+Depends: libc, python3-light
+Installed-Size: 100000
+
+Package: ca-bundle
+Installed-Size: 230000
+"""
+
+
+def _with_lists(root, bins, log, installed):
+    (root / "var/opkg-lists").mkdir(parents=True)
+    (root / "var/opkg-lists/openwrt_packages").write_text(_LISTS)
+    (root / "var/opkg-lists/openwrt_packages.sig").write_text("junk")
+    listing = "\\n".join(f"{n} - 1" for n in installed)
+    mark = root / "python-installed"
+    _stub(bins, "opkg", f'echo "opkg $*" >> {log}; [ "$1" = list-installed ] && printf "{listing}\\n"; '
+                        f'case "$*" in *install\\ python3*) touch {mark};; esac; exit 0')
+    # python3 «появляется» только после opkg install
+    real_py = subprocess.run(["sh", "-c", "command -v python3"], capture_output=True, text=True).stdout.strip()
+    _stub(bins, "python3", f'[ -f {mark} ] && exec {real_py} "$@"; echo "нет модулей: ssl"; exit 1')
+
+
+def test_openwrt_installer_counts_real_package_size(tmp_path):
+    """Живой случай: 9 МБ флеша, 59 МБ ОЗУ. Размер — по спискам opkg (без уже
+    стоящих libc, zlib, ca-bundle; libbz2 — через Provides), а не оценкой
+    12 МБ: 10 МБ на флеш с запасом не влезают, а в ОЗУ (10 + 40) — да."""
+    root, env, log, src = _openwrt(tmp_path, free_kb=9216, mem_kb=60416)
+    _with_lists(root, tmp_path / "bin", log, ["libc", "libpthread", "zlib", "ca-bundle", "ca-certs"])
+    r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
+    assert r.returncode == 0, r.stdout + r.stderr
+    # 3000000+500000+2000000+60000+200000+1800000+150000+400000+1900000+100000 = 10110000 Б
+    assert "python3 с модулями: 10 МБ (по спискам opkg)" in r.stdout
+    calls = log.read_text(encoding="utf-8")
+    assert "-d nexuspy install python3-light" in calls
+
+
+def test_openwrt_installer_prefers_flash_when_it_fits(tmp_path):
+    root, env, log, src = _openwrt(tmp_path, free_kb=12000, mem_kb=60416)
+    _with_lists(root, tmp_path / "bin", log, ["libc", "libpthread", "zlib", "ca-bundle"])
+    r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = log.read_text(encoding="utf-8")
+    assert "opkg install python3-light" in calls and "nexuspy" not in calls
+
+
+def test_openwrt_installer_ram_threshold_follows_real_size(tmp_path):
+    root, env, log, src = _openwrt(tmp_path, free_kb=4096, mem_kb=60416)
+    _with_lists(root, tmp_path / "bin", log, ["libc", "libpthread", "zlib", "ca-bundle", "libopenssl3",
+                                               "libbz2-1.0"])
+    r = _run_installer(env, "--hub", "https://hub.example", "--token", "t", "--src", f"file://{src}")
+    assert r.returncode == 0, r.stdout + r.stderr
+    # без libopenssl3 и libbz2: 8250000 Б → 8 МБ; 8 + 40 запаса ≤ 59 МБ ОЗУ
+    assert "python3 с модулями: 8 МБ" in r.stdout
+    assert "-d nexuspy install" in log.read_text(encoding="utf-8")
 
 
 def test_openwrt_installer_rejects_bad_args_and_removes(tmp_path):

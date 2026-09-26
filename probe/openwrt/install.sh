@@ -39,10 +39,13 @@ ROOT="${NEXUS_PROBE_ROOT:-}"
 DIR="$ROOT/usr/share/nexus-probe"
 INIT="$ROOT/etc/init.d/nexus-probe"
 CFG="$ROOT/etc/config/nexus-probe"
-# Флеш под python3 и модули; меньше — установка не влезет и оставит полпакета.
+# Размер python3 с модулями считается по спискам opkg (pkg_need_kb); это —
+# оценка, если посчитать не вышло. Меньше — установка не влезет и оставит полпакета.
 NEED_FLASH_KB=12000
-# python3 в ОЗУ: сам python (~11 МБ в tmpfs) + запас на пробник и xray.
-NEED_RAM_KB=100000
+# Флеш не заполняем в ноль: без места ломается сохранение настроек роутера.
+FLASH_RESERVE_KB=1024
+# python3 в ОЗУ: сам python (tmpfs) + этот запас на работу пробника и роутера.
+RAM_RESERVE_KB=40960
 PY_TMP="$ROOT/tmp/nexus-py"
 # unicodedata (нужен encodings.idna → ssl) живёт в python3-codecs: отдельного
 # python3-unicodedata в OpenWrt нет, и opkg из-за него отказал бы целиком.
@@ -128,31 +131,81 @@ if missing:
 PY
 }
 
+# Сколько КБ займут $PKGS с зависимостями, которых на роутере ещё нет —
+# по Installed-Size из списков opkg (после opkg update). Пусто — не вышло.
+pkg_need_kb() {
+    [ "$PM" = opkg ] || return 1
+    {
+        opkg list-installed 2>/dev/null | awk '{print "I " $1}'
+        for f in "$ROOT"/var/opkg-lists/*; do
+            case "$f" in *.sig) continue ;; esac
+            [ -f "$f" ] || continue
+            gunzip -c "$f" 2>/dev/null || cat "$f"
+        done
+    } | awk -v want="$PKGS" '
+        /^I / { inst[$2] = 1; next }
+        /^Package: / { p = $2; next }
+        /^Provides: / { n = split(substr($0, 11), a, /, */)
+                        for (i = 1; i <= n; i++) { sub(/[ (].*/, "", a[i]); if (!(a[i] in prov)) prov[a[i]] = p }
+                        next }
+        /^Depends: / { if (!(p in dep)) dep[p] = substr($0, 10); next }
+        /^Installed-Size: / { if (!(p in size)) size[p] = $2; next }
+        function have(x) { return (x in inst) || ((x in prov) && (prov[x] in inst)) }
+        END {
+            tail = split(want, q, " "); head = 1; total = 0
+            while (head <= tail) {
+                x = q[head++]
+                if (!(x in size) && (x in prov)) x = prov[x]
+                if ((x in seen) || have(x)) continue
+                seen[x] = 1
+                if (!(x in size)) exit 1          # пакета нет в списках — не угадываем
+                total += size[x]
+                m = split(dep[x], d, /, */)
+                for (i = 1; i <= m; i++) {
+                    k = split(d[i], alt, / *\| */); pick = ""; ok = 0
+                    for (j = 1; j <= k; j++) {
+                        nm = alt[j]; sub(/ *\(.*/, "", nm); gsub(/ /, "", nm)
+                        if (nm == "") continue
+                        if (have(nm)) { ok = 1; break }
+                        if (pick == "") pick = nm
+                    }
+                    if (!ok && pick != "") q[++tail] = pick
+                }
+            }
+            printf "%d\n", (total + 1023) / 1024
+        }'
+}
+
 if [ "$PYMODE" != tmp ] && command -v python3 >/dev/null 2>&1 && py_check >/dev/null 2>&1; then
     say "python3 уже есть и подходит: $(python3 --version 2>&1)"
 elif [ "$PYMODE" != flash ] && [ -x "$PY_TMP/usr/bin/python3" ] && PY_DEST="$PY_TMP" && py_check >/dev/null 2>&1; then
     say "python3 уже есть в ОЗУ ($PY_DEST): $(py --version 2>&1)"
 else
     PY_DEST=""
+    say "обновляю список пакетов ($PM)…"
+    pm_update >/tmp/nexus-probe-pm.log 2>&1 || { tail -5 /tmp/nexus-probe-pm.log >&2; die "$PM update не прошёл — есть ли интернет у роутера?"; }
+    need_kb="$(pkg_need_kb 2>/dev/null)" || need_kb=""
+    case "$need_kb" in ''|*[!0-9]*) need_kb="$NEED_FLASH_KB"; how="оценка" ;; *) how="по спискам $PM" ;; esac
     free_kb="$(df -k "$ROOT/overlay" 2>/dev/null | awk 'NR==2 {print $4}')"
+    mem_kb="$(awk '/^MemAvailable:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null)"
+    say "python3 с модулями: $(( (need_kb + 1023) / 1024 )) МБ ($how); свободно: флеш ${free_kb:+$((free_kb / 1024)) МБ}${free_kb:-?}, ОЗУ ${mem_kb:+$((mem_kb / 1024)) МБ}${mem_kb:-?}"
     short=0
-    [ -n "$free_kb" ] && [ "$free_kb" -lt "$NEED_FLASH_KB" ] && short=1
+    [ -n "$free_kb" ] && [ "$free_kb" -lt $((need_kb + FLASH_RESERVE_KB)) ] && short=1
     if [ "$PYMODE" = flash ] && [ "$short" = 1 ]; then
-        die "на флеше свободно $((free_kb / 1024)) МБ, а python3 с модулями — около $((NEED_FLASH_KB / 1024)) МБ. Освободите место (opkg remove …) или поставьте python3 в ОЗУ: --python tmp"
+        die "на флеше не хватает места: нужно $(( (need_kb + FLASH_RESERVE_KB) / 1024 )) МБ с запасом. Освободите место (opkg remove …) или поставьте python3 в ОЗУ: --python tmp"
     fi
     if [ "$PYMODE" = tmp ] || [ "$short" = 1 ]; then
-        [ "$short" = 1 ] && say "на флеше свободно $((free_kb / 1024)) МБ, python3 с модулями — около $((NEED_FLASH_KB / 1024)) МБ: ставлю его в ОЗУ"
+        [ "$short" = 1 ] && say "на флеш не влезает — ставлю python3 в ОЗУ"
         # В ОЗУ ставит только opkg (--add-dest); apk так не умеет.
-        [ "$PM" = opkg ] || die "python3 в ОЗУ ставится только через opkg, а здесь $PM. Освободите на флеше $((NEED_FLASH_KB / 1024)) МБ и повторите"
-        mem_kb="$(awk '/^MemAvailable:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null)"
-        [ -n "$mem_kb" ] && [ "$mem_kb" -ge "$NEED_RAM_KB" ] \
-            || die "свободно ${mem_kb:+$((mem_kb / 1024)) МБ }ОЗУ, для python3 в ОЗУ нужно $((NEED_RAM_KB / 1024)) МБ. Освободите на флеше $((NEED_FLASH_KB / 1024)) МБ (opkg remove …) и повторите"
+        [ "$PM" = opkg ] || die "python3 в ОЗУ ставится только через opkg, а здесь $PM. Освободите на флеше $(( (need_kb + FLASH_RESERVE_KB) / 1024 )) МБ и повторите"
+        need_ram=$((need_kb + RAM_RESERVE_KB))
+        [ -n "$mem_kb" ] && [ "$mem_kb" -ge "$need_ram" ] \
+            || die "в ОЗУ не хватает места: свободно ${mem_kb:+$((mem_kb / 1024)) МБ}${mem_kb:-?}, а python3 ($(( (need_kb + 1023) / 1024 )) МБ) с запасом на работу роутера — $((need_ram / 1024)) МБ. Освободите на флеше $(( (need_kb + FLASH_RESERVE_KB) / 1024 )) МБ (opkg remove …) и повторите"
         PY_DEST="$PY_TMP"
         pm_add() { opkg --add-dest "nexuspy:$PY_DEST" -d nexuspy install "$@"; }
         say "python3 будет в ОЗУ ($PY_DEST): флеш не тратится, после перезагрузки роутера служба поставит его заново сама (нужен интернет, ~1 мин)"
     fi
     say "ставлю python3 ($PM): $PKGS"
-    pm_update >/tmp/nexus-probe-pm.log 2>&1 || { tail -5 /tmp/nexus-probe-pm.log >&2; die "$PM update не прошёл — есть ли интернет у роутера?"; }
     # shellcheck disable=SC2086
     pm_add $PKGS >>/tmp/nexus-probe-pm.log 2>&1 || { tail -8 /tmp/nexus-probe-pm.log >&2; die "пакеты не встали (лог: /tmp/nexus-probe-pm.log)"; }
     why="$(py_check)" || die "python3 встал, но не хватает модулей: $why"
