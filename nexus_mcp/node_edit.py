@@ -1,5 +1,5 @@
 """Правка конфигурации ноды через её панель: маршрутизация, relay, настройки
-ноды, инбаунды — то же, что админ делает на странице сервера.
+ноды, инбаунды, Cloudflare-фронт — то же, что админ делает на странице сервера.
 
 Порядок всегда один:
 1. `plan()` читает текущее состояние, собирает запросы к панели и ОБРАТНЫЕ
@@ -54,6 +54,8 @@ OPS = {
     "inbound_push": "inbound=<тег|id> — переприменить на ноду как есть",
     "inbound_order": "inbounds=[теги или id по порядку в подписке]",
     "push_network": "применить DNS/маршрутизацию/relay из панели на ноду",
+    "cf_front": "Cloudflare-фронт ноды: enable=true|false, cf_only=true|false (необязательно) — "
+                "включение сразу проверяет путь через Cloudflare",
     "batch": "несколько правок ОДНОЙ ноды одним подтверждением: ops=[{op, args}, …] — "
              "например relay_add → swap_outbound → relay_remove",
     "rollback": "edit=<id правки> — вернуть как было",
@@ -394,6 +396,122 @@ async def _plan_push_network(nd: _Node, args: dict) -> dict:
             "notes": ["xray ноды перезапустится (секунды обрыва у юзеров)"]}
 
 
+CF_BASE = "/api/v1/admin/cloudflare"
+CF_LINE = "VLESS WS · CF"
+
+
+def _cf_slug(text: str) -> str:
+    """Как cf_front._slug панели: имя фронта `<нода>.<зона>`."""
+    return re.sub(r"[^a-z0-9-]+", "-", (text or "").lower()).strip("-")[:40].strip("-")
+
+
+async def _node_users(nd: _Node) -> int | None:
+    """Юзеров с доступом к ноде (active_users панели). None — не посчиталось."""
+    try:
+        items = await panel_api.read_raw("/api/v1/servers", nd.panel,
+                                         params={"with_stats": "true", "with_online": "false"})
+    except panel_api.PanelError:
+        return None
+    hit = next((s for s in items or [] if isinstance(s, dict) and str(s.get("id")) == nd.id), None)
+    return hit.get("active_users") if hit else None
+
+
+async def _plan_cf_front(nd: _Node, args: dict) -> dict:
+    extra = sorted(set(args) - {"enable", "cf_only"})
+    if extra:
+        raise EditError(f"cf_front: поля {', '.join(extra)} не бывает. Можно: enable, cf_only "
+                        f"(токен и домен Cloudflare задаются только в панели)")
+    enable, cf_only = args.get("enable"), args.get("cf_only")
+    if not isinstance(enable, bool):
+        raise EditError("cf_front: enable=true|false")
+    if cf_only is not None and not isinstance(cf_only, bool):
+        raise EditError("cf_front: cf_only=true|false")
+    base = f"{CF_BASE}/servers/{nd.id}"
+    try:
+        settings = await panel_api.read_raw(f"{CF_BASE}/settings", nd.panel) or {}
+        st = await panel_api.read_raw(base, nd.panel) or {}
+    except panel_api.PanelError as e:
+        raise EditError(f"Cloudflare-фронт в панели не читается: {e}") from e
+    enabled = bool(st.get("enabled"))
+    old_cf = bool(st.get("cf_only", nd.server.get("cf_only")))
+    configured = bool(settings.get("configured"))
+    steps, undo, lines, clients = [], [], [], []
+    notes = ["через Cloudflare едет только WS; Cloudflare в РФ местами режут — «только через CF» "
+             "советовать, когда строка «· CF» прошла с домашних пробников (node_diagnose)"]
+
+    if not enable:
+        if cf_only:
+            raise EditError("cf_front: cf_only=true без фронта убрал бы ноду из подписки целиком")
+        if not enabled:
+            raise EditError(f"на {nd.name} Cloudflare-фронт не включён — выключать нечего")
+        host, port = st.get("hostname") or "?", st.get("port")
+        if old_cf:
+            # Отдельным шагом только ради отката: disable снимает cf_only и сам.
+            steps.append(_step("PATCH", nd.base, {"cf_only": False}, f"{nd.name}: снять «только через CF»"))
+            undo.append(_step("PATCH", nd.base, {"cf_only": True}, f"вернуть «только через CF» на {nd.name}"))
+            lines.append("cf_only: true → false")
+            clients.append("ссылки с IP ноды вернутся в подписку")
+        steps.append(_step("POST", f"{base}/disable", None, f"{nd.name}: снять Cloudflare-фронт {host}"))
+        undo.append(_step("POST", f"{base}/enable", None, f"включить Cloudflare-фронт на {nd.name} заново"))
+        lines.append(f"снять фронт {host}: инбаунд vless-cf на ноде, замок порта {port}, DNS-запись")
+        users = await _node_users(nd)
+        clients.append(f"строка «{CF_LINE}» пропадёт из подписок {users if users is not None else '?'} "
+                       f"юзеров ноды")
+        if not configured:
+            notes.append(f"токен/домен Cloudflare в панели не заданы — DNS-запись {host} панель не "
+                         f"удалит, её снять руками в Cloudflare")
+        notes.append("откат включит фронт заново (имя — по имени ноды)")
+        return {"steps": steps, "undo": undo, "lines": lines, "clients": clients, "notes": notes}
+
+    if not configured:
+        miss = [what for key, what in (("api_token", "токен API"), ("zone", "домен (зона)"))
+                if not settings.get(key)]
+        raise EditError(f"Cloudflare в панели не настроен (нет: {', '.join(miss) or 'токена или домена'}) — "
+                        f"сначала панель → Настройки → Cloudflare. Токен хаб не принимает и не передаёт")
+    zone = settings.get("zone") or ""
+    if enabled:
+        host, port = st.get("hostname") or "?", st.get("port")
+        lines.append(f"фронт уже включён: {host}, порт {port}")
+    else:
+        host = f"{_cf_slug(nd.server.get('name') or nd.name) or 'node'}.{zone}"
+        port = settings.get("port")
+        # Порт, DNS-запись и инбаунд на ноде остаются и при отказе «Файрвол» —
+        # откат (disable) нужен и тогда: undo_on_fail.
+        steps.append({**_step("POST", f"{base}/enable", None, f"{nd.name}: включить Cloudflare-фронт {host}"),
+                      "undo_on_fail": True, "report": "cf_front",
+                      # DNS, инбаунд на ноде, файрвол и до ~1 мин проверки пути.
+                      "timeout": 180.0})
+        undo.append(_step("POST", f"{base}/disable", None, f"снять Cloudflare-фронт с {nd.name}"))
+        lines += [f"имя фронта: {host} (если занято другой нодой — панель добавит хвост из id)",
+                  f"порт {port}: открыт только сетям Cloudflare",
+                  "DNS-запись в Cloudflare, инбаунд vless-cf на ноде, затем проверка пути"]
+        users = await _node_users(nd)
+        clients.append(f"{users if users is not None else '?'} юзеров ноды получат новую строку "
+                       f"«{CF_LINE}» при обновлении подписки")
+    change_cf = cf_only is not None and cf_only != old_cf
+    verify = {**_step("POST", f"{base}/verify", None, f"{nd.name}: проверить путь через Cloudflare"),
+              "report": "cf_check"}
+    if change_cf and cf_only:
+        # «Только через CF» при непрошедшей проверке оставил бы юзерам одну
+        # неработающую строку — дальше проверки не идём.
+        verify["require_ok"] = True
+    steps.append(verify)
+    undo.append(None)
+    if change_cf:
+        steps.append(_step("PATCH", nd.base, {"cf_only": cf_only},
+                           f"{nd.name}: «только через CF» {'вкл' if cf_only else 'выкл'}"))
+        undo.append(_step("PATCH", nd.base, {"cf_only": old_cf}, f"вернуть cf_only={old_cf} на {nd.name}"))
+        lines.append(f"cf_only: {str(old_cf).lower()} → {str(cf_only).lower()}")
+        clients.append(f"ВНИМАНИЕ: из подписки уйдут ВСЕ ссылки с IP ноды (Reality, Hysteria2, SS…) — у юзеров "
+                       f"ноды останется только «{CF_LINE}». Включится, только если проверка пути прошла"
+                       if cf_only else "ссылки с IP ноды вернутся в подписку")
+    elif enabled:
+        lines.append("только повторная проверка пути" + (" (cf_only уже такой)" if cf_only is not None else ""))
+    notes.append("проверка не прошла — чаще NS/DNS ещё не доехали: повторить тем же вызовом позже "
+                 "(фронт включён → только проверка)")
+    return {"steps": steps, "undo": undo, "lines": lines, "clients": clients, "notes": notes}
+
+
 def _simulate(nd: _Node, op: str, p: dict) -> None:
     """Следующая операция пакета видит ноду такой, какой её оставит эта."""
     for st in p["steps"]:
@@ -443,11 +561,17 @@ _PLANNERS = {
     "inbound_update": _plan_inbound_update, "inbound_create": _plan_inbound_create,
     "inbound_delete": _plan_inbound_delete, "inbound_push": _plan_inbound_push,
     "inbound_order": _plan_inbound_order, "push_network": _plan_push_network,
-    "batch": _plan_batch,
+    "cf_front": _plan_cf_front, "batch": _plan_batch,
 }
 
 
 # ── План, применение, откат ────────────────────────────────────────────────
+
+def _undo_upto(rec: dict) -> int:
+    """Сколько первых шагов откатывать: прошедшие плюс упавший с undo_on_fail
+    (панель отказала, но часть сделанного на ноде и в Cloudflare осталась)."""
+    return max(rec.get("done", 0), rec.get("undo_upto", 0))
+
 
 def _load_edit(edit_id: str) -> dict:
     if not re.fullmatch(r"[0-9a-f]{12}", edit_id or ""):
@@ -473,7 +597,7 @@ async def _plan_rollback(args: dict) -> tuple[dict, dict]:
         raise EditError("откат отката не делается — сделайте правку заново")
     if rec.get("rolled_back"):
         raise EditError(f"правка {rec['id']} уже откачена ({rec['rolled_back']})")
-    done = rec.get("done", 0)
+    done = _undo_upto(rec)
     if not done:
         raise EditError(f"у правки {rec['id']} не прошёл ни один шаг — откатывать нечего")
     undo = [u for i, u in enumerate(rec["undo"]) if i < done and u]
@@ -558,13 +682,28 @@ async def apply(p: dict) -> dict:
            "titles": [{"title": s.get("title")} for s in p["steps"]], "plan_hash": p["plan_hash"]}
     rollback_of = p["args"].get("edit") if p["op"] == "rollback" else None
     _save_edit(rec)
-    results, error = [], ""
+    results, error, extra = [], "", {}
     for s in p["steps"]:
         try:
             step = await _resolve(s, p["panel"]) if s.get("resolve") else s
-            res = await panel_api.write(step["method"], step["path"], step.get("body"), panel_name=p["panel"])
+            res = await panel_api.write(step["method"], step["path"], step.get("body"),
+                                        timeout=s.get("timeout") or 120.0, panel_name=p["panel"])
         except (panel_api.PanelError, EditError) as e:
             error = str(e)
+            data = getattr(e, "data", None)
+            if isinstance(data, dict):
+                # Отказ с разбором (Cloudflare: шаг и пройденные шаги) — как есть.
+                if isinstance(data.get("detail"), str):
+                    error = f"панель ответила {e.status}: {data['detail']}"
+                extra.update(panel_api.redact({k: data[k] for k in ("step", "steps") if k in data}))
+            if s.get("undo_on_fail"):
+                rec["undo_upto"] = rec["done"] + 1
+            break
+        if s.get("report"):
+            extra[s["report"]] = panel_api.redact(res)
+        if s.get("require_ok") and isinstance(res, dict) and res.get("ok") is False:
+            error = f"{s.get('title') or 'шаг'}: не прошло ({res.get('error') or res.get('code') or 'без причины'}) — " \
+                    f"дальше не иду"
             break
         rec["done"] += 1
         _save_edit(rec)
@@ -577,10 +716,10 @@ async def apply(p: dict) -> dict:
         _save_edit(orig)
     total = len(p["steps"])
     out = {"ok": not error, "edit": rec["id"], "node": p["node"], "op": p["op"],
-           "done_steps": f"{rec['done']} из {total}", "results": results}
+           "done_steps": f"{rec['done']} из {total}", "results": results, **extra}
     if error:
         out["detail"] = f"шаг {rec['done'] + 1} из {total} не прошёл: {error}"
-        if rec["done"] and any(rec["undo"][:rec["done"]]):
+        if _undo_upto(rec) and any(rec["undo"][:_undo_upto(rec)]):
             out["rollback"] = f"node_edit(op='rollback', args={{'edit': '{rec['id']}'}}) вернёт прошедшие шаги"
     elif any(rec["undo"]):
         out["rollback"] = f"node_edit(op='rollback', args={{'edit': '{rec['id']}'}})"
@@ -592,7 +731,8 @@ def _short_result(res: Any) -> Any:
     res = panel_api.redact(res)
     if isinstance(res, dict):
         keep = {k: res[k] for k in ("status", "tag", "name", "relay_server", "warning", "push_error",
-                                    "display_name", "listen_port", "is_enabled", "dns_settings")
+                                    "display_name", "listen_port", "is_enabled", "dns_settings",
+                                    "ok", "hostname", "port", "code", "error")
                 if k in res and res[k] not in (None, "")}
         return keep or {"ok": True}
     if isinstance(res, list):
@@ -610,5 +750,5 @@ def history(limit: int = 20) -> list[dict]:
         items.append({"edit": r["id"], "ts": r["ts"], "node": r["node"], "op": r["op"],
                       "args": r.get("args"), "done": r.get("done"), "error": r.get("error") or None,
                       "rolled_back": r.get("rolled_back"), "can_rollback": any(r.get("undo") or []) and
-                      r.get("op") != "rollback" and not r.get("rolled_back") and r.get("done", 0) > 0})
+                      r.get("op") != "rollback" and not r.get("rolled_back") and _undo_upto(r) > 0})
     return items

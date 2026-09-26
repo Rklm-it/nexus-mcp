@@ -59,6 +59,8 @@ WRITE_PATTERNS = [
     ("PATCH", rf"/api/v1/servers/{_U}/inbounds/{_U}"),
     ("DELETE", rf"/api/v1/servers/{_U}/inbounds/{_U}"),
     ("POST", rf"/api/v1/servers/{_U}/inbounds/{_U}/push"),
+    # Cloudflare-фронт ноды (vgx3d api/v1/admin/cloudflare.py).
+    ("POST", rf"/api/v1/admin/cloudflare/servers/{_U}/(enable|verify|disable)"),
 ]
 
 MAX_CHARS = 60_000
@@ -73,7 +75,14 @@ _NOT_SECRET = {"has_api_token", "token_type", "tokens_used", "token_count"}
 
 
 class PanelError(Exception):
-    pass
+    """status/data — код и разобранный JSON отказа панели, если он был: часть
+    ручек отдаёт в отказе не только detail (Cloudflare: шаг и пройденные шаги),
+    и это обязано доехать до человека целиком (инвариант 26)."""
+
+    def __init__(self, message: str, status: int | None = None, data: Any = None):
+        super().__init__(message)
+        self.status = status
+        self.data = data
 
 
 def _mask(value: Any) -> Any:
@@ -203,7 +212,12 @@ async def request(method: str, path: str, params: dict | None = None,
                     f"nexus-mcp-panels add {p['name']} <url> <токен> --gate <секрет>")
         elif r.status_code == 403:
             hint = " — токен не принят или фича выключена лицензией"
-        raise PanelError(f"панель {p['name']} ответила {r.status_code} на {method} {path}: {detail}{hint}")
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        raise PanelError(f"панель {p['name']} ответила {r.status_code} на {method} {path}: {detail}{hint}",
+                         r.status_code, data)
     if r.status_code == 204 or not r.content:
         return {} if raw else {"status": r.status_code}
     try:
@@ -237,9 +251,10 @@ async def write(method: str, path: str, body: Any = None, params: dict | None = 
                          body=body, raw=True)
 
 
-async def read_raw(path: str, panel_name: str = "", timeout: float = 30.0) -> Any:
+async def read_raw(path: str, panel_name: str = "", timeout: float = 30.0,
+                   params: dict | None = None) -> Any:
     """Чтение без маскировки — для снимка «как было». В модель не отдавать."""
-    return await request("GET", check_read_path(path), None, timeout, panel_name, raw=True)
+    return await request("GET", check_read_path(path), params, timeout, panel_name, raw=True)
 
 
 async def post_action(path: str, params: dict | None = None, timeout: float = 120.0,

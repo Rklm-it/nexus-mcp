@@ -143,7 +143,7 @@ python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ро�
 | `panel_get` | любая админская GET-ручка (`/api/v1/admin/*`, серверы, инбаунды, юзеры) |
 | `panel_action` | короткий список действий: проверка/перезапуск/обновление ноды, прогон центра состояния, пересинхронизация; только с флагом и `confirm=true` |
 | `node_action` | restart / set_brain_url / update_agent / use_relay (нода не достаёт до панели — ходит к ней через реле хаба); только при `NEXUS_ALLOW_ACTIONS=1` и `confirm=true` |
-| `node_edit` | правка конфигурации ноды через её панель: маршрутизация (`routing`, `swap_outbound`), relay (`relay_add`, `relay_remove`), настройки ноды (`settings`), инбаунды (`inbound_update/create/delete/push/order`), `push_network`, несколько шагов одним `batch`, откат `rollback`. Без `confirm` — план и `plan_hash`; применение — `confirm=true` с тем же `plan_hash` |
+| `node_edit` | правка конфигурации ноды через её панель: маршрутизация (`routing`, `swap_outbound`), relay (`relay_add`, `relay_remove`), настройки ноды (`settings`), инбаунды (`inbound_update/create/delete/push/order`), `push_network`, Cloudflare-фронт (`cf_front`: включить с проверкой пути / выключить, «только через CF»), несколько шагов одним `batch`, откат `rollback`. Без `confirm` — план и `plan_hash`; применение — `confirm=true` с тем же `plan_hash` |
 | `node_edits`, `action_status` | история правок (что откатывается); итог долгого действия |
 | `sim_probe`, `sim_vless`, `sim_geo` | проверки с SIM-карт операторов РФ, в т.ч. с белыми списками, и из городов РФ (bschekbot, платно: preview → `confirm=true` + `max_credits`, дневной потолок хаба) |
 | `sim_units`, `sim_account`, `sim_result`, `sim_cancel` | единицы оператор × округ × БС, баланс, результат и отмена долгой проверки |
@@ -163,7 +163,7 @@ python3 probe.py --hub https://mcp.example.ru --token <PROBE_TOKEN> --name ро�
   ключи Reality, пароли SS и Hysteria, `sub_token` в ссылках;
 - **публичные ручки панели** (подписка, вебхуки, бот) хабу закрыты. В панели он
   только читает админские ресурсы, а меняет лишь из списков `panel.ACTION_PATTERNS`
-  (действия) и `panel.WRITE_PATTERNS` (конфигурация ОДНОЙ ноды: маршрутизация,
+  (действия) и `panel.WRITE_PATTERNS` (конфигурация ОДНОЙ ноды: маршрутизация, Cloudflare-фронт,
   relay, инбаунды, настройки). Удалить ноду, юзера, платёж хаб не может;
 - **правка ноды (`node_edit`)** идёт планом: человек видит, что поменяется и кого
   из клиентов заденет, а применяется ровно этот план (`plan_hash`; нода изменилась

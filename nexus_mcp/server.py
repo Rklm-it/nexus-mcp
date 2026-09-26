@@ -58,7 +58,7 @@ panel=<имя>, а ноды называются «панель/имя».
    а не делать.
 
 Правка конфигурации ноды (node_edit) — маршрутизация, relay, настройки ноды,
-инбаунды — ТОЛЬКО по просьбе человека:
+инбаунды, Cloudflare-фронт (op="cf_front") — ТОЛЬКО по просьбе человека:
 1. вызов без confirm — бесплатный план: что поменяется, кого из клиентов заденет,
    plan_hash. План показать человеку своими словами.
 2. человек согласился — тот же вызов с confirm=true и plan_hash из плана.
@@ -69,9 +69,11 @@ op="batch". Каждая правка получает id; откат — op="ro
 панели они замаскированы, а маска вместо ключа ломает ноду — хаб такое отвергнет.
 
 IP ноды режется (payload_filtered / ip_unreachable) — первое средство панели:
-Cloudflare-фронт («Включить Cloudflare», VLESS+WS через Cloudflare). Если он
-включён, node_diagnose проверяет его адрес (cf_reachable / cf_blocked) и строку
-«· CF» сквозной проверкой отдельно от IP. «Только через CF» советовать, лишь когда
+Cloudflare-фронт («Включить Cloudflare», VLESS+WS через Cloudflare; с хаба —
+node_edit op="cf_front", args={"enable": true}: включение сразу проверяет путь,
+токен и домен задаются только в панели). Если он включён, node_diagnose
+проверяет его адрес (cf_reachable / cf_blocked) и строку «· CF» сквозной
+проверкой отдельно от IP. «Только через CF» советовать, лишь когда
 «· CF» прошла с домашних пробников: Cloudflare в РФ местами тоже режут.
 
 БЕЛЫЕ СПИСКИ: Белые списки операторов (на 25.09.2026): при включённом БС работают ТОЛЬКО CDN-ноды (российский CDN перед нодой, сейчас ru41s2-YA-CDN и ru42s2-tw-cdn). Остальные ноды — когда белые списки не действуют или клиент на Wi-Fi.
@@ -741,13 +743,16 @@ async def node_edit(node: str, op: str, args: dict | None = None, confirm: bool 
 
     op: routing | swap_outbound | settings | relay_add | relay_remove |
     inbound_update | inbound_create | inbound_delete | inbound_push |
-    inbound_order | push_network | batch | rollback (args — см. отказ с
-    неизвестным op, там список). Примеры:
+    inbound_order | push_network | cf_front | batch | rollback (args — см.
+    отказ с неизвестным op, там список). Примеры:
       swap_outbound  args={"from": "relay-00383c6f", "to": "relay-49341184"}
       relay_add      args={"via": "ger41s2"}          (mode=xray по умолчанию)
       relay_remove   args={"tag": "relay-00383c6f"}
       settings       args={"display_name": "#1 Обход"}
       inbound_update args={"inbound": "vless-xhttp-cdn", "changes": {"display_name": "…"}}
+      cf_front       args={"enable": true}              (Cloudflare-фронт + проверка пути)
+      cf_front       args={"enable": true, "cf_only": true}   (из подписки уйдут ссылки с IP ноды)
+      cf_front       args={"enable": false}
       batch          args={"ops": [{"op": "relay_add", "args": {...}}, {"op": "swap_outbound", ...}]}
       rollback       args={"edit": "<id правки>"}
     Без confirm — план (бесплатно, ничего не меняет) и plan_hash. С confirm=true

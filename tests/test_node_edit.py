@@ -30,7 +30,7 @@ class FakePanel:
     def __init__(self):
         self.servers = {
             YA: {"id": YA, "name": "ru41s2-YA-CDN", "display_name": "#1 Обход", "is_active": True,
-                 "warp_enabled": False,
+                 "warp_enabled": False, "cf_only": False,
                  "dns_settings": {"servers": ["8.8.8.8"], "final_outbound": "relay-00383c6f"},
                  "routing_rules": [copy.deepcopy(TG), copy.deepcopy(RU)], "custom_routes": None},
         }
@@ -47,12 +47,55 @@ class FakePanel:
                                           "password": "INBOUND-SECRET-9999"}}]}
         self.log = []
         self.n = 0
+        # Cloudflare-фронт (vgx3d api/v1/admin/cloudflare.py).
+        self.cf_settings = {"api_token": "✓ задано", "zone": "nexus-front.net", "port": 2087,
+                            "https_ports": [2053, 2083, 2087, 2096, 8443], "configured": True}
+        self.cf = {}                 # server_id → {"hostname", "port"}
+        self.cf_enable_fail = None   # тело 400 от enable
+        self.cf_verify_ok = True
+        self.active_users = {YA: 37}
+
+    def cloudflare(self, req, path, body):
+        if path == "/api/v1/admin/cloudflare/settings" and req.method == "GET":
+            return httpx.Response(200, json=self.cf_settings)
+        m = re.fullmatch(r"/api/v1/admin/cloudflare/servers/([0-9a-f-]{36})(/\w+)?", path)
+        if not m:
+            return httpx.Response(404, json={"detail": "Not Found"})
+        sid, act = m.group(1), m.group(2) or ""
+        srv, front = self.servers[sid], self.cf.get(sid)
+        if act == "" and req.method == "GET":
+            if not front:
+                return httpx.Response(200, json={"enabled": False, "cf_only": srv["cf_only"]})
+            return httpx.Response(200, json={"enabled": True, **front, "cf_only": srv["cf_only"]})
+        if act == "/enable" and req.method == "POST":
+            if self.cf_enable_fail:
+                return httpx.Response(400, json=self.cf_enable_fail)
+            self.cf[sid] = {"hostname": "ru41s2-ya-cdn.nexus-front.net", "port": 2087}
+            return httpx.Response(200, json={"ok": True, "hostname": self.cf[sid]["hostname"], "port": 2087,
+                                             "inbound_id": IB, "steps": [{"step": "DNS", "ok": True}]})
+        if act == "/verify" and req.method == "POST":
+            if not front:
+                return httpx.Response(409, json={"detail": "Cloudflare на этой ноде не включён"})
+            if self.cf_verify_ok:
+                return httpx.Response(200, json={"ok": True, "code": 101, "attempts": 1})
+            return httpx.Response(200, json={"ok": False, "code": 0, "error": "Cloudflare 522"})
+        if act == "/disable" and req.method == "POST":
+            self.cf.pop(sid, None)
+            srv["cf_only"] = False
+            return httpx.Response(200, json={"ok": True, "steps": []})
+        return httpx.Response(405, json={"detail": f"нет {req.method} {path}"})
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         path = req.url.path
         body = json.loads(req.content) if req.content else None
         self.log.append((req.method, path, body))
         m = re.fullmatch(r"/api/v1/servers/([0-9a-f-]{36})(/.*)?", path)
+        if path.startswith("/api/v1/admin/cloudflare/"):
+            return self.cloudflare(req, path, body)
+        if path == "/api/v1/servers" and req.method == "GET":
+            stats = req.url.params.get("with_stats") == "true"
+            return httpx.Response(200, json=[{**s, **({"active_users": self.active_users.get(i, 0)}
+                                                       if stats else {})} for i, s in self.servers.items()])
         m2 = re.fullmatch(r"/api/v1/admin/nodes/([0-9a-f-]{36})/relay-node", path)
         if m2 and req.method == "POST":
             sid = m2.group(1)
@@ -70,6 +113,8 @@ class FakePanel:
         if rest == "" and req.method == "GET":
             return httpx.Response(200, json=srv)
         if rest == "" and req.method == "PATCH":
+            if body.get("cf_only") and not srv["cf_only"] and sid not in self.cf:
+                return httpx.Response(409, json={"detail": "Сначала включите Cloudflare на этой ноде"})
             srv.update(body)
             return httpx.Response(200, json=srv)
         if rest == "/outbounds" and req.method == "GET":
@@ -311,6 +356,116 @@ def test_history_lists_edits(fake):
     assert h[0]["edit"] == r["edit"] and h[0]["can_rollback"] is True
 
 
+# ── Cloudflare-фронт ───────────────────────────────────────────────────────
+
+CF = f"/api/v1/admin/cloudflare/servers/{YA}"
+
+
+def test_cf_front_plan_writes_nothing_and_needs_its_own_hash(fake):
+    from nexus_mcp import server
+
+    args = {"enable": True, "cf_only": True}
+    pv = run(server.node_edit("ru41s2-YA-CDN", "cf_front", args))
+    assert pv["ok"] and pv["preview"], pv
+    assert writes(fake) == []                       # план не зовёт ни одного POST/PATCH
+    dump = json.dumps(pv, ensure_ascii=False)
+    assert "ru41s2-ya-cdn.nexus-front.net" in dump and "2087" in dump
+    assert any("37 юзеров" in c and "VLESS WS · CF" in c for c in pv["affects_clients"]), pv
+    assert any("уйдут ВСЕ ссылки с IP ноды" in c for c in pv["affects_clients"]), pv
+
+    # plan_hash другого плана (без cf_only) — отказ, в панель ничего не ушло.
+    other = run(server.node_edit("ru41s2-YA-CDN", "cf_front", {"enable": True}))["plan_hash"]
+    assert other != pv["plan_hash"]
+    r = run(server.node_edit("ru41s2-YA-CDN", "cf_front", args, confirm=True, plan_hash=other))
+    assert r["error"] == "plan_changed" and writes(fake) == []
+
+    r = run(server.node_edit("ru41s2-YA-CDN", "cf_front", args, confirm=True, plan_hash=pv["plan_hash"]))
+    assert r["ok"], r
+    assert writes(fake) == [("POST", f"{CF}/enable"), ("POST", f"{CF}/verify"),
+                            ("PATCH", f"/api/v1/servers/{YA}")]
+    assert r["cf_check"]["ok"] is True and r["cf_front"]["hostname"] == "ru41s2-ya-cdn.nexus-front.net"
+    assert fake.servers[YA]["cf_only"] is True
+
+    # Откат: сначала вернуть cf_only, потом снять фронт.
+    fake.log.clear()
+    pv2 = run(server.node_edit("", "rollback", {"edit": r["edit"]}))
+    r2 = run(server.node_edit("", "rollback", {"edit": r["edit"]}, confirm=True, plan_hash=pv2["plan_hash"]))
+    assert r2["ok"], r2
+    assert writes(fake) == [("PATCH", f"/api/v1/servers/{YA}"), ("POST", f"{CF}/disable")]
+    assert [b for m, _, b in fake.log if m == "PATCH"] == [{"cf_only": False}]
+    assert YA not in fake.cf
+
+
+def test_cf_front_refused_when_panel_not_configured(fake):
+    from nexus_mcp import server
+
+    fake.cf_settings.update(api_token="", configured=False)
+    r = run(server.node_edit("ru41s2-YA-CDN", "cf_front", {"enable": True}))
+    assert r["ok"] is False and "не настроен" in r["detail"] and "токен API" in r["detail"], r
+    assert writes(fake) == []
+
+
+def test_cf_front_refuses_token_in_args(fake):
+    msg = run(_plan("cf_front", {"enable": True, "api_token": "cf-secret"}))
+    assert "api_token" in msg
+
+
+def test_cf_front_enable_400_reaches_answer_with_step(fake):
+    from nexus_mcp import server
+
+    steps = [{"step": "DNS-запись", "ok": True, "detail": "ru41s2-ya-cdn.nexus-front.net → 217.18.62.16"},
+             {"step": "Файрвол", "ok": False, "detail": "нода не ответила: timeout"}]
+    fake.cf_enable_fail = {"detail": "Файрвол: нода не ответила: timeout", "step": "Файрвол", "steps": steps}
+    pv = run(server.node_edit("ru41s2-YA-CDN", "cf_front", {"enable": True}))
+    r = run(server.node_edit("ru41s2-YA-CDN", "cf_front", {"enable": True}, confirm=True,
+                             plan_hash=pv["plan_hash"]))
+    assert r["ok"] is False and r["step"] == "Файрвол" and r["steps"] == steps, r
+    assert "Файрвол: нода не ответила: timeout" in r["detail"]
+    assert writes(fake) == [("POST", f"{CF}/enable")]    # проверка после отказа не идёт
+    # На «Файрвол» панель оставляет инбаунд и DNS — откат (disable) обязан быть.
+    fake.log.clear()
+    pv2 = run(server.node_edit("", "rollback", {"edit": r["edit"]}))
+    assert pv2["ok"], pv2
+    r2 = run(server.node_edit("", "rollback", {"edit": r["edit"]}, confirm=True, plan_hash=pv2["plan_hash"]))
+    assert r2["ok"] and writes(fake) == [("POST", f"{CF}/disable")], r2
+
+
+def test_cf_only_waits_for_path_check(fake):
+    """Проверка пути не прошла — «только через CF» не включается: у юзеров
+    осталась бы одна неработающая строка."""
+    from nexus_mcp import server
+
+    fake.cf_verify_ok = False
+    args = {"enable": True, "cf_only": True}
+    pv = run(server.node_edit("ru41s2-YA-CDN", "cf_front", args))
+    r = run(server.node_edit("ru41s2-YA-CDN", "cf_front", args, confirm=True, plan_hash=pv["plan_hash"]))
+    assert r["ok"] is False and r["cf_check"]["error"] == "Cloudflare 522", r
+    assert ("PATCH", f"/api/v1/servers/{YA}") not in writes(fake)
+    assert fake.servers[YA]["cf_only"] is False
+
+
+def test_cf_front_disable_and_rollback_restores_cf_only(fake):
+    from nexus_mcp import server
+
+    fake.cf[YA] = {"hostname": "ru41s2-ya-cdn.nexus-front.net", "port": 2087}
+    fake.servers[YA]["cf_only"] = True
+    assert "без фронта" in run(_plan("cf_front", {"enable": False, "cf_only": True}))
+    pv = run(server.node_edit("ru41s2-YA-CDN", "cf_front", {"enable": False}))
+    assert any("пропадёт из подписок 37" in c for c in pv["affects_clients"]), pv
+    r = run(server.node_edit("ru41s2-YA-CDN", "cf_front", {"enable": False}, confirm=True,
+                             plan_hash=pv["plan_hash"]))
+    assert r["ok"] and writes(fake)[-1] == ("POST", f"{CF}/disable"), r
+    fake.log.clear()
+    pv2 = run(server.node_edit("", "rollback", {"edit": r["edit"]}))
+    run(server.node_edit("", "rollback", {"edit": r["edit"]}, confirm=True, plan_hash=pv2["plan_hash"]))
+    assert writes(fake) == [("POST", f"{CF}/enable"), ("PATCH", f"/api/v1/servers/{YA}")]
+    assert fake.servers[YA]["cf_only"] is True and YA in fake.cf
+
+
+def test_cf_front_not_enabled_nothing_to_disable(fake):
+    assert "не включён" in run(_plan("cf_front", {"enable": False}))
+
+
 # ── Чат: план идёт сразу, применение — кнопкой ─────────────────────────────
 
 def test_chat_gates_only_confirmed_edit():
@@ -323,6 +478,9 @@ def test_chat_gates_only_confirmed_edit():
         "node_edit", {"node": "x", "op": "swap_outbound", "args": {"from": "relay-00383c6f",
                                                                    "to": "relay-49341184"}})
     assert "node_edit" in runner.EDIT_TOOLS and "node_edit" not in runner.ACTION_TOOLS
+    assert "Cloudflare-фронт · включить, только через CF" in runner.describe_action(
+        "node_edit", {"node": "x", "op": "cf_front", "args": {"enable": True, "cf_only": True}})
+    assert set(runner.EDIT_OPS) == set(node_edit.OPS)
 
 
 # ── Сторожа: хаб и панель говорят об одном (инвариант 25) ──────────────────
@@ -363,3 +521,30 @@ def test_fields_match_panel(vgx3d):
     req = rq[rq.index("class RelayByNodeRequest"):]
     for f in ("relay_server_id", "relay_mode", "listen_port", "protocol"):
         assert f"{f}:" in req[:1500], f
+
+
+def test_cf_front_matches_panel(vgx3d):
+    """Ручки, поля и имя фронта — те же, что у панели."""
+    api = (vgx3d / "brain/app/api/v1/admin/cloudflare.py").read_text(encoding="utf-8")
+    assert 'APIRouter(prefix="/cloudflare"' in api
+    for route in ('@router.get("/settings")', '@router.get("/servers/{server_id}")',
+                  '@router.post("/servers/{server_id}/enable")', '@router.post("/servers/{server_id}/verify")',
+                  '@router.post("/servers/{server_id}/disable")'):
+        assert route in api, route
+    # Отказ enable — 400 с detail, step, steps: хаб отдаёт их как есть.
+    assert re.search(r'status_code=400,\s*content=\{"detail": [^\n]*"step": e\.step, "steps": e\.steps\}', api)
+    front = (vgx3d / "brain/app/services/cf_front.py").read_text(encoding="utf-8")
+    pub = front[front.index("def public_settings"):front.index("def _cf(")]
+    for key in ('"configured"', '"zone"', '"port"'):
+        assert key in pub, key
+    st = front[front.index("async def status"):]
+    assert '"enabled": False, "cf_only"' in st and '"hostname"' in st
+    slug = front[front.index("def _slug"):front.index("async def hostname_for")]
+    assert 're.sub(r"[^a-z0-9-]+", "-", (text or "").lower()).strip("-")' in slug and "[:40]" in slug
+    assert 'candidate = f"{base}.{zone}"' in front and '_slug(server.name) or "node"' in front
+    assert node_edit._cf_slug("ru41s2-YA-CDN") == "ru41s2-ya-cdn"
+    schema = (vgx3d / "brain/app/schemas/server.py").read_text(encoding="utf-8")
+    assert re.search(r"^\s+active_users:", schema[schema.index("class ServerOut"):], re.M)
+    srv = (vgx3d / "brain/app/api/v1/servers.py").read_text(encoding="utf-8")
+    lst = srv[srv.index("async def list_servers"):srv.index("async def list_servers") + 300]
+    assert "with_stats: bool" in lst and "with_online: bool | None" in lst

@@ -43,7 +43,8 @@ EDIT_OPS = {
     "relay_add": "добавить relay", "relay_remove": "удалить relay", "inbound_update": "изменить инбаунд",
     "inbound_create": "новый инбаунд", "inbound_delete": "удалить инбаунд",
     "inbound_push": "переприменить инбаунд", "inbound_order": "порядок инбаундов",
-    "push_network": "применить сеть", "batch": "пакет правок", "rollback": "откат правки",
+    "push_network": "применить сеть", "cf_front": "Cloudflare-фронт", "batch": "пакет правок",
+    "rollback": "откат правки",
 }
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -88,6 +89,11 @@ def _edit_detail(op: str, args: dict) -> str:
         return ", ".join(args)
     if op == "rollback":
         return str(args.get("edit", "?"))
+    if op == "cf_front":
+        what = "включить" if args.get("enable") else "выключить"
+        if args.get("cf_only") is not None:
+            what += ", только через CF" if args["cf_only"] else ", вернуть ссылки с IP"
+        return what
     if op == "batch":
         return " → ".join(EDIT_OPS.get((o or {}).get("op"), str((o or {}).get("op")))
                           for o in args.get("ops") or [])
