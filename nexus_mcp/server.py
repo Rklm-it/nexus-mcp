@@ -125,7 +125,7 @@ async def nodes_list(only_problems: bool = False) -> dict:
             continue
         rows.append({k: n.get(k) for k in (
             "name", "ip", "country", "active", "panel_online", "heartbeat_age_s",
-            "agent_version", "rf_status", "ssh_host", "ssh_port", "source")})
+            "agent_version", "rf_status", "ssh_host", "ssh_port", "ssh_source", "source")})
     return {"ok": True, "count": len(rows), "nodes": rows, "warnings": warnings}
 
 

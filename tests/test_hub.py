@@ -393,10 +393,56 @@ def test_merge_panel_and_file(hub_settings):
     assert nodes["extra"]["source"] == "file"
 
 
-def test_ssh_goes_to_management_address():
-    """Инвариант 37: SSH — на адрес управления (api_host), если он задан."""
-    rows = [{"id": "u", "name": "n", "ip_address": "1.1.1.1", "api_host": "10.9.9.9"}]
-    assert inventory.merge({"main": rows}, {})[0]["ssh_host"] == "10.9.9.9"
+# pablo-vps/tr31s2: api_host — проброс до агента (9090), SSH — на IP ноды.
+TR31 = {"id": "u", "name": "tr31s2", "ip_address": "107.161.174.211", "api_host": "45.141.118.103:19003"}
+
+
+def test_ssh_goes_to_node_ip_not_management_address(hub_settings):
+    """Инвариант 37 vgx3d: api_host — адрес управления агентом, не SSH. Хаб
+    ходил на 45.141.118.103:19003 и получал таймаут при открытом SSH на IP."""
+    n = inventory.merge({"main": [dict(TR31)]}, {})[0]
+    assert (n["ssh_host"], n["ssh_port"], n["ssh_source"]) == ("107.161.174.211", 22, "панель (IP ноды)")
+    argv = ssh.ssh_argv(n)
+    assert argv[-3] == "root@107.161.174.211" and argv[argv.index("-p") + 1] == "22"
+    assert "45.141.118.103" not in " ".join(argv)
+
+
+def test_nodes_json_overrides_ssh_address(hub_settings):
+    n = inventory.merge({"main": [dict(TR31)]}, {"nodes": [
+        {"name": "tr31s2", "ssh_host": "45.141.118.103:2201", "ssh_user": "admin"}]})[0]
+    assert n["ssh_source"] == "nodes.json"
+    assert ssh.ssh_target(n) == ("45.141.118.103", 2201)
+    n = inventory.merge({"main": [dict(TR31)]}, {"nodes": [{"name": "tr31s2", "ssh_port": 2222}]})[0]
+    assert ssh.ssh_target(n) == ("107.161.174.211", 2222)
+    n = inventory.merge({"main": [dict(TR31), {"id": "g", "name": "ger", "ip_address": "111.235.151.78"}]},
+                        {"nodes": [{"name": "tr31s2", "ssh_via": "ger"}]})
+    n = next(x for x in n if x["name"] == "tr31s2")
+    assert n["ssh_host"] == "107.161.174.211" and n["ssh_via"] == "root@111.235.151.78:22"
+
+
+def test_ssh_timeout_hint_names_address_source(hub_settings, tmp_path, monkeypatch):
+    """Таймаут SSH: в подсказке — куда шли и откуда адрес (панель / nodes.json)."""
+    key = tmp_path / "k"
+    key.write_text("x")
+    hub_settings.ssh_key = str(key)
+
+    class Proc:
+        returncode = 255
+
+        async def communicate(self, data=None):
+            return b"", b"ssh: connect to host 107.161.174.211 port 22: Connection timed out"
+
+    async def fake_exec(*argv, **kw):
+        return Proc()
+
+    monkeypatch.setattr(ssh.asyncio, "create_subprocess_exec", fake_exec)
+    n = inventory.merge({"main": [dict(TR31)]}, {})[0]
+    d = asyncio.run(ssh.run_script(n, "true")).as_dict()
+    assert d["failure"] == "timeout"
+    assert "107.161.174.211:22" in d["hint"] and "панель (IP ноды)" in d["hint"] and "nodes.json" in d["hint"]
+    n = inventory.merge({"main": [dict(TR31)]}, {"nodes": [{"name": "tr31s2", "ssh_host": "10.0.0.5"}]})[0]
+    d = asyncio.run(ssh.run_script(n, "true")).as_dict()
+    assert "10.0.0.5:22" in d["hint"] and "адрес — nodes.json" in d["hint"]
 
 
 def test_heartbeat_age_handles_naive_utc():

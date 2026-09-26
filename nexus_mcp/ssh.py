@@ -30,6 +30,14 @@ class SshResult:
     ms: float
     # Почему не вышло — короткое имя, по нему выбирается совет.
     failure: str | None = None
+    # Куда шёл SSH и откуда взят адрес (панель / nodes.json).
+    target: str = ""
+
+    def hint(self) -> str:
+        text = FAILURE_HINTS.get(self.failure or "", "")
+        if self.target and self.failure in ADDRESS_FAILURES:
+            text = f"{text} {self.target}".strip()
+        return text
 
     def as_dict(self) -> dict:
         d = {"ok": self.ok, "rc": self.rc, "ms": self.ms, "stdout": self.stdout}
@@ -37,7 +45,7 @@ class SshResult:
             d["stderr"] = self.stderr
         if self.failure:
             d["failure"] = self.failure
-            d["hint"] = FAILURE_HINTS.get(self.failure, "")
+            d["hint"] = self.hint()
         return d
 
 
@@ -57,6 +65,22 @@ FAILURE_HINTS = {
     "kill_timeout": "Команда на ноде не уложилась в отведённое время и была прервана.",
     "bad_via": "ssh_via в nodes.json не распознан: имя ноды из списка или user@host[:port].",
 }
+
+# Отказы, в которых виноват может быть сам адрес: к ним — куда шли и откуда
+# адрес взят.
+ADDRESS_FAILURES = ("timeout", "refused", "unreachable")
+
+
+def describe_target(node: dict) -> str:
+    """«SSH шёл на 107.161.174.211:22 (адрес — панель (IP ноды))» + как поправить."""
+    host, port = ssh_target(node)
+    src = node.get("ssh_source") or "nodes.json"
+    via = f", через {node['ssh_via']}" if node.get("ssh_via") else ""
+    text = f"SSH шёл на {host}:{port} (адрес — {src}{via})."
+    if src == "nodes.json":
+        return text + " Адрес задан вручную — сверить ssh_host / ssh_port в nodes.json."
+    return text + " SSH у ноды на другом адресе или порту — ssh_host / ssh_port в nodes.json."
+
 
 # Промежуточный узел (ssh_via) уходит в ProxyCommand, то есть в шелл: только
 # user@host[:port] без лишних символов. Имя ноды inventory.merge уже заменил
@@ -181,6 +205,7 @@ async def run_script(node: dict, script: str, timeout: float = 45.0) -> SshResul
         argv = ssh_argv(node)
     except ValueError:
         return SshResult(False, None, "", f"ssh_via «{node.get('ssh_via')}» не распознан", 0.0, "bad_via")
+    target = describe_target(node)
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -198,9 +223,9 @@ async def run_script(node: dict, script: str, timeout: float = 45.0) -> SshResul
         # ssh не видно разницы, а по выводу видно — пришёл ли хоть байт.
         failure = "kill_timeout" if out else "timeout"
         return SshResult(False, None, _trim(out.decode("utf-8", "replace")),
-                         err.decode("utf-8", "replace")[-2000:], ms, failure)
+                         err.decode("utf-8", "replace")[-2000:], ms, failure, target)
     ms = round((time.monotonic() - t0) * 1000, 1)
     rc = proc.returncode
     stderr = err.decode("utf-8", "replace")[-4000:]
     failure = classify(stderr, rc)
-    return SshResult(rc == 0, rc, _trim(out.decode("utf-8", "replace")), stderr, ms, failure)
+    return SshResult(rc == 0, rc, _trim(out.decode("utf-8", "replace")), stderr, ms, failure, target)

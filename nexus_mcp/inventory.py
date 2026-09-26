@@ -14,6 +14,13 @@
     }
 
 Запись с тем же `name`, что в панели, — это поправка; с новым — отдельная нода.
+
+SSH у ноды из панели — на её IP (`ip_address`) и порт 22, пока `nodes.json`
+не сказал иначе (`ssh_host`, `ssh_port`, `ssh_via`). `api_host` панели для
+SSH не годится: это адрес управления агентом (проброс до его порта 9090,
+инвариант 37 vgx3d), а не sshd — у нод за пробросом он ведёт в чужой порт, и
+хаб получал таймаут при открытом SSH на IP ноды. Откуда взят адрес — в
+`ssh_source`, он же в подсказке при отказе SSH.
 """
 
 from __future__ import annotations
@@ -165,8 +172,12 @@ def merge(by_panel: dict[str, list[dict]], file_data: dict) -> list[dict]:
     for n in nodes.values():
         for k, v in defaults.items():
             n.setdefault(k, v)
-        # SSH идёт на адрес управления, если он есть: это тот, что доступен.
-        n.setdefault("ssh_host", n.get("api_host") or n.get("ip"))
+        # SSH — на IP ноды. api_host (адрес управления агентом) — не SSH.
+        if n.get("ssh_host"):
+            n["ssh_source"] = "nodes.json"
+        else:
+            n["ssh_host"] = n.get("ip")
+            n["ssh_source"] = "панель (IP ноды)" if n.get("source") == "panel" else "nodes.json (ip)"
         out.append(n)
     # ssh_via: имя другой ноды → её адрес (user@host:port). Не имя — оставляем
     # как есть, ssh.parse_via проверит.

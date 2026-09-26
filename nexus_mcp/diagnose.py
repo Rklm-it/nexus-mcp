@@ -264,7 +264,7 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
                    with_ssh: bool = True) -> dict:
     probes = probes or [HUB]
     report: dict = {"node": {k: node.get(k) for k in (
-        "name", "panel", "ip", "ssh_host", "ssh_via", "country", "panel_online", "heartbeat_age_s",
+        "name", "panel", "ip", "ssh_host", "ssh_source", "ssh_via", "country", "panel_online", "heartbeat_age_s",
         "agent_version", "rf_status", "source")}}
     findings: list[dict] = panel_findings(node)
 
@@ -310,7 +310,7 @@ async def diagnose(node: dict, probes: list[str] | None = None, with_e2e: bool =
         else:
             report["ssh"] = ssh_res.as_dict()
             findings.append(finding(CRIT if ssh_res.failure != "no_key" else WARN, f"ssh_{ssh_res.failure}",
-                                    f"SSH с хаба не удался: {ssh.FAILURE_HINTS.get(ssh_res.failure, ssh_res.stderr[:200])}"))
+                                    f"SSH с хаба не удался: {ssh_res.hint() or ssh_res.stderr[:200]}"))
 
     report["reach"] = {}
     for probe, r in zip(probes, reaches):
