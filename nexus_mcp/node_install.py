@@ -49,8 +49,10 @@ INSTALLER_PATH = "/api/v1/install-node.sh"
 INSTALLER_MARK = 'MASTER_BRAIN_URL="${MASTER_BRAIN_URL:-'
 # Порт Cell API по умолчанию (--port установщика, api_port в панели).
 CELL_PORT = 9090
-# Строки вывода установщика с секретом агента — режутся ещё на сервере.
-SECRET_LINES = ("API-Key",)
+# Строки вывода с секретами — режутся ещё на сервере: API-Key агента
+# (install-node.sh и cell-setup.sh), ключ Shadowsocks-2022 и short_id Reality
+# из сводки cell-setup.sh. PubKey Reality — публичный, его оставляем.
+SECRET_LINES = ("API-Key", "PSK", "ShortID")
 # Протоколы, которые установщик ставит и регистрирует (PROTOCOLS по умолчанию).
 DEFAULT_PROTOCOLS = ("reality", "reality_grpc", "hysteria2", "shadowsocks")
 CDN_PROTOCOLS = ("vless_xhttp_cdn",)
@@ -378,6 +380,12 @@ async def install(panel_name: str, params: dict, ssh_user: str = "") -> dict:
         server = find_server(await panel_servers(p), params["ip"]) or created
     out.update({"ok": True, "registered_by": registered_by, "server_id": str(server.get("id") or ""),
                 "panel_online": bool(server.get("is_online"))})
+    if out["installer_rc"] and registered_by == "installer":
+        # Первая регистрация дошла, но ответ не успел (панель провизит ноду в
+        # том же запросе) — повтор установщика получил 409 «уже есть» и вышел
+        # с 1. Нода при этом в панели: успех по панели, а не по коду выхода.
+        out["note"] = (f"установщик вышел с кодом {out['installer_rc']}, но нода в панели есть — обычно "
+                       "это 409 на повторе регистрации, когда первый запрос дошёл, а ответ не успел")
     if params["ssh_port"] != 22 or (ssh_user and ssh_user != "root"):
         out["nodes_json"] = {"name": params["name"], "panel": p["name"], "ssh_port": params["ssh_port"],
                              **({"ssh_user": ssh_user} if ssh_user else {})}

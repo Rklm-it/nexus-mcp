@@ -19,6 +19,9 @@ INSTALLER = ('#!/usr/bin/env bash\nMASTER_BRAIN_URL="${MASTER_BRAIN_URL:-https:/
              "echo \"quote: it's $ \\\"x\\\"\"\n"
              'read -r x && echo "STDIN_EATEN"\n'
              'echo -e "  API-Key:         \\033[0;32mCELLSECRET\\033[0m"\n'
+             'echo "|    Server PSK:       SSPSKSECRET"\n'
+             'echo "|    ShortID:          SHORTSECRET"\n'
+             'echo "|    PubKey:           PUBLICKEYOK"\n'
              'exit 7\n')
 
 PARAMS = {"ip": "45.141.118.7", "name": "de 1 «тест»", "country": "DE", "ssh_port": 22,
@@ -73,6 +76,8 @@ def test_install_script_passes_values_and_hides_secrets():
     assert "quote: it's $ \"x\"" in out                     # скрипт не покорёжен heredoc'ом
     assert "STDIN_EATEN" not in out                         # stdin установщика — /dev/null
     assert "CELLSECRET" not in out and "API-Key" not in out  # строка с ключом агента вырезана
+    assert "SSPSKSECRET" not in out and "SHORTSECRET" not in out  # ключ SS-2022 и short_id — тоже
+    assert "PUBLICKEYOK" in out                             # публичный ключ Reality — не секрет
     assert "\x1b[" not in out
     assert out.strip().endswith("rc=7")                     # код установщика, а не хвоста трубы
 
@@ -212,6 +217,26 @@ def test_install_registered_by_installer(panel, monkeypatch):
     assert audit.tail()[-1]["tool"] == "node_install" and audit.tail()[-1]["ok"] is True
 
 
+def test_installer_rc_after_registered_node_is_explained(panel, monkeypatch):
+    """Первый POST регистрации дошёл, ответ не успел, повтор получил 409 и
+    установщик вышел с 1: нода в панели — это успех, с пояснением про код."""
+    from nexus_mcp import server
+
+    hub = FakeHub(monkeypatch)
+    orig = ssh.run_script
+
+    async def rc1(node, script, timeout=45):
+        res = await orig(node, script, timeout)
+        if "NEXUS_INSTALLER_B64" in script:
+            return ssh.SshResult(True, 0, "HTTP 409 уже есть\nrc=1\n", "", 5.0)
+        return res
+
+    monkeypatch.setattr(ssh, "run_script", rc1)
+    r = asyncio.run(server.node_install("main", "45.141.118.7", "de-1", "DE", confirm=True))
+    assert r["ok"] and r["installer_rc"] == 1 and r["registered_by"] == "installer"
+    assert "409" in r["note"] and hub.posted == []
+
+
 def test_install_via_relay_registers_from_hub(panel, monkeypatch):
     """Сервер не достаёт до панели: агент качается через реле, а регистрацию
     (её через реле нет) делает хаб токеном агента."""
@@ -287,8 +312,9 @@ def test_installer_contract_matches_panel(vgx3d):
         assert f'{var}="${{{var}:-' in text, var
     assert "--brain-url \"$MASTER_BRAIN_URL\"" in text           # агент получит адрес реле
     assert '"${MASTER_BRAIN_URL}/install/cell-bundle.tar.gz"' in text  # бандл — путь /install/*, есть в реле
-    for label in ni.SECRET_LINES:
-        assert f"{label}:" in text
+    cell_setup_text = (vgx3d / "cell/cell-setup.sh").read_text(encoding="utf-8")
+    for label in ni.SECRET_LINES:                          # метки строк с секретами ещё печатаются
+        assert f"{label}:" in text or f"{label}:" in cell_setup_text, label
     assert f"--argjson port \"$CELL_PORT\"" in text and f'CELL_PORT="${{CELL_PORT:-{ni.CELL_PORT}}}"' in text
     assert f'PROTOCOLS="${{PROTOCOLS:-{",".join(ni.DEFAULT_PROTOCOLS)}}}"' in text
     assert f'PROTOCOLS="${{PROTOCOLS:-{",".join(ni.CDN_PROTOCOLS)}}}"' in text
