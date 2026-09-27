@@ -45,7 +45,7 @@ EDIT_TOOLS = ("node_edit",)
 # Изменения через админ-API панели и обслуживание базы/Redis: предпросмотр
 # (без confirm) идёт сразу, выполнение (confirm=true) ждёт кнопки.
 PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance", "probe_subscription",
-                     "master_job", "master_clients_update", "panel_update")
+                     "master_job", "master_clients_update", "panel_update", "node_install")
 
 MASTER_JOB_TITLES = {
     "brain": "обновить brain мастера (git pull и пересборка)",
@@ -190,6 +190,12 @@ def describe_action(tool: str, inp: dict) -> str:
         if ids and inp.get("only_behind") is False:
             who += " (даже на той же версии)"
         return f"Мастер {panel}: разослать «обновись» {who}"
+    if tool == "node_install":
+        where = f"{inp.get('ip', '?')}" + (f":{inp['ssh_port']}" if inp.get("ssh_port") not in (None, 22) else "")
+        route = {"relay": " · через реле хаба", "direct": " · напрямую"}.get(str(inp.get("route") or ""), "")
+        cdn = f" · CDN {inp['cdn_domain']}" if inp.get("cdn_domain") else ""
+        return (f"Поставить ноду {inp.get('name', '?')} ({inp.get('country', '?')}) на сервер {where} "
+                f"и добавить в панель {inp.get('panel', '?')}{route}{cdn} (5–15 мин)")
     if tool == "panel_update":
         return f"Обновить панель {inp.get('panel', '?')} образами мастера (3–10 мин, панель перезапустится)"
     if tool == "panel_maintenance":

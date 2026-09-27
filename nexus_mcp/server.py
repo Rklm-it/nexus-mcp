@@ -70,6 +70,10 @@ panel=<имя>, а ноды называются «панель/имя».
 4. Действия (node_action) — только после согласия человека, с confirm=true.
    Смена порта/транспорта/IP уезжает в подписки всех юзеров ноды — это предлагать,
    а не делать.
+5. Новая нода на чистом сервере — node_install(panel, ip, name, country): хаб сам
+   зайдёт по SSH своим ключом (ключ хаба человек кладёт в authorized_keys, хоть
+   через веб-консоль хостера), поставит агент установщиком панели и добавит ноду.
+   Без confirm — план, человеку; с confirm=true — установка (итог — action_status).
 
 Правка конфигурации ноды (node_edit) — маршрутизация, relay, настройки ноды,
 инбаунды, Cloudflare-фронт (op="cf_front") — ТОЛЬКО по просьбе человека:
@@ -1191,6 +1195,57 @@ async def node_action(node: str, action: str, confirm: bool = False, service: st
         return out
 
     return await _job(f"{action} {n['name']}", work())
+
+
+@mcp.tool()
+async def node_install(panel: str, ip: str, name: str, country: str, confirm: bool = False,
+                       ssh_port: int = 22, ssh_user: str = "", route: str = "auto",
+                       cdn_domain: str = "") -> dict:
+    """Поставить ноду на ЧИСТЫЙ сервер и добавить её в панель — с хаба, по SSH
+    ключом хаба. Только по просьбе человека.
+
+    Нужно заранее: публичный ключ хаба (/etc/nexus-mcp/id_ed25519.pub) в
+    /root/.ssh/authorized_keys сервера — хоть через веб-консоль хостера.
+    panel — куда добавить (panels_list); ip — IP сервера; name — имя ноды в
+    панели; country — код страны (DE, NL…); ssh_port/ssh_user — если SSH не
+    22/root; cdn_domain — origin-домен для CDN-ноды (A-запись уже на IP).
+    route: auto — напрямую, а если сервер не достаёт до панели — через реле
+    хаба; direct | relay — принудительно.
+
+    Без confirm — план (ничего не меняет): SSH, ОС, порты, нет ли агента,
+    маршрут до панели, нет ли ноды с таким IP/именем. План — человеку.
+    С confirm=true — установка установщиком самой панели (install-node.sh,
+    5–15 мин, идёт задачей: итог — action_status). Не дошла регистрация с
+    сервера — хаб регистрирует ноду сам. После — node_diagnose(name).
+    """
+    if off := _actions_off():
+        return off
+    from nexus_mcp import node_install as ni
+
+    try:
+        params = ni.check_params(ip, name, country, ssh_port, cdn_domain, route)
+        if not confirm:
+            pl = await ni.plan(panel, params, ssh_user)
+            return {"ok": True, "preview": True, **pl,
+                    "next": ("перескажите план человеку; согласится — тот же вызов с confirm=true"
+                             if pl["ready"] else "сначала устраните blockers")}
+    except ni.InstallError as e:
+        return _err(e)
+
+    async def work() -> dict:
+        try:
+            res = await ni.install(panel, params, ssh_user)
+        except (ni.InstallError, inventory.InventoryError, panel_api.PanelError, recipes.RecipeError) as e:
+            res = _err(e)
+        audit.record("node_install", {"panel": panel, "ip": params["ip"], "name": params["name"],
+                                      "country": params["country"], "route": res.get("route", route)},
+                     res.get("ok", False), res.get("detail", "") or res.get("error", ""))
+        if res.get("ok"):
+            res["next"] = (f"node_diagnose('{params['name']}') — агент, heartbeat, доступность из РФ; "
+                           "первый heartbeat — в течение пары минут")
+        return res
+
+    return await _job(f"node_install {params['name']} ({params['ip']})", work())
 
 
 # ── Правка конфигурации ноды ───────────────────────────────────────────────

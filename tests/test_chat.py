@@ -507,6 +507,28 @@ def test_paid_sim_check_needs_button_only_for_the_run(chat_settings):
     asyncio.run(go())
 
 
+def test_node_install_plan_passes_and_install_waits_for_button(chat_settings):
+    """План установки ноды только читает — идёт сразу; установка (confirm=true)
+    ставит агент на сервер и пишет в панель — ждёт кнопку."""
+    async def go():
+        runner, client, _ = _setup(chat_settings, None)
+        cid = runner.store.create_chat()["id"]
+        inp = {"panel": "JonyX", "ip": "45.141.118.7", "name": "de-1", "country": "DE"}
+        ok, val = await runner._decide(cid, "mcp__nexus__node_install", inp)
+        assert ok and val == inp and runner.store.pending_approvals() == []
+
+        task = asyncio.create_task(runner._decide(cid, "mcp__nexus__node_install",
+                                                  {**inp, "confirm": True, "route": "relay"}))
+        ev = await _wait_type(client, cid, "approval")
+        assert ev["data"]["title"] == ("Поставить ноду de-1 (DE) на сервер 45.141.118.7 и добавить в панель "
+                                       "JonyX · через реле хаба (5–15 мин)")
+        await client.post(f"/chat/api/approvals/{ev['data']['approval_id']}", json={"allow": True}, headers=AUTH)
+        ok, val = await task
+        assert ok and val["confirm"] is True
+
+    asyncio.run(go())
+
+
 def test_web_tools_pass_and_posts_wait_for_button(chat_settings):
     """Браузер mcp-browser рядом: чтение и браузер идут сразу, предпросмотр
     поста — сразу, публикация (confirm=true) — только по кнопке. Без секрета
