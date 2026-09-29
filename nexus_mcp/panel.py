@@ -140,6 +140,51 @@ def check_action_path(path: str) -> str:
                      + "; ".join(f"{k} — {v}" for k, v in ACTION_PATTERNS.items()))
 
 
+# Один элемент списка не длиннее этого: строка лога с SQL-запросом на
+# 75 тысяч параметров весит сотни килобайт, и из-за одной такой строки
+# вылетал весь хвост лога.
+ITEM_CHARS = 2_000
+# Ключи, у которых важен КОНЕЦ списка (хвост лога), а не начало.
+TAIL_KEYS = {"lines", "logs", "log_tail", "tail"}
+# Меньше этого остатка бюджета частичный список уже бесполезен.
+MIN_FIT_CHARS = 2_000
+
+
+def _size(v: Any) -> int:
+    return len(json.dumps(v, ensure_ascii=False, default=str))
+
+
+def _cut(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n] + f"…(ещё {len(s) - n} символов)"
+
+
+def _fit(v: Any, budget: int, tail: bool) -> Any:
+    """Уложить строку или список в `budget` символов, а не выбросить целиком.
+
+    Раньше поле, не влезшее в ответ, заменялось на «обрезано — запросите
+    отдельно» — и `panel_logs` на панели, где в логе одна гигантская строка,
+    не показывал НИ ОДНОЙ строки при любом `lines`: отдельный запрос
+    обрезался точно так же."""
+    if isinstance(v, str):
+        return _cut(v, max(0, budget - 60))
+    if isinstance(v, list):
+        items = [_cut(x, ITEM_CHARS) if isinstance(x, str) else x for x in v]
+        picked, used = [], 60
+        for x in (reversed(items) if tail else items):
+            n = _size(x) + 2
+            if used + n > budget:
+                break
+            picked.append(x)
+            used += n
+        if tail:
+            picked.reverse()
+        if len(picked) < len(v):
+            note = f"…показано {len(picked)} из {len(v)}" + (" (последние)" if tail else "")
+            picked = [note, *picked] if tail else [*picked, note]
+        return picked
+    return f"…обрезано ({_size(v)} символов) — запросите отдельно"
+
+
 def _shrink(data: Any) -> Any:
     """Ответ панели бывает огромным (списки юзеров, логи). Модели нужен
     смысл, а не мегабайт: режем с явной пометкой, сколько отрезано."""
@@ -152,18 +197,26 @@ def _shrink(data: Any) -> Any:
     if isinstance(data, dict):
         out, used = {}, 0
         for k, v in data.items():
-            chunk = len(json.dumps(v, ensure_ascii=False, default=str))
-            if used + chunk > MAX_CHARS:
-                out[k] = f"…обрезано ({chunk} символов) — запросите отдельно"
-            else:
+            chunk = _size(v)
+            if used + chunk <= MAX_CHARS:
                 out[k] = v
                 used += chunk
+                continue
+            left = MAX_CHARS - used
+            if left >= MIN_FIT_CHARS and isinstance(v, (str, list)):
+                out[k] = _fit(v, left, tail=k in TAIL_KEYS)
+                used += _size(out[k])
+            else:
+                out[k] = f"…обрезано ({chunk} символов) — запросите отдельно"
         return out
     return text[:MAX_CHARS] + "…(обрезано)"
 
 
 HEALTH_LINES = 15
 HEALTH_LINE_CHARS = 300
+# `detail` проверки — одна фраза. Панели до 3.104.11 клали туда текст
+# исключения целиком: у панели на 75 тысяч клиентов это был мегабайт SQL.
+HEALTH_DETAIL_CHARS = 500
 
 
 def compact_health(data: Any) -> Any:
@@ -182,6 +235,8 @@ def compact_health(data: Any) -> Any:
             if not isinstance(c, dict):
                 continue
             c = dict(c)
+            if isinstance(c.get("detail"), str):
+                c["detail"] = _cut(c["detail"], HEALTH_DETAIL_CHARS)
             lines = c.pop("lines", None) or []
             if lines and c.get("status") not in ("ok", "off"):
                 c["lines"] = [str(x)[:HEALTH_LINE_CHARS] for x in lines[-HEALTH_LINES:]]

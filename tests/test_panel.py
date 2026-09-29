@@ -139,6 +139,59 @@ def test_health_keeps_every_check_when_logs_are_huge(hub_settings, monkeypatch):
     assert len(json.dumps(r, ensure_ascii=False)) < panel.MAX_CHARS
 
 
+def test_huge_log_line_does_not_hide_the_whole_tail(hub_settings, monkeypatch):
+    """Одна строка лога с SQL на 75 тысяч параметров (JonyX, 29.09.2026) —
+    и `panel_logs` не показывал ни одной строки при любом `lines`: поле
+    целиком заменялось на «обрезано — запросите отдельно». Хвост обязан
+    остаться: последние строки целиком, гигантская — обрезанной."""
+    from nexus_mcp import server
+
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    lines = [f"line {i}" for i in range(50)] + ["$1::UUID, " * 100_000] + ["последняя"]
+    _mock(monkeypatch, lambda req: httpx.Response(
+        200, json={"service": "brain", "container": "b", "lines": lines}))
+    r = asyncio.run(server.panel_logs(lines=60))
+    out = r["data"]["lines"]
+    assert isinstance(out, list), out
+    assert out[-1] == "последняя"
+    assert "line 49" in out
+    assert all(len(x) <= panel.ITEM_CHARS + 40 for x in out)
+    assert len(json.dumps(r, ensure_ascii=False)) < panel.MAX_CHARS * 1.1
+
+
+def test_many_long_lines_keep_the_newest(hub_settings, monkeypatch):
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    lines = [f"{i:04d} " + "x" * 1500 for i in range(500)]
+    _mock(monkeypatch, lambda req: httpx.Response(200, json={"lines": lines}))
+    out = asyncio.run(panel.get("/api/v1/admin/logs/brain"))["lines"]
+    assert out[0].startswith("…показано") and "(последние)" in out[0]
+    assert out[-1].startswith("0499 ")
+    assert len(out) > 10
+
+
+def test_health_detail_is_short_even_if_panel_sends_a_megabyte(hub_settings, monkeypatch):
+    """Панели до 3.104.11 клали в `detail` упавшей секции текст исключения
+    вместе с SQL-запросом: мегабайт вытеснял все группы."""
+    from nexus_mcp import server
+
+    hub_settings.brain_url = "https://p.ru"
+    hub_settings.brain_admin_token = "A"
+    body = {"status": "error", "groups": [
+        {"key": "core", "status": "ok", "checks": [{"key": "db", "status": "ok", "detail": "ok"}]},
+        {"key": "monitoring", "status": "unknown", "checks": [
+            {"key": "monitoring", "status": "unknown",
+             "detail": "DBAPIError: " + "$1::UUID, " * 100_000},
+        ]},
+    ]}
+    _mock(monkeypatch, lambda req: httpx.Response(200, json=body))
+    r = asyncio.run(server.panel_health())
+    groups = r["data"]["groups"]
+    assert [g["key"] for g in groups] == ["core", "monitoring"]
+    assert len(groups[1]["checks"][0]["detail"]) <= panel.HEALTH_DETAIL_CHARS + 40
+
+
 def test_health_fields_match_panel(vgx3d):
     """compact_health опирается на поля ответа панели — сверяем с её кодом."""
     text = (vgx3d / "brain/app/services/app_health.py").read_text(encoding="utf-8")
