@@ -172,7 +172,7 @@ def test_many_long_lines_keep_the_newest(hub_settings, monkeypatch):
 
 
 def test_health_detail_is_short_even_if_panel_sends_a_megabyte(hub_settings, monkeypatch):
-    """Панели до 3.104.11 клали в `detail` упавшей секции текст исключения
+    """Панели до 3.105.1 клали в `detail` упавшей секции текст исключения
     вместе с SQL-запросом: мегабайт вытеснял все группы."""
     from nexus_mcp import server
 
