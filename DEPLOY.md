@@ -321,6 +321,26 @@ systemctl daemon-reload && systemctl enable --now nexus-probe
 
 Проверка без хаба: `python3 probe.py --once <IP ноды>`.
 
+**Телефон с симкой (Android, Termux из F-Droid)** — замеры с живой мобильной
+сети, в том числе скорость (`probe_speed`): стенд на ноде мобильную сеть не
+воспроизводит. С мобильного соединение к зарубежному хабу замерзает после
+первых ~16 КБ (ТСПУ), поэтому связь с хабом — через локальный xray с CDN-ссылкой
+(`--hub-proxy`), а сами пробы идут напрямую через симку:
+```
+pkg install -y python unzip && mkdir -p ~/probe && cd ~/probe
+curl -L -o probe.py https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/probe/probe.py
+curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-android-arm64-v8a.zip
+unzip -o xray.zip xray && chmod +x xray
+# hub.json — клиентский конфиг xray: inbound http 127.0.0.1:10809, outbound — CDN-ссылка
+nohup ./xray run -c hub.json > hub.log 2>&1 &
+termux-wake-lock
+python probe.py --hub <адрес хаба> --token <PROBE_TOKEN> --name телефон-мтс --xray ./xray \
+  --hub-proxy http://127.0.0.1:10809
+```
+VPN-приложение и Wi-Fi на время замеров выключены, Termux исключён из экономии
+батареи. `--hub-proxy` попадает и в окружение, поэтому самообновление пробника
+связь с хабом не теряет.
+
 ## Шаг 8. Чат с Claude в приложении Nexus Admin
 
 Установщик ставит рядом с хабом сервис `nexus-chat`: в нём Claude работает на

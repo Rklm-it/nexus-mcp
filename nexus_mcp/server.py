@@ -29,6 +29,7 @@ from nexus_mcp import links as sublinks
 from nexus_mcp import relay
 from nexus_mcp import probe_sub
 from nexus_mcp import sweep as sub_sweep
+from nexus_mcp import speed as sub_speed
 from nexus_mcp import panel as panel_api
 from nexus_mcp.inventory import InventoryError
 from nexus_mcp.probes import HUB, ProbeError, registry
@@ -311,6 +312,51 @@ async def subscription_check(probe: str = HUB, e2e: bool = False, panel: str = "
     audit.record("subscription_check", {"probe": probe, "e2e": e2e, "panel": panel, "start": start}, True)
     if st.get("running"):
         st["next"] = f"subscription_check(probe='{probe}', start=False) — через минуту"
+    return st
+
+
+@mcp.tool()
+async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "",
+                      variants: dict | None = None, dl_mb: float = sub_speed.DEFAULT_DL_MB,
+                      ul_mb: float = sub_speed.DEFAULT_UL_MB, max_time: float = sub_speed.DEFAULT_MAX_TIME,
+                      repeats: int = 1, start: bool = True) -> dict:
+    """Скорость строки подписки с пробника — и перебор её параметров.
+
+    Пробник (например телефон с симкой) поднимает xray с этой строкой и мерит
+    задержку, скачивание и отправку через Яндекс.Интернетометр (запасной —
+    Cloudflare). Для вопроса «какие параметры CDN реально нужны»: стенд на ноде
+    мобильную сеть не воспроизводит.
+
+    link — ссылка целиком (vless://…), либо panel + host — строка тестовой
+    подписки панели с этим адресом (CDN-домен или IP). variants — {имя: поля},
+    поля подменяются в extra ссылки (sc_max_each_post_bytes,
+    sc_min_posts_interval_ms, uplink_data_placement, uplink_http_method,
+    max_connections / xmux={…}; mode — в query). «as-is» (как есть) идёт
+    первым всегда. dl_mb / ul_mb / max_time — объём и потолок времени замера
+    (на телефоне это его трафик), repeats — повторов каждого варианта.
+    Меняется только клиент: размер поста и интервал серверу не нужны, а место
+    данных и метод аплинка сервер обязан понимать — иначе вариант не встанет.
+    Прогон фоном: start=False читает состояние, не запуская новый.
+    """
+    try:
+        if start:
+            uri = link.strip() or (await sub_speed.pick_link(panel, host.strip()) if host else "")
+            if not uri:
+                return {"ok": False, "error": "bad_args", "detail": "нужна ссылка (link) или panel + host"}
+            st = sub_speed.runs.start(probe, uri, variants or {}, dl_mb, ul_mb, max_time, repeats)
+            cur = sub_speed.runs.running.get(probe)
+            if cur:
+                try:
+                    await asyncio.wait_for(asyncio.shield(cur["task"]), JOB_WAIT)
+                except asyncio.TimeoutError:
+                    pass
+        st = sub_speed.runs.state(probe)
+    except (sub_speed.SpeedError, sub_sweep.SweepError, sublinks.LinksError, ProbeError) as e:
+        return _err(e)
+    audit.record("probe_speed", {"probe": probe, "host": host, "panel": panel, "variants": list((variants or {}))},
+                 True)
+    if st.get("running"):
+        st["next"] = f"probe_speed(probe='{probe}', start=False) — через минуту"
     return st
 
 

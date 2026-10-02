@@ -56,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 
-PROBE_VERSION = "1.2.1"
+PROBE_VERSION = "1.3.0"
 
 # Лёгкие пробы, которые можно гнать пачкой. e2e сюда не входит: каждая —
 # отдельный процесс xray, на роутере это десятки мегабайт.
@@ -390,7 +390,7 @@ def fetch_xray(url: str, timeout: float = 120.0) -> tuple[str | None, str]:
         os.makedirs(XRAY_TMP_DIR, exist_ok=True)
         zpath = os.path.join(XRAY_TMP_DIR, "xray.zip")
         try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+            opener = urllib.request.build_opener(_hub_proxy_handler(),
                                                  urllib.request.HTTPSHandler(context=hub_ssl_context()))
             req = urllib.request.Request(url, headers={"User-Agent": f"nexus-probe/{PROBE_VERSION}"})
             with opener.open(req, timeout=timeout) as resp, open(zpath, "wb") as f:
@@ -580,6 +580,251 @@ def _drain(proc: subprocess.Popen) -> str:
     return (out or b"").decode("utf-8", "replace")[-800:]
 
 
+# ── Скорость через туннель ──────────────────────────────────────────────────
+#
+# «Открылось ли» не отвечает на вопрос «какие параметры CDN нужны»: при
+# интервале постов 1–3 мс туннель открывался везде, а на мобильном скачивание
+# падало с 70 до 15 Мбит/с, отдача — до 0,2. Мерить надо с той же симки:
+# стенд на ноде (дата-центр) мобильную сеть не воспроизводит.
+#
+# Замер — тем же путём, что Яндекс.Интернетометр в браузере через этот VPN:
+# пробы выдаёт его API (ближайшие к выходному IP), запасной — Cloudflare.
+# Объём ограничен и байтами, и временем: на телефоне это его трафик.
+
+SPEED_PROBES_URL = "https://yandex.ru/internet/api/v0/get-probes"
+SPEED_FALLBACK_DOWN = "https://speed.cloudflare.com/__down?bytes={n}"
+SPEED_FALLBACK_UP = "https://speed.cloudflare.com/__up"
+SPEED_DL_BYTES = 10_000_000
+SPEED_UL_BYTES = 4_000_000
+SPEED_MAX_TIME = 15.0
+
+
+def _open_via_socks(port: int, url: str, timeout: float):
+    from urllib.parse import urlparse
+
+    u = urlparse(url)
+    host = u.hostname or ""
+    https = u.scheme == "https"
+    dport = u.port or (443 if https else 80)
+    path = (u.path or "/") + (("?" + u.query) if u.query else "")
+    s = _socks5_connect(port, host, dport, timeout)
+    if https:
+        s = ssl.create_default_context().wrap_socket(s, server_hostname=host)
+    s.settimeout(timeout)
+    return s, host, path
+
+
+def _read_head(s) -> tuple[int | None, dict, bytes]:
+    buf = b""
+    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+        chunk = s.recv(16384)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    lines = head.decode("latin-1", "replace").split("\r\n")
+    parts = lines[0].split(" ") if lines else []
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    headers = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return status, headers, rest
+
+
+def _dechunk(body: bytes) -> bytes:
+    out = b""
+    while body:
+        size_line, _, body = body.partition(b"\r\n")
+        try:
+            n = int(size_line.split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            break
+        if n == 0:
+            break
+        out += body[:n]
+        body = body[n + 2:]
+    return out
+
+
+def _speed_probes(port: int, timeout: float) -> dict:
+    """Адреса замера Интернетометра — запросом через туннель. Не вышло — {}."""
+    s, host, path = _open_via_socks(port, SPEED_PROBES_URL, timeout)
+    try:
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                  f"Accept: application/json\r\nConnection: close\r\n\r\n".encode())
+        status, headers, body = _read_head(s)
+        while len(body) < 2_000_000:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+    finally:
+        s.close()
+    if "chunked" in headers.get("transfer-encoding", "").lower():
+        body = _dechunk(body)
+    data = json.loads(body.decode("utf-8", "replace") or "{}")
+    out: dict = {}
+    for p in (data.get("download") or {}).get("probes") or []:
+        url = p.get("url") or ""
+        if "/probes/" in url:
+            out["download"] = url
+            if "50mb" in url:
+                break
+    for p in (data.get("upload") or {}).get("probes") or []:
+        if p.get("postUrl"):
+            out["upload"] = p["postUrl"]
+            break
+    return out
+
+
+def _speed_download(port: int, url: str, max_bytes: int, max_time: float, timeout: float) -> dict:
+    """Скачивание через туннель: байты/время с первого байта тела. Таймаут
+    посреди закачки — не ошибка, а замер медленного канала."""
+    t0 = time.monotonic()
+    s, host, path = _open_via_socks(port, url, timeout)
+    try:
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                  f"Connection: close\r\n\r\n".encode())
+        status, _, rest = _read_head(s)
+        ttfb = _ms(t0)
+        got, start, err = len(rest), time.monotonic(), None
+        while got < max_bytes and time.monotonic() - start < max_time:
+            try:
+                chunk = s.recv(65536)
+            except OSError as e:
+                err = _kind(e)
+                break
+            if not chunk:
+                break
+            got += len(chunk)
+        dt = max(time.monotonic() - start, 1e-3)
+    finally:
+        s.close()
+    res = {"status": status, "bytes": got, "s": round(dt, 2),
+           "mbit": round(got * 8 / dt / 1e6, 2), "ttfb_ms": ttfb}
+    if err:
+        res["error"] = err
+    return res
+
+
+def _speed_upload(port: int, url: str, total: int, max_time: float, timeout: float) -> dict:
+    """Отправка через туннель. Время — до ОТВЕТА сервера: он отвечает, приняв
+    тело целиком, а до этого байты могут лежать в буферах сокета и клиента —
+    по моменту «отдали в сокет» скорость вышла бы завышенной."""
+    block = os.urandom(65536)
+    s, host, path = _open_via_socks(port, url, timeout)
+    sent, err, status = 0, None, None
+    start = time.monotonic()
+    try:
+        s.sendall(f"POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                  f"Content-Type: application/octet-stream\r\nContent-Length: {total}\r\n"
+                  f"Connection: close\r\n\r\n".encode())
+        while sent < total and time.monotonic() - start < max_time:
+            n = min(len(block), total - sent)
+            try:
+                s.sendall(block[:n])
+            except OSError as e:
+                err = _kind(e)
+                break
+            sent += n
+        if sent >= total and not err:
+            try:
+                s.settimeout(max(1.0, max_time - (time.monotonic() - start)))
+                status, _, _ = _read_head(s)
+            except OSError as e:
+                err = _kind(e)
+        dt = max(time.monotonic() - start, 1e-3)
+    finally:
+        s.close()
+    res = {"status": status, "bytes": sent, "s": round(dt, 2),
+           "mbit": round(sent * 8 / dt / 1e6, 2), "complete": status is not None and status < 400}
+    if err:
+        res["error"] = err
+    if status is not None and status >= 400:
+        # Отказ сервера — не скорость: байты могли уйти в никуда.
+        res["mbit"] = 0.0
+    return res
+
+
+def probe_speed(config: dict, dl_bytes: int = SPEED_DL_BYTES, ul_bytes: int = SPEED_UL_BYTES,
+                max_time: float = SPEED_MAX_TIME, timeout: float = 15.0,
+                xray_bin: str | None = None) -> dict:
+    """Поднять xray с конфигом строки и померить через него задержку,
+    скачивание и отправку. Только xray: sing-box не знает части полей xhttp
+    (`extra`), а именно их и перебираем."""
+    global _xray_last_used
+    binary = find_xray(xray_bin)
+    if not binary and _XRAY_URL:
+        binary, why = fetch_xray(_XRAY_URL)
+        if not binary:
+            return {"ok": False, "error": "no_xray", "detail": why}
+    if not binary:
+        return {"ok": False, "error": "no_xray", "detail": "нет xray: укажите --xray"}
+    _xray_last_used = time.time()
+    with _E2E_LOCK:
+        avail, need = mem_available_mb(), min_mem_mb("xray")
+        if avail is not None and avail < need:
+            return {"ok": False, "error": "low_memory", "detail": f"свободно {avail} МБ, нужно {need}"}
+        port = _free_port()
+        cfg = json.loads(json.dumps(config))
+        cfg["inbounds"] = [{"tag": "socks", "listen": "127.0.0.1", "port": port, "protocol": "socks",
+                            "settings": {"auth": "noauth", "udp": False}}]
+        cfg["log"] = {"loglevel": "warning"}
+        cfg.pop("routing", None)
+        tmpdir = tempfile.mkdtemp(prefix="nexus-speed-")
+        path = os.path.join(tmpdir, "config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        proc = subprocess.Popen([binary, "run", "-c", path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    out = (proc.stdout.read() or b"").decode("utf-8", "replace") if proc.stdout else ""
+                    return {"ok": False, "error": "xray_failed", "detail": "xray не запустился с этим конфигом",
+                            "xray_log": out[-800:]}
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            res: dict = {"ok": False}
+            try:
+                r = _fetch_via_socks(port, E2E_DEFAULT_URL, timeout)
+                res["ping_ms"] = r.get("ms")
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "error": _kind(e), "detail": f"туннель не встал: {str(e)[:160]}",
+                        "xray_log": _drain(proc)}
+            try:
+                urls = _speed_probes(port, timeout)
+            except Exception:  # noqa: BLE001
+                urls = {}
+            res["source"] = "yandex" if urls.get("download") else "cloudflare"
+            dl_url = urls.get("download") or SPEED_FALLBACK_DOWN.format(n=dl_bytes)
+            ul_url = urls.get("upload") or SPEED_FALLBACK_UP
+            for key, fn, args in (("download", _speed_download, (dl_url, dl_bytes)),
+                                  ("upload", _speed_upload, (ul_url, ul_bytes))):
+                try:
+                    res[key] = fn(port, *args, max_time, timeout)
+                except Exception as e:  # noqa: BLE001
+                    res[key] = {"mbit": 0.0, "error": _kind(e), "detail": str(e)[:160]}
+            res["dl_mbit"] = res["download"].get("mbit", 0.0)
+            res["ul_mbit"] = res["upload"].get("mbit", 0.0)
+            res["ok"] = bool(res["dl_mbit"] or res["ul_mbit"])
+            if not res["ok"]:
+                res["xray_log"] = _drain(proc)
+            return res
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            _xray_last_used = time.time()
+
+
 # ── Диспетчер заданий ──────────────────────────────────────────────────────
 
 def run_job(kind: str, args: dict, xray_bin: str | None = None) -> dict:
@@ -598,6 +843,11 @@ def run_job(kind: str, args: dict, xray_bin: str | None = None) -> dict:
         if kind == "e2e":
             return probe_e2e(a["config"], a.get("url") or E2E_DEFAULT_URL,
                              float(a.get("timeout", 15)), xray_bin, a.get("singbox"))
+        if kind == "speed":
+            return probe_speed(a["config"], int(a.get("dl_bytes") or SPEED_DL_BYTES),
+                               int(a.get("ul_bytes") or SPEED_UL_BYTES),
+                               float(a.get("max_time") or SPEED_MAX_TIME),
+                               float(a.get("timeout", 15)), xray_bin)
         if kind == "update":
             return self_update(a["code"], str(a.get("version") or ""))
         if kind == "batch":
@@ -705,10 +955,25 @@ def probe_info(xray_bin: str | None = None) -> dict:
         "self_update": not os.environ.get("NEXUS_PROBE_NO_UPDATE"),
         "mem_available_mb": mem_available_mb(),
         "router_vpn": router_vpn(),
+        "hub_proxy": bool(_HUB_PROXY),
     }
 
 
 # ── Цикл опроса хаба ───────────────────────────────────────────────────────
+
+# Через что ходить к ХАБУ (только к нему — пробы всегда напрямую). С мобильного
+# без белых списков соединение к зарубежному дата-центру замерзает после первых
+# ~16 КБ (ТСПУ, «TCP 16-20»): рукопожатие проходит, опрос хаба висит. Тогда
+# служебную связь пускают через локальный HTTP-прокси клиента (xray с CDN-ссылкой),
+# а сами проверки идут как есть — иначе мерили бы прокси, а не оператора.
+_HUB_PROXY = os.environ.get("NEXUS_PROBE_HUB_PROXY", "").strip()
+
+
+def _hub_proxy_handler() -> urllib.request.ProxyHandler:
+    if _HUB_PROXY:
+        return urllib.request.ProxyHandler({"http": _HUB_PROXY, "https": _HUB_PROXY})
+    return urllib.request.ProxyHandler({})
+
 
 def _call(hub: str, token: str, method: str, path: str, body: dict | None = None,
           timeout: float = 40.0) -> dict:
@@ -718,7 +983,7 @@ def _call(hub: str, token: str, method: str, path: str, body: dict | None = None
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                  "User-Agent": f"nexus-probe/{PROBE_VERSION}"},
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+    opener = urllib.request.build_opener(_hub_proxy_handler(),
                                          urllib.request.HTTPSHandler(context=hub_ssl_context()))
     with opener.open(req, timeout=timeout) as resp:
         raw = resp.read()
@@ -801,6 +1066,9 @@ def main() -> None:
     p.add_argument("--xray-url", default=os.environ.get("NEXUS_XRAY_URL", ""),
                    help="zip с xray: качать в /tmp перед сквозной проверкой и удалять после "
                         "простоя (роутер, где xray не влезает на флеш)")
+    p.add_argument("--hub-proxy", default=os.environ.get("NEXUS_PROBE_HUB_PROXY", ""),
+                   help="HTTP-прокси ТОЛЬКО для связи с хабом, например http://127.0.0.1:10809 "
+                        "(мобильный: прямой путь к зарубежному хабу режется). Пробы — напрямую")
     p.add_argument("--once", default=None, metavar="HOST",
                    help="не подключаться к хабу, а один раз проверить HOST и выйти")
     a = p.parse_args()
@@ -813,8 +1081,13 @@ def main() -> None:
         return
     if not a.token:
         p.error("нужен --token (или переменная NEXUS_PROBE_TOKEN)")
-    global _XRAY_URL
+    global _XRAY_URL, _HUB_PROXY
     _XRAY_URL = a.xray_url or ""
+    _HUB_PROXY = (a.hub_proxy or "").strip()
+    if _HUB_PROXY:
+        # Самообновление перезапускает файл с тем же argv, а окружение берёт
+        # прежнее: кладём прокси и туда, чтобы новый код не потерял хаб.
+        os.environ["NEXUS_PROBE_HUB_PROXY"] = _HUB_PROXY
     serve(a.hub, a.token, a.name, a.xray)
 
 
