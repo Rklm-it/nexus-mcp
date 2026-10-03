@@ -22,6 +22,12 @@ else
     B=""; D=""; R=""; G=""; Y=""; C=""; N=""
 fi
 OK="${G}●${N}"; BAD="${R}●${N}"; WARN="${Y}●${N}"
+# Ширина строк считается в символах, а не байтах: иначе кириллица ломает
+# выравнивание пунктов и правую стенку рамки. C.UTF-8 есть в любой Ubuntu.
+case "${LC_ALL:-${LANG:-}}" in
+    *UTF-8*|*utf8*|*UTF8*|*utf-8*) ;;
+    *) locale -a 2>/dev/null | grep -qiE '^c\.utf-?8$' && export LC_ALL=C.UTF-8 ;;
+esac
 
 die() { echo "${R}✗${N} $*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || die "нужен root"
@@ -55,10 +61,72 @@ ask()    { local a; printf '%s' "${C}›${N} $1 " >&2; IFS= read -r a <&3 || a="
 ask_s()  { local a; printf '%s' "${C}›${N} $1 " >&2; IFS= read -rs a <&3 || a=""; echo >&2; printf '%s' "$a"; }
 yes_no() { local a; a="$(ask "$1 [д/н]")"; case "$a" in д|Д|y|Y|да|Да|yes) return 0 ;; *) return 1 ;; esac; }
 pause()  { printf '\n%s' "${D}Enter — назад в меню${N}" >&2; local _; IFS= read -r _ <&3 || true; }
-title()  { printf '\n%s\n%s\n' "${B}${C}$1${N}" "${D}$(printf '─%.0s' $(seq 1 56))${N}"; }
+title()  { printf '\n %s▍%s%s%s\n %s\n' "$C" "$B" "$1" "$N" "${D}$(printf '─%.0s' $(seq 1 56))${N}"; }
 ok()     { echo "${G}✓${N} $*"; }
 bad()    { echo "${R}✗${N} $*"; }
 restart_hub() { systemctl restart nexus-mcp nexus-chat && ok "хаб и чат перезапущены" || bad "перезапуск не прошёл: journalctl -u nexus-mcp -n 30"; }
+
+# ── Пункты меню ──────────────────────────────────────────────────────────────
+# Один список на экран, выбор и ссылки «пункт N» в подсказках: номер — место
+# в списке. Раньше номера писались в трёх местах руками и разъехались (19 и
+# 20 стояли посреди раздела «Claude»). Формат: раздел|функция|пункт|пояснение.
+ITEMS=(
+    "Панели|a_panels|Список панелей|+ маршруты реле"
+    "Панели|a_panel_add|Добавить панель|с проверкой, что отвечает"
+    "Панели|a_panel_rename|Переименовать панель|ноды на реле связь не теряют"
+    "Панели|a_panel_remove|Удалить панель|"
+    "Ноды и серверы|a_nodes|Ноды всех панелей|статус и heartbeat"
+    "Ноды и серверы|a_key_to_node|Положить ключ хаба на сервер|напрямую или через живую ноду"
+    "Ноды и серверы|a_ssh_check|Проверить SSH до сервера|"
+    "Ноды и серверы|a_ssh_shell|Зайти на сервер ключом хаба|терминал или одна команда"
+    "Ноды и серверы|a_edits|Правки нод Claude|что менял и что можно откатить"
+    "Claude и приложение|a_login|Вход Claude в подписку|"
+    "Claude и приложение|a_app_line|Строка подключения приложения|"
+    "Claude и приложение|a_audit|Плановый аудит|время сводки уведомлением"
+    "Claude и приложение|a_usage|Расход Claude|токены: день, неделя, месяц"
+    "SIM-проверки (bschekbot)|a_bsbord_key|Ключ bschekbot|ввод скрыт"
+    "SIM-проверки (bschekbot)|a_bsbord_cap|Дневной потолок трат|"
+    "Обслуживание|a_actions|Действия из чата: вкл / выкл|"
+    "Обслуживание|a_rotate|Сменить секреты|коннектор, пробник, чат"
+    "Обслуживание|a_connector|Ссылка коннектора claude.ai|"
+    "Обслуживание|a_logs|Журналы|хаб / чат / Caddy / установка"
+    "Обслуживание|restart_hub|Перезапустить хаб и чат|"
+    "Обслуживание|a_update|Обновить хаб|"
+)
+
+# Номер пункта по функции — для подсказок «пункт N».
+num_of() {
+    local i=0 it
+    for it in "${ITEMS[@]}"; do
+        i=$((i + 1))
+        [ "$(echo "$it" | cut -d'|' -f2)" = "$1" ] && { echo "$i"; return; }
+    done
+    echo "?"
+}
+
+# ── Оформление ───────────────────────────────────────────────────────────────
+plain() { printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g'; }
+# Дополнить пробелами до ширины в символах (цвета не считаются).
+pad() { local p; p="$(plain "$1")"; local n=$(( $2 - ${#p} )); printf '%s%*s' "$1" $(( n > 0 ? n : 0 )) ""; }
+rule() { local s; printf -v s '%*s' "$1" ""; printf '%s' "${s// /$2}"; }
+
+hub_version() {
+    git -C "$APP" log -1 --format='%h · %cd' --date=short 2>/dev/null || true
+}
+
+# Рамка по самой длинной строке: правая стенка не уезжает на длинном адресе.
+box() {
+    local title="$1" right="$2"; shift 2
+    local w=56 row p cols
+    for row in "$@"; do p="$(plain "$row")"; [ $(( ${#p} + 4 )) -gt $w ] && w=$(( ${#p} + 4 )); done
+    cols="$(tput cols 2>/dev/null || echo 100)"; [ "$cols" -gt 20 ] && [ $w -gt $(( cols - 2 )) ] && w=$(( cols - 2 ))
+    # Верх: ─ заголовок ───── версия ─ — ровно w символов между углами.
+    local head=" $title " tail="${right:+ $right }"
+    local fill=$(( w - ${#head} - ${#tail} - 2 ))
+    printf '\n%s╭─%s%s%s─╮%s\n' "$C" "$B$head$N$C" "$(rule $(( fill > 0 ? fill : 0 )) ─)" "$D$tail$N$C" "$N"
+    for row in "$@"; do printf '%s│%s %s %s│%s\n' "$C" "$N" "$(pad "$row" $(( w - 2 )))" "$C" "$N"; done
+    printf '%s╰%s╯%s\n' "$C" "$(rule "$w" ─)" "$N"
+}
 
 # ── Шапка ────────────────────────────────────────────────────────────────────
 header() {
@@ -66,53 +134,43 @@ header() {
     chat="$(curl -fsS --connect-timeout 2 -m 4 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
     if [ -z "$chat" ]; then claude="$BAD чат не отвечает"
     elif echo "$chat" | grep -q '"logged_in":true'; then claude="$OK вошёл в подписку"
-    else claude="$WARN не вошёл — пункт 8"; fi
+    else claude="$WARN не вошёл — пункт $(num_of a_login)"; fi
     sim="$(hubpy sim | tail -1)"
     case "$sim" in "ключ не задан") sim="$D${sim}$N" ;; баланс*) sim="$OK $sim" ;; *) sim="$WARN $sim" ;; esac
     [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ] && acts="${G}включены${N}" || acts="${D}выключены${N}"
     audit="$(envget NEXUS_CHAT_AUDIT_AT)"; [ -n "$audit" ] || audit="${D}нет${N}"
     np="$(hubpy panels-count | tail -1)"
     tokens="$(usagepy --short | tail -1)"
-    printf '\n%s\n' "${B}╭─ Nexus Hub ${N}${D}$(hub_url)${N}"
-    printf '%s  хаб %s   чат %s   caddy %s\n' "${B}│${N}" "$(svc_dot nexus-mcp)" "$(svc_dot nexus-chat)" "$(svc_dot nexus-mcp-caddy)"
-    printf '%s  Claude  %s\n' "${B}│${N}" "$claude"
-    printf '%s  Токены  %s\n' "${B}│${N}" "$tokens"
-    printf '%s  SIM     %s\n' "${B}│${N}" "$sim"
-    printf '%s  Панели %s · действия из чата %s · аудит %s\n' "${B}│${N}" "${B}$np${N}" "$acts" "$audit"
-    printf '%s\n' "${B}╰────────────────────────────────────────────────────────${N}"
+    box "Nexus Hub" "$(hub_version)" \
+        "${D}Адрес  ${N} $(hub_url)" \
+        "${D}Службы ${N} $(svc_dot nexus-mcp) хаб   $(svc_dot nexus-chat) чат   $(svc_dot nexus-mcp-caddy) caddy" \
+        "${D}Claude ${N} $claude" \
+        "${D}Токены ${N} $tokens" \
+        "${D}SIM    ${N} $sim" \
+        "${D}Панели ${N} ${B}$np${N}   ${D}действия из чата${N} $acts   ${D}аудит${N} $audit"
 }
 
 menu() {
-    local s="${D}"
-    cat <<EOF
+    local i=0 sec="" it s f label hint
+    for it in "${ITEMS[@]}"; do
+        i=$((i + 1))
+        IFS='|' read -r s f label hint <<<"$it"
+        if [ "$s" != "$sec" ]; then
+            sec="$s"
+            printf '\n %s▍%s%s%s\n' "$C" "$B" "$s" "$N"
+        fi
+        if [ -n "$hint" ]; then label="$(pad "$label" 31)$D$hint$N"; fi
+        printf '  %s%3d%s  %s\n' "$B" "$i" "$N" "$label"
+    done
+    printf '\n  %s%3d%s  %s\n' "$B" 0 "$N" "Выход"
+}
 
- ${B}Панели${N}
-   1  Список панелей                 ${s}+ маршруты реле${N}
-   2  Добавить панель                ${s}с проверкой, что отвечает${N}
-   3  Переименовать панель           ${s}ноды на реле связь не теряют${N}
-   4  Удалить панель
- ${B}Ноды${N}
-   5  Ноды всех панелей              ${s}статус и heartbeat${N}
-   6  Положить ключ хаба на ноду     ${s}напрямую или через живую ноду${N}
-   7  Проверить SSH до ноды
- ${B}Claude и приложение${N}
-   8  Вход Claude в подписку
-   9  Строка подключения приложения
-  10  Плановый аудит                 ${s}время сводки уведомлением${N}
-  19  Расход Claude                  ${s}токены: день, неделя, месяц${N}
-  20  Правки нод Claude              ${s}что менял и что можно откатить${N}
- ${B}SIM-проверки (bschekbot)${N}
-  11  Ключ bschekbot                 ${s}ввод скрыт${N}
-  12  Дневной потолок трат
- ${B}Обслуживание${N}
-  13  Действия из чата: вкл / выкл
-  14  Сменить секреты                ${s}коннектор, пробник, чат${N}
-  15  Ссылка коннектора claude.ai
-  16  Журналы                        ${s}хаб / чат / Caddy / установка${N}
-  17  Перезапустить хаб и чат
-  18  Обновить хаб
-   0  Выход
-EOF
+# Выбранный номер → функция пункта; пусто — такого нет.
+item_func() {
+    [[ "$1" =~ ^[0-9]+$ ]] || return 0
+    local n=$(( 10#$1 ))
+    [ "$n" -ge 1 ] && [ "$n" -le "${#ITEMS[@]}" ] || return 0
+    echo "${ITEMS[$((n - 1))]}" | cut -d'|' -f2
 }
 
 # ── Действия ─────────────────────────────────────────────────────────────────
@@ -178,7 +236,7 @@ a_key_to_node() {
         ssh-copy-id -i "$KEY.pub" -p "$port" -o ProxyJump="$jump" -o ConnectTimeout=15 "$user@$ip" <&3
     else
         ssh-copy-id -i "$KEY.pub" -p "$port" -o ConnectTimeout=15 "$user@$ip" <&3
-    fi && ok "ключ положен — проверка: пункт 7"
+    fi && ok "ключ положен — проверка: пункт $(num_of a_ssh_check)"
 }
 
 a_ssh_check() {
@@ -188,7 +246,33 @@ a_ssh_check() {
     ssh -i "$KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
         "root@$ip" 'echo "  хост: $(hostname) · агент: $(cat /opt/vpn-cell/agent/VERSION 2>/dev/null || echo нет)"' \
         && ok "хаб заходит на $ip своим ключом" \
-        || bad "не заходит: Permission denied — ключа нет (пункт 6); timeout — путь до ноды режется"
+        || bad "не заходит: Permission denied — ключа нет (пункт $(num_of a_key_to_node)); timeout — путь до ноды режется"
+}
+
+# Зайти на сервер ключом хаба: когда с компьютера владельца SSH не пускает
+# (провайдер режет, пароля нет), а ключ хаба на сервере лежит — например,
+# поправить зеркало apt новому серверу до установки ноды (03.10.2026).
+a_ssh_shell() {
+    title "Зайти на сервер ключом хаба"
+    local ip port user jump cmd
+    ip="$(ask "IP сервера:")"; [ -n "$ip" ] || return
+    port="$(ask "SSH-порт [22]:")"; port="${port:-22}"
+    user="$(ask "Пользователь [root]:")"; user="${user:-root}"
+    jump="$(ask "Через живую ноду? (root@IP, Enter — напрямую):")"
+    cmd="$(ask "Команда (Enter — открыть терминал):")"
+    local opts=(-i "$KEY" -p "$port" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
+    [ -n "$jump" ] && opts+=(-o ProxyJump="$jump")
+    local rc
+    if [ -n "$cmd" ]; then
+        echo "${D}$user@$ip \$ $cmd${N}"
+        ssh "${opts[@]}" -o BatchMode=yes "$user@$ip" "$cmd" <&3; rc=$?
+        if [ "$rc" = 0 ]; then ok "команда выполнена"
+        else bad "код $rc — вывод выше; Permission denied — ключа нет (пункт $(num_of a_key_to_node))"; fi
+    else
+        echo "${D}Терминал $user@$ip — выход: exit или Ctrl+D.${N}"
+        ssh -t "${opts[@]}" "$user@$ip" <&3; rc=$?
+        [ "$rc" = 0 ] || bad "сессия закончилась с кодом $rc"
+    fi
 }
 
 a_login() { title "Вход Claude в подписку"; nexus-chat-login <&3; }
@@ -247,8 +331,8 @@ a_actions() {
 a_rotate() {
     title "Сменить секреты"
     echo "Новые: секрет коннектора claude.ai, токен домашнего пробника, токен чата."
-    echo "${Y}После смены:${N} коннектор в claude.ai — новая ссылка (пункт 15), приложение —"
-    echo "новая строка (пункт 9), пробник — новый --token. Ключ к нодам не меняется."
+    echo "${Y}После смены:${N} коннектор в claude.ai — новая ссылка (пункт $(num_of a_connector)), приложение —"
+    echo "новая строка (пункт $(num_of a_app_line)), пробник — новый --token. Ключ к нодам не меняется."
     yes_no "Сменить?" || return
     envset NEXUS_MCP_SECRET "$(gen 40)"; envset NEXUS_PROBE_TOKENS "$(gen 32)"; envset NEXUS_CHAT_TOKEN "$(gen 48)"
     restart_hub
@@ -303,16 +387,12 @@ while true; do
     clear 2>/dev/null || true
     header
     menu
+    echo
     c="$(ask "Пункт:")"
     case "$c" in
-        1) a_panels ;; 2) a_panel_add ;; 3) a_panel_rename ;; 4) a_panel_remove ;;
-        5) a_nodes ;; 6) a_key_to_node ;; 7) a_ssh_check ;;
-        8) a_login ;; 9) a_app_line ;; 10) a_audit ;;
-        11) a_bsbord_key ;; 12) a_bsbord_cap ;;
-        13) a_actions ;; 14) a_rotate ;; 15) a_connector ;; 16) a_logs ;; 17) restart_hub ;; 18) a_update ;;
-        19) a_usage ;; 20) a_edits ;;
         0|q|й|"") echo; exit 0 ;;
-        *) bad "нет такого пункта" ;;
     esac
+    f="$(item_func "$c")"
+    if [ -n "$f" ]; then "$f"; else bad "нет такого пункта: $c"; fi
     pause
 done

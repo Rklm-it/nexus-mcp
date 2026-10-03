@@ -5,6 +5,7 @@ systemctl/curl, ввод пунктов из файла вместо терми�
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -46,10 +47,23 @@ ENV = ("NEXUS_MCP_SECRET=secretsecretsecretsecretsecret1234\nNEXUS_CHAT_TOKEN=ch
        "NEXUS_BSBORD_DAILY_RUB=300\n")
 
 
+def _items() -> list[tuple[str, str, str]]:
+    """Пункты меню из ITEMS скрипта: (раздел, функция, подпись) по порядку."""
+    text = (ROOT / "bin/nexus-hub").read_text()
+    block = text.split("ITEMS=(", 1)[1].split("\n)", 1)[0]
+    rows = re.findall(r'^\s*"([^"]+)"\s*$', block, re.M)
+    return [tuple(r.split("|")[:3]) for r in rows]
+
+
+def _num(func: str) -> str:
+    return str([f for _s, f, _l in _items()].index(func) + 1)
+
+
 def test_menu_changes_settings(tmp_path):
     (tmp_path / "env").write_text(ENV)
-    # 13: включить действия; 10: аудит; 12: потолок; 10: плохое время — отказ; 0: выход
-    r, env = _run(tmp_path, "13\nд\n\n10\n09:00,21:00\n\n12\n150\n\n10\n25:99\n\n0\n")
+    acts, audit, cap = _num("a_actions"), _num("a_audit"), _num("a_bsbord_cap")
+    # действия вкл; аудит; потолок; плохое время аудита — отказ; 0: выход
+    r, env = _run(tmp_path, f"{acts}\nд\n\n{audit}\n09:00,21:00\n\n{cap}\n150\n\n{audit}\n25:99\n\n0\n")
     assert r.returncode == 0, r.stderr
     assert "NEXUS_ALLOW_ACTIONS=1" in env
     assert "NEXUS_CHAT_AUDIT_AT=09:00,21:00" in env
@@ -59,9 +73,9 @@ def test_menu_changes_settings(tmp_path):
 
 def test_secrets_are_shown_only_on_yes_and_rotated(tmp_path):
     (tmp_path / "env").write_text(ENV)
-    r, _ = _run(tmp_path, "9\nн\n\n0\n")
+    r, _ = _run(tmp_path, f"{_num('a_app_line')}\nн\n\n0\n")
     assert "chat_old_token" not in r.stdout + r.stderr          # «нет» — секрет не на экране
-    r, env = _run(tmp_path, "14\nд\n\n0\n")
+    r, env = _run(tmp_path, f"{_num('a_rotate')}\nд\n\n0\n")
     assert "chat_old_token" not in env and "probe_old" not in env and "secretsecretsecret" not in env
     assert "NEXUS_CHAT_TOKEN=" in env and "NEXUS_MCP_SECRET=" in env
 
@@ -81,7 +95,7 @@ def test_usage_and_edits_items(tmp_path):
     """Шапка показывает токены; пункты 19 и 20 работают и без чата/правок."""
     env = ENV + f"NEXUS_STATE_DIR={tmp_path / 'state'}\n"
     (tmp_path / "env").write_text(env)
-    r, _ = _run(tmp_path, "19\n\n20\n\n0\n")
+    r, _ = _run(tmp_path, f"{_num('a_usage')}\n\n{_num('a_edits')}\n\n0\n")
     assert r.returncode == 0, r.stderr
     assert "Токены" in r.stdout and "чат ещё не запускался" in r.stdout
     assert "правок ещё не было" in r.stdout
@@ -92,6 +106,47 @@ def test_usage_and_edits_items(tmp_path):
 
     st = Store(tmp_path / "state" / "chat" / "chat.db")
     st.add_usage("chat", "claude-x", input=1500, output=500, cache_read=1_000_000)
-    r, _ = _run(tmp_path, "19\n\n0\n")
+    r, _ = _run(tmp_path, f"{_num('a_usage')}\n\n0\n")
     assert "сегодня 1 млн" in r.stdout, r.stdout
     assert "Этот месяц" in r.stdout and "claude.ai → Settings → Usage" in r.stdout
+
+
+def test_menu_numbers_follow_the_list(tmp_path):
+    """Экран, выбор и подсказки — из одного ITEMS: номера подряд по разделам,
+    у каждого пункта есть функция, а «пункт N» в тексте ведёт куда надо."""
+    items = _items()
+    text = (ROOT / "bin/nexus-hub").read_text()
+    for _s, func, _l in items:
+        assert re.search(rf"^{func}\(\)", text, re.M), f"нет функции {func}"
+    sections = [s for s, _f, _l in items]
+    assert sections == sorted(sections, key=sections.index)        # раздел не разорван
+    assert not re.search(r"пункт [0-9]", text)                      # номера только через num_of
+
+    (tmp_path / "env").write_text(ENV)
+    r, _ = _run(tmp_path, "0\n")
+    # Пробелы, а не \s: \s съедал перевод строки, и следующий пункт пропадал.
+    shown = re.findall(r"^ +(\d+) {2}(\S.*?)(?: {2,}|$)", r.stdout, re.M)
+    assert [int(n) for n, _ in shown][:len(items)] == list(range(1, len(items) + 1))
+    assert [lbl.strip() for _n, lbl in shown][:len(items)] == [lbl for _s, _f, lbl in items]
+    r, _ = _run(tmp_path, "99\n\n0\n")
+    assert "нет такого пункта: 99" in r.stdout
+
+
+def test_status_box_is_aligned(tmp_path):
+    (tmp_path / "env").write_text(ENV)
+    r, _ = _run(tmp_path, "", "status")
+    lines = [ln for ln in r.stdout.splitlines() if ln and ln[0] in "╭│╰"]
+    assert len(lines) >= 5 and len({len(ln) for ln in lines}) == 1, lines   # правая стенка ровная
+
+
+def test_shell_item_runs_command_with_hub_key(tmp_path):
+    (tmp_path / "env").write_text(ENV)
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "ssh").write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > {tmp_path}/ssh.args\necho "Reading package lists... Done"\n')
+    (bin_ / "ssh").chmod(0o755)
+    r, _ = _run(tmp_path, f"{_num('a_ssh_shell')}\n203.0.113.9\n\n\n\napt-get update\n\n0\n")
+    args = (tmp_path / "ssh.args").read_text().splitlines()
+    assert args[args.index("-i") + 1].endswith("etc/id_ed25519")             # ключ хаба
+    assert "root@203.0.113.9" in args and args[-1] == "apt-get update"
+    assert "BatchMode=yes" in args and "команда выполнена" in r.stdout
