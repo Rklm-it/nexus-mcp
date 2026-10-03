@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import base64
 import socket
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
@@ -40,13 +40,26 @@ async def fetch_links(url: str = "") -> list[str]:
     if not url:
         raise LinksError("нет подписки для проверки: задайте NEXUS_TEST_SUB_URL "
                          "(подписка тестового юзера, привязанного ко всем нодам)")
-    # UA обычного клиента: панель отдаёт формат по User-Agent.
+    # UA обычного клиента: панель отдаёт формат по User-Agent. А v2rayNG
+    # панель числит среди понимающих xray JSON (маркер «v2rayn»), и с
+    # включённой «Подпиской JSON» отдаёт массив конфигов без единой ссылки —
+    # у Sava-link (03.10.2026) подписка выглядела пустой при 21 строке.
+    # format=plain — те же ссылки открытым текстом, его панель JSON-ом не
+    # подменяет. Свой format в ссылке (подписку дал человек) не трогаем.
+    # Дописать, а не передать params=: им httpx query ЗАМЕНЯЕТ, и ссылка
+    # теряла свои ?sort=/?group=.
+    target = httpx.URL(url)
+    if "format" not in parse_qs(urlparse(url).query):
+        target = target.copy_merge_params({"format": "plain"})
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-        r = await c.get(url, headers={"User-Agent": "v2rayNG/1.9"})
+        r = await c.get(target, headers={"User-Agent": "v2rayNG/1.9"})
     if r.status_code >= 400:
         raise LinksError(f"подписка ответила {r.status_code}: {r.text[:200]}")
     links = decode_subscription(r.text)
     if not links:
+        if r.text.lstrip()[:1] in ("[", "{"):
+            raise LinksError("подписка пришла JSON-ом (xray/sing-box конфиги), а не ссылками — "
+                             "уберите format=json из ссылки или проверьте «Подписку JSON» панели")
         raise LinksError("в подписке нет ссылок — тестовый юзер не привязан к нодам или истёк")
     return links
 
