@@ -99,6 +99,103 @@ def test_precheck_script_is_valid_bash_and_parses():
     assert kv["os"] == "Ubuntu 24.04 LTS" and kv["panel_direct"] == "000"
 
 
+def _fake_bin(tmp_path):
+    """ss с «чужим» xray на 443 и 3x-ui на 2053; curl: ru-зеркало молчит."""
+    b = tmp_path / "bin"
+    b.mkdir()
+    (b / "ss").write_text(
+        "#!/bin/bash\n"
+        "echo 'tcp LISTEN 0 4096 *:443 *:* users:((\"xray\",pid=11,fd=3))'\n"
+        "echo 'tcp LISTEN 0 4096 0.0.0.0:2053 0.0.0.0:* users:((\"x-ui\",pid=12,fd=7))'\n"
+        "echo 'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=1,fd=3))'\n")
+    (b / "curl").write_text('#!/bin/bash\nfor a; do u="$a"; done\n'
+                            'case "$u" in *ru.archive*) echo -n 000; exit 28 ;; *) echo -n 200 ;; esac\n')
+    for f in b.iterdir():
+        f.chmod(0o755)
+    return b
+
+
+def _apt_dir(tmp_path):
+    d = tmp_path / "apt"
+    (d / "sources.list.d").mkdir(parents=True)
+    (d / "sources.list.d" / "ubuntu.sources").write_text(
+        "Types: deb\nURIs: http://ru.archive.ubuntu.com/ubuntu/\nSuites: noble noble-updates\n\n"
+        "Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\n")
+    (d / "sources.list").write_text("# пусто\n")
+    return d
+
+
+def test_precheck_finds_dead_mirror_and_port_owners(tmp_path):
+    """Прогон настоящим bash: зеркало и владельцы портов, как на польском VPS 03.10."""
+    import os
+
+    b, d = _fake_bin(tmp_path), _apt_dir(tmp_path)
+    s = ni.precheck_script("https://p.ru", apt_sources=f"{d}/sources.list {d}/sources.list.d/*.sources")
+    r = subprocess.run(["bash", "-s"], input=s, text=True, capture_output=True, timeout=30,
+                       env={**os.environ, "PATH": f"{b}:{os.environ['PATH']}"})
+    pre = ni.parse_kv(r.stdout)
+    assert ni.parse_pairs(pre["port_owners"]) == {"443": "xray", "2053": "x-ui", "22": "sshd"}
+    assert ni.parse_pairs(pre["apt_mirrors"]) == {"ru.archive.ubuntu.com": "000", "security.ubuntu.com": "200"}
+    assert ni.dead_mirrors(pre) == ["ru.archive.ubuntu.com"]
+
+
+def test_apt_fix_switches_only_dead_mirror(tmp_path):
+    import os
+
+    b, d = _fake_bin(tmp_path), _apt_dir(tmp_path)
+    s = ni.apt_fix_script(["ru.archive.ubuntu.com"], force_ipv4=True, apt_dir=str(d),
+                          backup_dir=str(tmp_path / "bak"))
+    r = subprocess.run(["bash", "-s"], input=s, text=True, capture_output=True, timeout=30,
+                       env={**os.environ, "PATH": f"{b}:{os.environ['PATH']}"})
+    src = (d / "sources.list.d" / "ubuntu.sources").read_text()
+    assert "URIs: http://archive.ubuntu.com/ubuntu/" in src and "ru.archive" not in src
+    assert "http://security.ubuntu.com/ubuntu/" in src                 # чужое не тронуто
+    assert 'ForceIPv4 "true"' in (d / "apt.conf.d" / "99nexus-force-ipv4").read_text()
+    backups = list((tmp_path / "bak").glob("*/ubuntu.sources"))
+    assert backups and "ru.archive" in backups[0].read_text()           # копия — до правки, не рядом
+    assert not list((d / "sources.list.d").glob("*.bak"))
+    assert "apt_fix=switched:ru.archive.ubuntu.com->archive.ubuntu.com:200" in r.stdout
+    with pytest.raises(ni.InstallError):
+        ni.apt_fix_script(["x; rm -rf /"], force_ipv4=False)
+
+
+DEAD_MIRROR = ("user=root\ncell=absent\nports=22,443\nport_owners=443:xray,22:sshd,\npanel_direct=200\n"
+               "apt_mirrors=ru.archive.ubuntu.com:000,security.ubuntu.com:200,\nipv6=no\n")
+
+
+def test_preview_names_port_owner_and_dead_mirror(panel, monkeypatch):
+    from nexus_mcp import server
+
+    hub = FakeHub(monkeypatch, precheck=DEAD_MIRROR)
+    r = asyncio.run(server.node_install("main", "45.141.118.7", "de-1", "DE"))
+    assert r["ready"] and r["apt_fix"] == ["ru.archive.ubuntu.com"]
+    text = " ".join(r["warnings"])
+    assert "443 (xray)" in text and "ru.archive.ubuntu.com" in text
+    assert not any("NEXUS_APT_FIX" in s for s in hub.scripts)          # план ничего не меняет
+
+
+def test_install_fixes_mirror_before_installer(panel, monkeypatch):
+    from nexus_mcp import server
+
+    hub = FakeHub(monkeypatch, precheck=DEAD_MIRROR)
+    r = asyncio.run(server.node_install("main", "45.141.118.7", "de-1", "DE", confirm=True))
+    assert r["ok"] and r["apt_fix"].startswith("switched:ru.archive.ubuntu.com")
+    order = [("fix" if "NEXUS_APT_FIX" in s else "install" if "NEXUS_INSTALLER_B64" in s else "other")
+             for s in hub.scripts]
+    assert order.index("fix") < order.index("install")
+    assert "ForceIPv4" in next(s for s in hub.scripts if "NEXUS_APT_FIX" in s)   # ipv6=no
+
+
+def test_install_stops_when_no_mirror_answers(panel, monkeypatch):
+    from nexus_mcp import server
+
+    hub = FakeHub(monkeypatch, precheck=DEAD_MIRROR)
+    hub.apt_fix_result = "switched:ru.archive.ubuntu.com->archive.ubuntu.com:000 backup=/x"
+    r = asyncio.run(server.node_install("main", "45.141.118.7", "de-1", "DE", confirm=True))
+    assert r["ok"] is False and r["error"] == "apt_mirror_dead"
+    assert not any("NEXUS_INSTALLER_B64" in s for s in hub.scripts)    # восемь минут впустую не тратим
+
+
 @pytest.mark.parametrize("route,pre,relay,expect", [
     ("auto", {"panel_direct": "200"}, "R", ("direct", False)),
     ("auto", {"panel_direct": "000", "panel_relay": "200"}, "R", ("relay", False)),
@@ -124,6 +221,7 @@ class FakeHub:
         self.posted: list[dict] = []
         self.precheck = precheck
         self.installer_registers = installer_registers
+        self.apt_fix_result = "switched:ru.archive.ubuntu.com->archive.ubuntu.com:200 backup=/var/backups/x"
 
         async def run_script(node, script, timeout=45):
             self.scripts.append(script)
@@ -136,6 +234,8 @@ class FakeHub:
                 return ssh.SshResult(True, 0, "шаг… токен ADMINTOKEN123\nrc=0\n", "", 5.0)
             if "CELL_API_TOKEN" in script:
                 return ssh.SshResult(True, 0, "CELLTOKEN42\n", "", 5.0)
+            if "NEXUS_APT_FIX" in script:
+                return ssh.SshResult(True, 0, f"apt_fix={self.apt_fix_result}\n", "", 2.0)
             raise AssertionError(script[:200])
 
         async def brain_get(path, p, timeout=15.0):

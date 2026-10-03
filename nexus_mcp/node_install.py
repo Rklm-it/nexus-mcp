@@ -6,9 +6,13 @@
 достаёт, и его ключ владелец кладёт в authorized_keys через веб-консоль
 хостера. Дальше хаб делает то же, что человек в терминале:
 
-1. План (без confirm, ничего не меняет): SSH до сервера, ОС, занятые порты,
-   нет ли уже агента, достаёт ли сервер до панели напрямую или только через
-   реле хаба; в панели — нет ли уже ноды с таким IP или именем.
+1. План (без confirm, ничего не меняет): SSH до сервера, ОС, занятые порты
+   и кто их держит, нет ли уже агента, открываются ли с сервера зеркала apt,
+   достаёт ли сервер до панели напрямую или только через реле хаба; в
+   панели — нет ли уже ноды с таким IP или именем.
+1.5. Мёртвое зеркало Ubuntu (хостер прописал своё, а оно с сервера не
+   открывается) хаб перед установкой переключает на archive.ubuntu.com —
+   иначе установщик падает на пакетах через восемь минут.
 2. Установка (confirm=true): хаб качает установщик у СВОЕЙ панели (тот самый
    install-node.sh, что отдаёт кнопка «Добавить ноду»), передаёт его на
    сервер через stdin SSH и запускает без вопросов (ADMIN_TOKEN, NODE_NAME,
@@ -59,6 +63,15 @@ CDN_PROTOCOLS = ("vless_xhttp_cdn",)
 ROUTES = ("auto", "direct", "relay")
 # Установка идёт минутами (apt, xray, hysteria); с запасом на медленный apt.
 INSTALL_TIMEOUT = 1800.0
+# Порты, которые ставит установщик: Reality, gRPC, SS-2022, Hysteria2, Cell API.
+INSTALL_PORTS = ("443", "2053", "2096", "8443", str(CELL_PORT))
+# Где apt держит источники (Ubuntu 24.04 — deb822 в ubuntu.sources).
+APT_SOURCES = "/etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources"
+# Куда переключать мёртвое зеркало Ubuntu и где хранить копии источников.
+# Копии — не рядом: apt читает всё в sources.list.d (инвариант 12 vgx3d).
+APT_MIRROR = "archive.ubuntu.com"
+APT_BACKUP_DIR = "/var/backups/nexus-mcp/apt"
+_MIRROR_HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 
 _COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 _HOST_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
@@ -110,7 +123,7 @@ def ssh_node(params: dict, ssh_user: str = "") -> dict:
 
 # ── Скрипты на сервере ─────────────────────────────────────────────────────
 
-def precheck_script(panel_url: str, relay_url: str = "") -> str:
+def precheck_script(panel_url: str, relay_url: str = "", apt_sources: str = "") -> str:
     """Только чтение: что за машина и достаёт ли она до панели. Код ответа
     `/install/brain-ip` — тот же пинг, которым установщик проверяет панель."""
     panel_q = shlex.quote(recipes._url(panel_url) + "/install/brain-ip")
@@ -122,8 +135,25 @@ def precheck_script(panel_url: str, relay_url: str = "") -> str:
         f'[ -f {recipes.CELL_DIR}/.env ] && echo "cell=present" || echo "cell=absent"',
         "echo \"ports=$(ss -Hltnu 2>/dev/null | awk '{print $5}' | grep -oE '[0-9]+$' | sort -un | tr '\\n' ',')\"",
         'command -v curl >/dev/null && echo "curl=yes" || echo "curl=no"',
-        "code() { curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 \"$1\" 2>/dev/null || echo 000; }",
+        # Кто держит порт: «443:xray,2053:x-ui» — «заняты порты» без имени не
+        # говорит, чистый ли сервер на самом деле (остатки 3x-ui, чужой xray).
+        "echo \"port_owners=$(ss -Hltnup 2>/dev/null | awk '{p=$5; sub(/.*:/,\"\",p); u=\"?\";"
+        " if (match($0,/users:\\(\\(\"[^\"]+\"/)) u=substr($0,RSTART+9,RLENGTH-10); print p\":\"u}'"
+        " | sort -u | tr '\\n' ',')\"",
+        # Без «|| echo 000»: curl сам печатает 000 при отказе и выходит с
+        # ошибкой — дописанный второй 000 давал «HTTP 000000».
+        "code() { local c; c=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout \"${2:-10}\""
+        " --max-time \"${3:-20}\" \"$1\" 2>/dev/null); echo \"${c:-000}\"; }",
         f'echo "panel_direct=$(code {panel_q})"',
+        # Зеркала apt: хостер прописывает своё (ru.archive.ubuntu.com на
+        # польском VPS, 03.10.2026), оно с сервера не открывается, и
+        # установщик падает на python3-venv через восемь минут.
+        "mirrors=$(grep -hoE 'https?://[^/[:space:]]+/ubuntu' " + (apt_sources or APT_SOURCES) + " 2>/dev/null"
+        " | sed -E 's#^https?://##; s#/ubuntu$##' | sort -u)",
+        # Без curl мерить нечем — молчим, а не объявляем все зеркала мёртвыми.
+        "m=''; command -v curl >/dev/null && for h in $mirrors; do m=\"$m$h:$(code \"http://$h/ubuntu/\" 6 10),\"; done",
+        'echo "apt_mirrors=$m"',
+        "ip -6 route show default 2>/dev/null | grep -q . && echo 'ipv6=yes' || echo 'ipv6=no'",
     ]
     if relay_url:
         lines.append(f'echo "panel_relay=$(code {shlex.quote(recipes._url(relay_url) + "/install/brain-ip")})"')
@@ -134,9 +164,58 @@ def parse_kv(text: str) -> dict:
     out = {}
     for line in (text or "").splitlines():
         k, sep, v = line.partition("=")
-        if sep and re.fullmatch(r"[a-z_]+", k.strip()):
+        if sep and re.fullmatch(r"[a-z0-9_]+", k.strip()):
             out[k.strip()] = v.strip()
     return out
+
+
+def parse_pairs(value: str) -> dict[str, str]:
+    """«443:xray,2053:x-ui,» → {"443": "xray", ...} (port_owners, apt_mirrors)."""
+    out: dict[str, str] = {}
+    for item in (value or "").split(","):
+        k, sep, v = item.strip().rpartition(":")
+        if sep and k:
+            out.setdefault(k, v)
+    return out
+
+
+def dead_mirrors(pre: dict) -> list[str]:
+    """Зеркала Ubuntu, которые с сервера не открываются (код 000)."""
+    return sorted(h for h, code in parse_pairs(pre.get("apt_mirrors", "")).items()
+                  if code == "000" and _MIRROR_HOST_RE.match(h) and h != APT_MIRROR)
+
+
+def apt_fix_script(hosts: list[str], force_ipv4: bool, apt_dir: str = "/etc/apt",
+                   backup_dir: str = APT_BACKUP_DIR) -> str:
+    """Переключить мёртвые зеркала Ubuntu на archive.ubuntu.com перед установкой.
+
+    Меняется только `://<зеркало>/ubuntu` — путь security и чужие репозитории
+    не трогаются. Копии источников — в backup_dir. Без IPv6-маршрута apt
+    ходит только по IPv4: иначе каждый запрос сперва ждёт «Network is
+    unreachable» на AAAA. Итог — строка apt_fix=…, её читает хаб.
+    """
+    for h in hosts:
+        if not _MIRROR_HOST_RE.match(h):
+            raise InstallError(f"«{h}» — не имя зеркала")
+    # В имени только [A-Za-z0-9.-]: экранировать для sed -E надо лишь точку.
+    seds = " ".join(f"-e {shlex.quote('s#://' + h.replace('.', chr(92) + '.') + '/ubuntu#://' + APT_MIRROR + '/ubuntu#g')}"
+                    for h in hosts)
+    d = shlex.quote(apt_dir)
+    b = shlex.quote(backup_dir)
+    ipv4 = (f"echo 'Acquire::ForceIPv4 \"true\";' > {d}/apt.conf.d/99nexus-force-ipv4" if force_ipv4 else ":")
+    return f"""set +e
+# NEXUS_APT_FIX
+ts=$(date +%Y%m%d-%H%M%S)
+mkdir -p {b}/$ts {d}/apt.conf.d
+for f in {d}/sources.list {d}/sources.list.d/*.list {d}/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    cp -a "$f" {b}/$ts/ && sed -i -E {seds} "$f"
+done
+{ipv4}
+code=$(curl -s -o /dev/null -w '%{{http_code}}' --connect-timeout 6 --max-time 10 http://{APT_MIRROR}/ubuntu/ 2>/dev/null)
+code=${{code:-000}}
+echo "apt_fix=switched:{','.join(hosts)}->{APT_MIRROR}:$code backup={backup_dir}/$ts"
+"""
 
 
 def install_script(installer: str, params: dict, admin_token: str, brain_url: str = "") -> str:
@@ -307,15 +386,25 @@ async def plan(panel_name: str, params: dict, ssh_user: str = "") -> dict:
         pre = {}
     else:
         pre = parse_kv(res.stdout)
-        out["server"] = {k: pre.get(k) for k in ("os", "user", "arch", "cell", "ports", "curl")}
+        out["server"] = {k: pre.get(k) for k in ("os", "user", "arch", "cell", "ports", "curl", "ipv6")}
         if pre.get("user") != "root":
             blockers.append(f"вошли как {pre.get('user')}, а установщику нужен root")
         if pre.get("cell") == "present":
             blockers.append(f"на сервере уже стоит Cell-агент ({recipes.CELL_DIR}/.env) — это не чистый сервер")
         busy = {x for x in (pre.get("ports") or "").split(",") if x}
-        taken = sorted(busy & {"443", "8443", str(CELL_PORT)}, key=int)
+        taken = sorted(busy & set(INSTALL_PORTS), key=int)
         if taken:
-            warnings.append(f"заняты порты {', '.join(taken)} — их занимают протоколы и Cell API")
+            owners = parse_pairs(pre.get("port_owners", ""))
+            out["server"]["port_owners"] = {p: owners.get(p, "?") for p in taken}
+            named = ", ".join(f"{p} ({owners[p]})" if owners.get(p, "?") != "?" else p for p in taken)
+            warnings.append(f"заняты порты {named} — их занимают протоколы и Cell API; "
+                            "если это остатки другой панели, остановите её до установки")
+        dead = dead_mirrors(pre)
+        if dead:
+            out["apt_fix"] = dead
+            warnings.append(f"зеркало apt {', '.join(dead)} с сервера не открывается — установщик упал бы на "
+                            f"пакетах; перед установкой хаб переключит его на {APT_MIRROR} (копия источников — "
+                            f"{APT_BACKUP_DIR})")
         route, why, blocking = pick_route(params["route"], pre, relay_url)
         out["route"] = route
         if route == "relay":
@@ -346,11 +435,27 @@ async def install(panel_name: str, params: dict, ssh_user: str = "") -> dict:
     installer = await fetch_installer(p)
     brain_url = pl["relay_url"] if pl["route"] == "relay" else ""
     node = ssh_node(params, ssh_user)
+    apt_fix = ""
+    if pl.get("apt_fix"):
+        force_ipv4 = (pl.get("server") or {}).get("ipv6") == "no"
+        fix = await ssh.run_script(node, apt_fix_script(pl["apt_fix"], force_ipv4), timeout=60)
+        apt_fix = next((ln.split("=", 1)[1] for ln in (fix.stdout or "").splitlines()
+                        if ln.startswith("apt_fix=")), "")
+        if not fix.ok or not apt_fix:
+            return {"ok": False, "error": "apt_fix_failed", "plan": pl,
+                    "detail": f"зеркало apt не переключилось ({fix.failure or 'нет итога'}): "
+                              f"{(fix.stderr or fix.stdout or '')[-300:]}"}
+        if apt_fix.split(" ", 1)[0].endswith(":000"):
+            return {"ok": False, "error": "apt_mirror_dead", "apt_fix": apt_fix, "plan": pl,
+                    "detail": f"зеркало переключено, но и {APT_MIRROR} с сервера не открывается — у сервера "
+                              "нет выхода в интернет по HTTP; установщик не скачает пакеты"}
     res = await ssh.run_script(node, install_script(installer, params, token, brain_url), timeout=INSTALL_TIMEOUT)
     stdout = scrub(res.stdout, [token])
     rc_line = re.findall(r"^rc=(\d+)$", stdout, re.M)
     out: dict = {"panel": p["name"], "node": params["name"], "ip": params["ip"], "route": pl["route"],
                  "installer_rc": int(rc_line[-1]) if rc_line else None, "output": stdout[-12000:]}
+    if apt_fix:
+        out["apt_fix"] = apt_fix
     if pl["route"] == "relay":
         out["relay_url"] = pl["relay_url"]
     if not res.ok:
