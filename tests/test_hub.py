@@ -13,6 +13,7 @@ import subprocess
 import threading
 from pathlib import Path
 
+import httpx
 import pytest
 
 from nexus_mcp import diagnose, inventory, links, recipes, ssh
@@ -472,6 +473,40 @@ def test_subscription_decoding_and_node_match():
     uris = links.decode_subscription(body)
     assert len(uris) == 2
     assert links.links_for_node(uris, {"ip": "203.0.113.7"}) == [VLESS]
+
+
+def _panel_with_json_sub(monkeypatch):
+    """Подписка как у панели с «Подпиской JSON»: v2rayNG без format получает
+    массив xray-конфигов, format=plain — ссылки (brain subscription.py)."""
+    seen = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url)
+        fmt = req.url.params.get("format", "base64")
+        if fmt == "base64" and "v2rayng" in req.headers.get("user-agent", "").lower():
+            return httpx.Response(200, json=[{"outbounds": [{"protocol": "vless"}]}])
+        if fmt == "json":
+            return httpx.Response(200, json=[{"outbounds": []}])
+        return httpx.Response(200, text=VLESS + "\n")
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(links.httpx, "AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    return seen
+
+
+def test_fetch_links_survives_panel_json_subscription(monkeypatch):
+    seen = _panel_with_json_sub(monkeypatch)
+    assert asyncio.run(links.fetch_links("https://sub.example/api/v1/sub/TOKEN?sort=ping")) == [VLESS]
+    assert seen[-1].params.get("format") == "plain"
+    assert seen[-1].params.get("sort") == "ping"          # свои параметры ссылки не теряются
+
+
+def test_fetch_links_keeps_own_format_and_explains_json(monkeypatch):
+    seen = _panel_with_json_sub(monkeypatch)
+    with pytest.raises(links.LinksError, match="JSON-ом"):
+        asyncio.run(links.fetch_links("https://sub.example/api/v1/sub/TOKEN?format=json"))
+    assert seen[-1].params.get_list("format") == ["json"]
 
 
 def test_e2e_rewrites_inbounds_and_reports_missing_xray():
