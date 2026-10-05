@@ -56,7 +56,7 @@ import time
 import urllib.error
 import urllib.request
 
-PROBE_VERSION = "1.3.0"
+PROBE_VERSION = "1.4.0"
 
 # Лёгкие пробы, которые можно гнать пачкой. e2e сюда не входит: каждая —
 # отдельный процесс xray, на роутере это десятки мегабайт.
@@ -747,9 +747,164 @@ def _speed_upload(port: int, url: str, total: int, max_time: float, timeout: flo
     return res
 
 
+# ── Отзывчивость под нагрузкой ─────────────────────────────────────────────
+# Замер скорости гонит одну закачку и не видит главного: пока канал забит,
+# Telegram и сайты ждут в той же очереди (xmux сажает всё в пару соединений,
+# CDN копит мегабайты перед медленной симкой). Здесь закачка в несколько
+# потоков, а рядом каждые полсекунды — короткий запрос или открытие страницы.
+# Фазы: тишина → закачка → после неё (как быстро отходит).
+
+# (имя, адрес, «страница целиком»). Цели — по разные стороны маршрутизации
+# ноды: google и ya.ru нода отдаёт сама, Telegram и YouTube — через выход за
+# границу. Залипло только второе — дело в выходе, а не в канале до ноды.
+LOAD_TARGETS = (
+    ("google", "https://www.gstatic.com/generate_204", False),
+    ("telegram", "https://telegram.org/robots.txt", False),
+    ("ya.ru", "https://ya.ru/", True),
+    ("youtube", "https://www.youtube.com/robots.txt", True),
+)
+LOAD_STREAMS = 4
+LOAD_IDLE_S = 4.0
+LOAD_AFTER_S = 10.0
+LOAD_EVERY_S = 0.5
+LOAD_PING_TIMEOUT = 10.0
+LOAD_PAGE_CAP = 2_000_000
+
+
+def _load_sample(port: int, url: str, page: bool, timeout: float) -> dict:
+    """Один запрос через туннель: время до статуса или до конца страницы."""
+    t0 = time.monotonic()
+    s, host, path = _open_via_socks(port, url, timeout)
+    try:
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                  f"Accept-Encoding: identity\r\nConnection: close\r\n\r\n".encode())
+        status, headers, body = _read_head(s)
+        got = len(body)
+        if page:
+            want = int(headers.get("content-length") or 0) or LOAD_PAGE_CAP
+            while got < min(want, LOAD_PAGE_CAP):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                got += len(chunk)
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return {"status": status, "ms": _ms(t0), "bytes": got}
+
+
+def _load_test(port: int, dl_url: str, max_bytes: int, load_time: float,
+               streams: int = LOAD_STREAMS, targets=LOAD_TARGETS, idle_s: float = LOAD_IDLE_S,
+               after_s: float = LOAD_AFTER_S, every: float = LOAD_EVERY_S,
+               timeout: float = LOAD_PING_TIMEOUT) -> dict:
+    """Закачка в `streams` потоков + запросы к целям по кругу каждые `every` с.
+
+    Каждый запрос — в своём потоке: зависший не задерживает следующие, иначе
+    «20 секунд тишины» выглядели бы одним провалом, а не сорока. Фаза
+    запроса — та, в которой он ОТПРАВЛЕН. Объём закачки ограничен `max_bytes`
+    на все потоки (на телефоне это его трафик): кончился — фаза закачки
+    кончается раньше `load_time`, и это видно по `load_s`.
+    """
+    samples: list[dict] = []
+    lock = threading.Lock()
+    stop = threading.Event()
+    got = [0]
+    phase = ["idle"]
+    t_start = time.monotonic()
+
+    def ping(name: str, url: str, page: bool, ph: str, at: float) -> None:
+        try:
+            r = _load_sample(port, url, page, timeout)
+            ok = r["status"] is not None and r["status"] < 500
+            item = {"ms": r["ms"] if ok else None, "error": None if ok else f"status_{r['status']}"}
+        except Exception as e:  # noqa: BLE001
+            item = {"ms": None, "error": _kind(e)}
+        with lock:
+            samples.append({"phase": ph, "target": name, "at": round(at, 2), **item})
+
+    def download() -> None:
+        while not stop.is_set():
+            with lock:
+                if got[0] >= max_bytes:
+                    return
+            try:
+                s, host, path = _open_via_socks(port, dl_url, timeout)
+            except Exception:  # noqa: BLE001
+                time.sleep(0.5)
+                continue
+            try:
+                s.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\n"
+                          f"Connection: close\r\n\r\n".encode())
+                _, _, rest = _read_head(s)
+                with lock:
+                    got[0] += len(rest)
+                s.settimeout(1.0)
+                while not stop.is_set():
+                    with lock:
+                        if got[0] >= max_bytes:
+                            return
+                    try:
+                        chunk = s.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    with lock:
+                        got[0] += len(chunk)
+            except Exception:  # noqa: BLE001
+                time.sleep(0.2)
+            finally:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    pings: list[threading.Thread] = []
+    loaders: list[threading.Thread] = []
+    i = 0
+    load_t0 = load_t1 = None
+    next_at = time.monotonic()
+    end_at = None
+    while True:
+        now = time.monotonic()
+        rel = now - t_start
+        if phase[0] == "idle" and rel >= idle_s:
+            phase[0], load_t0 = "load", now
+            loaders = [threading.Thread(target=download, daemon=True) for _ in range(max(1, streams))]
+            for t in loaders:
+                t.start()
+        elif phase[0] == "load" and (now - load_t0 >= load_time or not any(t.is_alive() for t in loaders)):
+            stop.set()
+            phase[0], load_t1, end_at = "after", now, now + after_s
+        elif phase[0] == "after" and now >= end_at:
+            break
+        if now >= next_at:
+            name, url, page = targets[i % len(targets)]
+            i += 1
+            t = threading.Thread(target=ping, args=(name, url, page, phase[0], rel), daemon=True)
+            t.start()
+            pings.append(t)
+            next_at += every
+        time.sleep(0.05)
+    stop.set()
+    deadline = time.monotonic() + timeout + 1
+    for t in pings + loaders:
+        t.join(max(0.0, deadline - time.monotonic()))
+    with lock:
+        done = list(samples)
+        total = got[0]
+    hung = len(pings) - len(done)
+    load_s = max((load_t1 or time.monotonic()) - (load_t0 or time.monotonic()), 1e-3)
+    return {"samples": done, "hung": hung, "load_bytes": total, "load_s": round(load_s, 2),
+            "load_mbit": round(total * 8 / load_s / 1e6, 2), "streams": streams, "every_s": every}
+
+
 def probe_speed(config: dict, dl_bytes: int = SPEED_DL_BYTES, ul_bytes: int = SPEED_UL_BYTES,
                 max_time: float = SPEED_MAX_TIME, timeout: float = 15.0,
-                xray_bin: str | None = None) -> dict:
+                xray_bin: str | None = None, mode: str = "speed",
+                streams: int = LOAD_STREAMS) -> dict:
     """Поднять xray с конфигом строки и померить через него задержку,
     скачивание и отправку. Только xray: sing-box не знает части полей xhttp
     (`extra`), а именно их и перебираем."""
@@ -803,6 +958,14 @@ def probe_speed(config: dict, dl_bytes: int = SPEED_DL_BYTES, ul_bytes: int = SP
             res["source"] = "yandex" if urls.get("download") else "cloudflare"
             dl_url = urls.get("download") or SPEED_FALLBACK_DOWN.format(n=dl_bytes)
             ul_url = urls.get("upload") or SPEED_FALLBACK_UP
+            if mode == "load":
+                res["load"] = _load_test(port, dl_url, dl_bytes, max_time, streams)
+                res["dl_mbit"] = res["load"]["load_mbit"]
+                res["ul_mbit"] = 0.0
+                res["ok"] = any(s.get("ms") is not None for s in res["load"]["samples"])
+                if not res["ok"]:
+                    res["xray_log"] = _drain(proc)
+                return res
             for key, fn, args in (("download", _speed_download, (dl_url, dl_bytes)),
                                   ("upload", _speed_upload, (ul_url, ul_bytes))):
                 try:
@@ -847,7 +1010,8 @@ def run_job(kind: str, args: dict, xray_bin: str | None = None) -> dict:
             return probe_speed(a["config"], int(a.get("dl_bytes") or SPEED_DL_BYTES),
                                int(a.get("ul_bytes") or SPEED_UL_BYTES),
                                float(a.get("max_time") or SPEED_MAX_TIME),
-                               float(a.get("timeout", 15)), xray_bin)
+                               float(a.get("timeout", 15)), xray_bin,
+                               str(a.get("mode") or "speed"), int(a.get("streams") or LOAD_STREAMS))
         if kind == "update":
             return self_update(a["code"], str(a.get("version") or ""))
         if kind == "batch":

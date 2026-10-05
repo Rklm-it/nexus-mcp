@@ -319,7 +319,8 @@ async def subscription_check(probe: str = HUB, e2e: bool = False, panel: str = "
 async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "",
                       variants: dict | None = None, dl_mb: float = sub_speed.DEFAULT_DL_MB,
                       ul_mb: float = sub_speed.DEFAULT_UL_MB, max_time: float = sub_speed.DEFAULT_MAX_TIME,
-                      repeats: int = 1, start: bool = True) -> dict:
+                      repeats: int = 1, start: bool = True, mode: str = "speed",
+                      streams: int = 4) -> dict:
     """Скорость строки подписки с пробника — и перебор её параметров.
 
     Пробник (например телефон с симкой) поднимает xray с этой строкой и мерит
@@ -337,13 +338,24 @@ async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "
     Меняется только клиент: размер поста и интервал серверу не нужны, а место
     данных и метод аплинка сервер обязан понимать — иначе вариант не встанет.
     Прогон фоном: start=False читает состояние, не запуская новый.
+
+    mode="load" — отзывчивость под нагрузкой (пробник от 1.4.0): закачка в
+    streams потоков (как замер скорости в приложении), а рядом каждые 0,5 с
+    по кругу — короткий запрос к google и к Telegram и открытие ya.ru и
+    youtube. Сводка load_stats по фазам idle (тишина) / load (закачка) /
+    after (10 с после неё) и по целям: p50/p90/max, slow (дольше 2 с — у
+    человека «Соединение…») и fail. google и ya.ru нода отдаёт сама,
+    Telegram и YouTube идут через выход за границу: залипло только второе —
+    дело в выходе, а не в канале до ноды. dl_mb — потолок закачки на все
+    потоки, max_time — длина фазы закачки.
     """
     try:
         if start:
             uri = link.strip() or (await sub_speed.pick_link(panel, host.strip()) if host else "")
             if not uri:
                 return {"ok": False, "error": "bad_args", "detail": "нужна ссылка (link) или panel + host"}
-            st = sub_speed.runs.start(probe, uri, variants or {}, dl_mb, ul_mb, max_time, repeats)
+            st = sub_speed.runs.start(probe, uri, variants or {}, dl_mb, ul_mb, max_time, repeats,
+                                      mode, max(1, min(int(streams), 16)))
             cur = sub_speed.runs.running.get(probe)
             if cur:
                 try:
@@ -353,7 +365,8 @@ async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "
         st = sub_speed.runs.state(probe)
     except (sub_speed.SpeedError, sub_sweep.SweepError, sublinks.LinksError, ProbeError) as e:
         return _err(e)
-    audit.record("probe_speed", {"probe": probe, "host": host, "panel": panel, "variants": list((variants or {}))},
+    audit.record("probe_speed", {"probe": probe, "host": host, "panel": panel, "mode": mode,
+                                 "variants": list((variants or {}))},
                  True)
     if st.get("running"):
         st["next"] = f"probe_speed(probe='{probe}', start=False) — через минуту"
