@@ -29,6 +29,14 @@ from nexus_mcp import links, sweep
 from nexus_mcp.probes import HUB, ProbeError, _ver, registry
 
 MIN_PROBE_VERSION = "1.3.0"
+# Замер отзывчивости под нагрузкой (mode="load") — с этой версии пробника.
+MIN_LOAD_VERSION = "1.4.0"
+MODES = ("speed", "load")
+# Запрос дольше этого — «залипло»: человек видит «Соединение…», а не задержку.
+SLOW_MS = 2000
+# Сколько фаз «тишина» и «после закачки» прибавляют к max_time (пробник:
+# LOAD_IDLE_S + LOAD_AFTER_S + LOAD_PING_TIMEOUT).
+LOAD_EXTRA_S = 4 + 10 + 11
 MAX_VARIANTS = 12
 # Объём замера по умолчанию: на телефоне это его трафик.
 DEFAULT_DL_MB = 10.0
@@ -98,7 +106,9 @@ async def pick_link(panel: str, host: str) -> str:
                      "передайте ссылку целиком в link")
 
 
-def check_probe(probe: str) -> None:
+def check_probe(probe: str, mode: str = "speed") -> None:
+    if mode not in MODES:
+        raise SpeedError(f"mode: {mode} — бывает {', '.join(MODES)}")
     if probe == HUB:
         return
     p = registry.probes.get(probe)
@@ -111,6 +121,42 @@ def check_probe(probe: str) -> None:
         raise SpeedError(f"пробник «{probe}» версии {info.get('version')}, замер скорости — с "
                          f"{MIN_PROBE_VERSION}. Он обновится сам при следующем подключении, если "
                          "не выключено NEXUS_PROBE_NO_UPDATE")
+    if mode == "load" and _ver(info.get("version")) < _ver(MIN_LOAD_VERSION):
+        raise SpeedError(f"пробник «{probe}» версии {info.get('version')}, замер под нагрузкой — с "
+                         f"{MIN_LOAD_VERSION}. Обновите хаб: пробник подтянет новую версию сам "
+                         "при следующем подключении")
+
+
+def _pct(xs: list[float], q: float) -> float | None:
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return round(xs[min(len(xs) - 1, int(q * len(xs)))], 1)
+
+
+def load_stats(samples: list[dict]) -> dict:
+    """Запросы под нагрузкой → {фаза: {цель: сводка}}.
+
+    Неудача и «дольше SLOW_MS» считаются отдельно: первое — запрос не прошёл
+    вовсе, второе — прошёл, но человек успел увидеть «Соединение…».
+    """
+    by: dict[str, dict[str, list[dict]]] = {}
+    for s in samples:
+        by.setdefault(s.get("phase") or "?", {}).setdefault(s.get("target") or "?", []).append(s)
+    out: dict[str, dict] = {}
+    for phase in ("idle", "load", "after"):
+        for target, ss in (by.get(phase) or {}).items():
+            ms = [x["ms"] for x in ss if x.get("ms") is not None]
+            errors: dict[str, int] = {}
+            for x in ss:
+                if x.get("ms") is None:
+                    errors[x.get("error") or "?"] = errors.get(x.get("error") or "?", 0) + 1
+            out.setdefault(phase, {})[target] = {
+                "n": len(ss), "fail": len(ss) - len(ms), "slow": sum(1 for m in ms if m > SLOW_MS),
+                "p50_ms": _pct(ms, 0.5), "p90_ms": _pct(ms, 0.9), "max_ms": max(ms) if ms else None,
+                **({"errors": errors} if errors else {}),
+            }
+    return out
 
 
 def _row(name: str, overrides: dict, res: dict) -> dict:
@@ -123,6 +169,12 @@ def _row(name: str, overrides: dict, res: dict) -> dict:
         "ping_ms": res.get("ping_ms"),
         "source": res.get("source"),
     }
+    load = res.get("load")
+    if load:
+        row["load"] = {"mbit": load.get("load_mbit"), "s": load.get("load_s"),
+                       "mb": round((load.get("load_bytes") or 0) / 1e6, 1), "hung": load.get("hung"),
+                       "stats": load_stats(load.get("samples") or [])}
+        row["_samples"] = load.get("samples") or []
     for key in ("download", "upload"):
         part = res.get(key) or {}
         if part.get("error") or part.get("status") not in (None, 200, 201, 204):
@@ -136,13 +188,14 @@ def _row(name: str, overrides: dict, res: dict) -> dict:
 
 
 async def run(probe: str, uri: str, variants: dict[str, dict], dl_mb: float, ul_mb: float,
-              max_time: float, repeats: int, progress: dict) -> dict:
+              max_time: float, repeats: int, progress: dict, mode: str = "speed",
+              streams: int = 4) -> dict:
     plan: list[tuple[str, dict]] = [("as-is", {})]
     plan += [(n, v or {}) for n, v in variants.items() if n != "as-is"]
     plan = [x for x in plan for _ in range(max(1, repeats))]
     progress.update(total=len(plan), done=0)
     rows: list[dict] = []
-    job_timeout = 2 * max_time + 45
+    job_timeout = 2 * max_time + 45 + (LOAD_EXTRA_S if mode == "load" else 0)
     for name, overrides in plan:
         progress["current"] = name
         try:
@@ -159,13 +212,16 @@ async def run(probe: str, uri: str, variants: dict[str, dict], dl_mb: float, ul_
         try:
             res = await registry.run(probe, "speed", {
                 "config": cfg, "dl_bytes": int(dl_mb * 1_000_000), "ul_bytes": int(ul_mb * 1_000_000),
-                "max_time": max_time,
+                "max_time": max_time, "mode": mode, "streams": streams,
             }, timeout=job_timeout)
         except ProbeError as e:
             res = {"ok": False, "error": "probe", "detail": str(e)}
         rows.append(_row(name, overrides, res))
         progress["done"] += 1
-    return {"probe": probe, "host": urlparse(uri).hostname, "rows": rows, "summary": summarize(rows)}
+    summary = summarize(rows)
+    for r in rows:
+        r.pop("_samples", None)
+    return {"probe": probe, "host": urlparse(uri).hostname, "mode": mode, "rows": rows, "summary": summary}
 
 
 def summarize(rows: list[dict]) -> list[dict]:
@@ -191,6 +247,12 @@ def summarize(rows: list[dict]) -> list[dict]:
             "ul_all": [r.get("ul_mbit") for r in rs],
             "overrides": rs[0].get("overrides"),
         })
+        samples = [x for r in rs for x in (r.get("_samples") or [])]
+        if samples:
+            # Повторы сливаются по запросам, а не медианой сводок: один
+            # 20-секундный провал на три прогона — это и есть ответ.
+            out[-1]["load_stats"] = load_stats(samples)
+            out[-1]["load_mbit_all"] = [(r.get("load") or {}).get("mbit") for r in rs]
     return out
 
 
@@ -212,18 +274,20 @@ class Runs:
         return {"ok": True, "probe": probe, "running": False, "last": last}
 
     def start(self, probe: str, uri: str, variants: dict[str, dict], dl_mb: float = DEFAULT_DL_MB,
-              ul_mb: float = DEFAULT_UL_MB, max_time: float = DEFAULT_MAX_TIME, repeats: int = 1) -> dict:
+              ul_mb: float = DEFAULT_UL_MB, max_time: float = DEFAULT_MAX_TIME, repeats: int = 1,
+              mode: str = "speed", streams: int = 4) -> dict:
         cur = self.running.get(probe)
         if cur and not cur["task"].done():
             raise SpeedError(f"на пробнике «{probe}» уже идёт замер — дождитесь (speed_state)")
         if len(variants) > MAX_VARIANTS:
             raise SpeedError(f"вариантов {len(variants)}, не больше {MAX_VARIANTS} за прогон")
-        check_probe(probe)
+        check_probe(probe, mode)
         entry = {"id": uuid.uuid4().hex[:10], "started": time.time(), "progress": {"stage": "speed"}}
 
         async def work():
             try:
-                res = await run(probe, uri, variants, dl_mb, ul_mb, max_time, repeats, entry["progress"])
+                res = await run(probe, uri, variants, dl_mb, ul_mb, max_time, repeats, entry["progress"],
+                                mode, streams)
             except Exception as e:  # noqa: BLE001
                 res = {"ok": False, "error": type(e).__name__, "detail": str(e)[:300]}
             res["finished_at"] = int(time.time())

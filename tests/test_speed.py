@@ -6,7 +6,10 @@
   • скачивание и отправка меряются по байтам и времени, отказ сервера при
     отправке — не скорость;
   • повторы одного варианта сводятся медианой;
-  • пробник старее 1.3.0 получает внятный отказ, а не молчаливый таймаут.
+  • пробник старее 1.3.0 получает внятный отказ, а не молчаливый таймаут;
+  • замер под нагрузкой: запросы идут во всех трёх фазах, зависший запрос
+    не задерживает соседние, закачка держит потолок байт, а сводка отделяет
+    «не прошёл» от «прошёл, но дольше 2 с» и сливает повторы по запросам.
 """
 
 from __future__ import annotations
@@ -111,6 +114,12 @@ class _Http(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path.startswith("/stall"):
+            import time as _t
+            _t.sleep(2.5)
+            self.send_response(204)
+            self.end_headers()
+            return
         if self.path.startswith("/api"):
             body = json.dumps({"download": {"probes": [{"url": "http://probe.test/probes/50mb"}]},
                                "upload": {"probes": [{"postUrl": "http://probe.test/up"}]}}).encode()
@@ -210,3 +219,65 @@ def test_probes_are_taken_from_the_internetometer_api(socks_port, monkeypatch):
     monkeypatch.setattr(lib, "SPEED_PROBES_URL", "http://probe.test/api")
     urls = lib._speed_probes(socks_port, 5)
     assert urls == {"download": "http://probe.test/probes/50mb", "upload": "http://probe.test/up"}
+
+
+def test_load_test_samples_every_phase_and_caps_the_download(socks_port):
+    lib = probe_lib()
+    targets = (("fast", "http://probe.test/x", False), ("page", "http://probe.test/probes/50mb", True))
+    r = lib._load_test(socks_port, "http://probe.test/probes/50mb", 3_000_000, 1.5, streams=2,
+                       targets=targets, idle_s=0.6, after_s=0.6, every=0.2, timeout=5)
+    phases = {s["phase"] for s in r["samples"]}
+    assert phases == {"idle", "load", "after"}
+    # Потолок на все потоки: 3 МБ из бесконечного источника (каждый поток
+    # перезапускает закачку), а не 2 × 2 МБ и дальше.
+    assert 3_000_000 <= r["load_bytes"] < 3_000_000 + 2 * 2_000_000
+    assert r["load_mbit"] > 0 and r["streams"] == 2
+    assert all(s["ms"] is not None for s in r["samples"])
+
+
+def test_a_stalled_request_does_not_hold_back_the_next_ones(socks_port):
+    lib = probe_lib()
+    targets = (("stall", "http://probe.test/stall", False), ("fast", "http://probe.test/x", False))
+    t0 = __import__("time").monotonic()
+    r = lib._load_test(socks_port, "http://probe.test/probes/50mb", 500_000, 1.0, streams=1,
+                       targets=targets, idle_s=1.0, after_s=1.0, every=0.25, timeout=5)
+    took = __import__("time").monotonic() - t0
+    fast = [s for s in r["samples"] if s["target"] == "fast"]
+    stall = [s for s in r["samples"] if s["target"] == "stall"]
+    # Запросы по 2,5 с не растянули расписание: «быстрых» столько же, сколько
+    # при расписании каждые 0,25 с, и все быстрые.
+    assert len(fast) >= 3 and all(s["ms"] < 1500 for s in fast)
+    assert stall and all(s["ms"] >= 2400 for s in stall)
+    assert took < 2.0 + 2.5 + 2  # фазы + хвост одного зависшего, а не сумма всех
+
+
+def test_load_stats_tells_failed_from_slow():
+    st = speed.load_stats([
+        {"phase": "load", "target": "telegram", "ms": 120.0},
+        {"phase": "load", "target": "telegram", "ms": 3500.0},
+        {"phase": "load", "target": "telegram", "ms": None, "error": "timeout"},
+        {"phase": "idle", "target": "telegram", "ms": 90.0},
+    ])
+    tg = st["load"]["telegram"]
+    assert tg["n"] == 3 and tg["fail"] == 1 and tg["slow"] == 1
+    assert tg["max_ms"] == 3500.0 and tg["errors"] == {"timeout": 1}
+    assert st["idle"]["telegram"]["slow"] == 0 and "errors" not in st["idle"]["telegram"]
+
+
+def test_repeats_are_merged_by_requests_not_by_medians():
+    def row(ms):
+        return {"name": "v", "ok": True, "dl_mbit": 1.0, "ul_mbit": 0.0, "load": {"mbit": 1.0},
+                "_samples": [{"phase": "load", "target": "tg", "ms": m} for m in ms]}
+    out = speed.summarize([row([100.0, 100.0]), row([100.0, 100.0]), row([20000.0, 100.0])])
+    # Медиана сводок прогонов спрятала бы 20-секундный провал; слитые запросы — нет.
+    assert out[0]["load_stats"]["load"]["tg"]["slow"] == 1
+    assert out[0]["load_stats"]["load"]["tg"]["n"] == 6
+
+
+def test_load_mode_needs_a_new_probe(monkeypatch):
+    monkeypatch.setitem(registry.probes, "phone", Probe(name="phone", info={"version": "1.3.0", "xray": True}))
+    speed.check_probe("phone")  # обычный замер — можно
+    with pytest.raises(speed.SpeedError, match="1.4.0"):
+        speed.check_probe("phone", "load")
+    with pytest.raises(speed.SpeedError, match="mode"):
+        speed.check_probe("phone", "fast")
