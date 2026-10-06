@@ -430,8 +430,15 @@ a_update() {
     title "Обновить хаб"
     echo "Та же команда установки: настройки, секреты и ключ берутся из $ENVF."
     yes_no "Обновить сейчас?" || return
-    bash <(curl -fsSL --connect-timeout 15 -m 120 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh) \
-        || bad "установщик не скачался или упал — вывод выше"
+    if bash <(curl -fsSL --connect-timeout 15 -m 120 https://raw.githubusercontent.com/Rklm-it/nexus-mcp/main/install.sh); then
+        # Открытое меню — старая копия в памяти: новые пункты появятся только
+        # в новом запуске. Перезапускаемся сами, а не просим выйти и войти.
+        ok "хаб обновлён — открываю новое меню"
+        sleep 1
+        exec /usr/local/bin/nexus-hub
+    else
+        bad "установщик не скачался или упал — вывод выше"
+    fi
 }
 
 if [ "${1:-}" = "status" ]; then header; exit 0; fi
