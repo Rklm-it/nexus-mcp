@@ -222,6 +222,28 @@ async def node_links(panel: str, node: str, include_hidden: bool = True) -> dict
             "sni_hosts": snis[:10], "skipped": skipped}
 
 
+async def pick_node_link(node: str, host: str = "") -> str:
+    """Одна ссылка hub-probe на строку ноды «remna:<панель>/<нода>» — для замера.
+
+    host — «адрес» или «адрес:порт» строки, когда у ноды их несколько (вход
+    каскада рядом с прямой строкой). Сама ссылка с ключом служебного юзера в
+    ответы не попадает: её берёт пробник."""
+    rn = parse_remna_node(node)
+    if not rn:
+        raise OpsError("node — «remna:<панель>/<нода>»")
+    res = await node_links(rn[0], rn[1])
+    pairs = list(zip(res["links"], res["targets"]))
+    want = (host or "").strip().lower()
+    if want:
+        pairs = [(link, t) for link, t in pairs if want == t.lower() or want == t.lower().rsplit(":", 1)[0]
+                 or t.lower().endswith(":" + want)]
+    if len(pairs) == 1:
+        return pairs[0][0]
+    if not pairs:
+        raise OpsError(f"у {res['node']} нет строки «{host}». Есть: " + ", ".join(res["targets"]))
+    raise OpsError(f"у {res['node']} несколько строк — укажите host: " + ", ".join(t for _, t in pairs))
+
+
 def parse_remna_node(node: str) -> tuple[str, str] | None:
     """«remna:pablo/ru01s3» → ("pablo", "ru01s3"); «remna:ru01s3» — панель одна."""
     if not (node or "").startswith("remna:"):

@@ -193,3 +193,29 @@ def test_call_preview_then_run(env):
         run(ops.call_plan("pablo", "POST", "/api/auth/login", {}))
     res = run(ops.call_run("pablo", "PATCH", "/api/hosts", {"uuid": "h-ru", "remark": "RU new"}))
     assert res["ok"] and panel.hosts["h-ru"]["remark"] == "RU new"
+
+
+def test_probe_speed_takes_remna_node_link_without_leaking_it(env, monkeypatch):
+    """Замер по ноде Remnawave: ссылка hub-probe (и на скрытый вход каскада)
+    уходит пробнику, но не в ответ; при нескольких строках нужен host."""
+    from nexus_mcp import server, speed
+
+    panel, cf, sent = env
+    do("nl01s1", "cf_exit", {})
+    do("ru01s3", "cascade_entry", {"exit": "nl01s1", "sni": "ads.x5.ru"})   # строка скрыта
+    run(ops.ensure_probe_user("pablo"))
+    started = {}
+
+    def fake_start(probe, uri, *a, **k):
+        started["uri"] = uri
+        return {"running": False}
+
+    monkeypatch.setattr(speed.runs, "start", fake_start)
+    monkeypatch.setattr(speed.runs, "state", lambda probe: {"ok": True, "probe": probe, "host": "x"})
+    res = run(server.probe_speed("hub", node="remna:pablo/ru01s3"))
+    assert not res["ok"] and "host" in res["detail"] and f"{ENTRY_IP}:8443" in res["detail"]
+    res = run(server.probe_speed("hub", node="remna:pablo/ru01s3", host=f"{ENTRY_IP}:8443"))
+    assert res["ok"] and started["uri"].startswith(f"vless://{PROBE_VLESS}@{ENTRY_IP}:8443?")
+    assert PROBE_VLESS not in json.dumps(res, ensure_ascii=False)
+    res = run(server.probe_speed("hub", node="remna:pablo/ru01s3", host="8443"))
+    assert res["ok"]

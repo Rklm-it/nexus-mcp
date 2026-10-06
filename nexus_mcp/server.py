@@ -332,7 +332,7 @@ async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "
                       variants: dict | None = None, dl_mb: float = sub_speed.DEFAULT_DL_MB,
                       ul_mb: float = sub_speed.DEFAULT_UL_MB, max_time: float = sub_speed.DEFAULT_MAX_TIME,
                       repeats: int = 1, start: bool = True, mode: str = "speed",
-                      streams: int = 4) -> dict:
+                      streams: int = 4, node: str = "") -> dict:
     """Скорость строки подписки с пробника — и перебор её параметров.
 
     Пробник (например телефон с симкой) поднимает xray с этой строкой и мерит
@@ -341,7 +341,10 @@ async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "
     мобильную сеть не воспроизводит.
 
     link — ссылка целиком (vless://…), либо panel + host — строка тестовой
-    подписки панели с этим адресом (CDN-домен или IP). variants — {имя: поля},
+    подписки панели с этим адресом (CDN-домен или IP), либо node=
+    «remna:<панель>/<нода>» (+ host «адрес:порт», если строк несколько) —
+    строка ноды Remnawave со служебным hub-probe, в том числе скрытая (вход
+    каскада до открытия клиентам). variants — {имя: поля},
     поля подменяются в extra ссылки (sc_max_each_post_bytes,
     sc_min_posts_interval_ms, uplink_data_placement, uplink_http_method,
     max_connections / xmux={…}; mode — в query). «as-is» (как есть) идёт
@@ -363,9 +366,19 @@ async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "
     """
     try:
         if start:
-            uri = link.strip() or (await sub_speed.pick_link(panel, host.strip()) if host else "")
+            uri = link.strip()
+            if not uri and node.strip().startswith("remna:"):
+                from nexus_mcp import remna_ops
+
+                try:
+                    uri = await remna_ops.pick_node_link(node.strip(), host.strip())
+                except (remna_ops.OpsError, remna.RemnaError, remna_ops.re_.EditError) as e:
+                    return _err(e)
+            if not uri and host:
+                uri = await sub_speed.pick_link(panel, host.strip())
             if not uri:
-                return {"ok": False, "error": "bad_args", "detail": "нужна ссылка (link) или panel + host"}
+                return {"ok": False, "error": "bad_args",
+                        "detail": "нужна ссылка (link), panel + host или node='remna:<панель>/<нода>'"}
             st = sub_speed.runs.start(probe, uri, variants or {}, dl_mb, ul_mb, max_time, repeats,
                                       mode, max(1, min(int(streams), 16)))
             cur = sub_speed.runs.running.get(probe)
@@ -377,7 +390,7 @@ async def probe_speed(probe: str, link: str = "", panel: str = "", host: str = "
         st = sub_speed.runs.state(probe)
     except (sub_speed.SpeedError, sub_sweep.SweepError, sublinks.LinksError, ProbeError) as e:
         return _err(e)
-    audit.record("probe_speed", {"probe": probe, "host": host, "panel": panel, "mode": mode,
+    audit.record("probe_speed", {"probe": probe, "host": host, "panel": panel, "node": node, "mode": mode,
                                  "variants": list((variants or {}))},
                  True)
     if st.get("running"):
