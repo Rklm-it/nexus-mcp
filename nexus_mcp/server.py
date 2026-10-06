@@ -1819,6 +1819,46 @@ async def hub_subs(request: Request) -> JSONResponse:
     return JSONResponse(res)
 
 
+# ── HTTP для приложения: панели Remnawave ───────────────────────────────────
+# Только чтение. Токен Remnawave остаётся на хабе: приложение видит то же,
+# что Claude в remna_overview / remna_nodes / remna_user, а меняет — через
+# чат, где на каждое действие есть «Разрешить».
+
+async def _remna_http(fn) -> JSONResponse:
+    try:
+        return JSONResponse({"ok": True, **(await fn())})
+    except remna.RemnaError as e:
+        code = e.status if e.status and 400 <= e.status < 500 else 502
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=code)
+
+
+@mcp.custom_route("/hub/remna", methods=["GET"])
+async def hub_remna(request: Request) -> JSONResponse:
+    async def go():
+        return {"panels": [remna.public_view(p) for p in remna.all_panels()]}
+    return await _remna_http(go)
+
+
+@mcp.custom_route("/hub/remna/{name}/{view}", methods=["GET"])
+async def hub_remna_view(request: Request) -> JSONResponse:
+    name, view = request.path_params["name"], request.path_params["view"]
+
+    async def go():
+        if view not in ("overview", "nodes", "users"):
+            raise remna.RemnaError(f"нет такого вида «{view}»: overview | nodes | users", 404)
+        p = remna.resolve(name)
+        if view == "overview":
+            return await remna.overview(p)
+        if view == "nodes":
+            return {"nodes": await remna.nodes(p)}
+        users = await remna.find_user(p, request.query_params.get("q") or "")
+        for u in users[:3]:
+            if u.get("id") is not None:
+                u["devices"] = await remna.user_devices(p, u["id"])
+        return {"users": users}
+    return await _remna_http(go)
+
+
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "service": "nexus-mcp"})

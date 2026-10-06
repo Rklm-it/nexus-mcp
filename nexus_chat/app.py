@@ -14,6 +14,7 @@ import hmac
 import json
 import logging
 import time
+from urllib.parse import quote
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -21,7 +22,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from nexus_chat import config, devices, usage
-from nexus_chat.runner import Runner, panel_names
+from nexus_chat.runner import Runner, panel_names, remna_names
 from nexus_chat.store import Store, StoreError
 
 logger = logging.getLogger("nexus_chat")
@@ -95,6 +96,7 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         return JSONResponse({
             "sim": await sim_state(),
             "panels": panel_names(),
+            "remna_panels": remna_names(),
             "ok": True, "api": API_VERSION,
             "logged_in": s.logged_in,
             "model": s.model or "", "effort": s.effort or "",
@@ -249,6 +251,17 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         return JSONResponse({"ok": True, "hub": hub, "name": name, "command": cmd,
                              "remove": f"wget -qO- {s.probe_src}/probe/openwrt/install.sh | sh -s -- --remove"})
 
+    # ── Панели Remnawave: то же, что видит Claude, только чтение ──
+
+    async def remna_panels(request: Request):
+        return await _hub("GET", "/hub/remna")
+
+    async def remna_view(request: Request):
+        name, view = request.path_params["name"], request.path_params["view"]
+        params = {"q": request.query_params.get("q") or ""} if view == "users" else None
+        return await _hub("GET", f"/hub/remna/{quote(name, safe='')}/{quote(view, safe='')}",
+                          timeout=40, params=params)
+
     async def healthz(request: Request):
         return JSONResponse({"ok": True, "service": "nexus-chat", "logged_in": s.logged_in})
 
@@ -277,6 +290,8 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         Route("/chat/api/probes/sweep", guarded(probe_sweep), methods=["GET", "POST"]),
         Route("/chat/api/probes/setup", guarded(probe_setup), methods=["GET"]),
         Route("/chat/api/probes/subs", guarded(probe_subs), methods=["GET", "POST"]),
+        Route("/chat/api/remna", guarded(remna_panels), methods=["GET"]),
+        Route("/chat/api/remna/{name}/{view}", guarded(remna_view), methods=["GET"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.runner = runner

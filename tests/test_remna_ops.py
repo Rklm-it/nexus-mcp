@@ -219,3 +219,56 @@ def test_probe_speed_takes_remna_node_link_without_leaking_it(env, monkeypatch):
     assert PROBE_VLESS not in json.dumps(res, ensure_ascii=False)
     res = run(server.probe_speed("hub", node="remna:pablo/ru01s3", host="8443"))
     assert res["ok"]
+
+
+# ── приложение: панели Remnawave через чат хаба ──────────────────────────
+
+def test_app_sees_remna_panels_through_chat(env, monkeypatch, hub_settings, tmp_path):
+    """Приложение → nexus-chat → nexus-mcp → Remnawave: список, ноды, клиент.
+    Токены панели в ответ не едут; чат принимает панель Remnawave и говорит
+    Claude работать инструментами remna_*."""
+    import asyncio
+
+    import httpx
+
+    from nexus_chat import app as chat_app
+    from nexus_chat import config as chat_config
+    from nexus_chat.runner import Runner, with_panel
+    from nexus_chat.store import Store
+    from nexus_mcp import server
+
+    run(ops.ensure_probe_user("pablo"))
+    cs = chat_config.ChatSettings()
+    cs.token = "t" * 40
+    cs.state_dir = tmp_path / "chat"
+    cs.mcp_secret = "s" * 32
+    cs.audit_at = []
+    monkeypatch.setattr(chat_config, "settings", cs)
+    hub_settings.public_hosts = []
+    monkeypatch.setattr(chat_app, "_hub_transport", httpx.ASGITransport(app=server.build_app()))
+    auth = {"authorization": "Bearer " + "t" * 40}
+
+    async def go():
+        cs.state_dir.mkdir(parents=True)
+        app = chat_app.build_app(Runner(Store(cs.db_path), cs), start_background=False)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://hub") as c:
+            st = (await c.get("/chat/api/state", headers=auth)).json()
+            assert st["remna_panels"] == ["pablo"]
+            r = await c.get("/chat/api/remna", headers=auth)
+            dump = r.text
+            assert r.status_code == 200 and r.json()["panels"][0]["name"] == "pablo"
+            assert "tok" not in json.loads(dump)["panels"][0].values() and "CF-TOKEN-SECRET" not in dump
+            r = await c.get("/chat/api/remna/pablo/nodes", headers=auth)
+            assert r.status_code == 200 and {n["name"] for n in r.json()["nodes"]} >= {"ru01s3", "nl01s1"}
+            r = await c.get("/chat/api/remna/pablo/users", params={"q": "hub-probe"}, headers=auth)
+            assert r.status_code == 200 and r.json()["users"][0]["username"] == "hub-probe"
+            r = await c.get("/chat/api/remna/ghost/nodes", headers=auth)
+            assert r.status_code == 404 and "pablo" in r.json()["detail"]
+            r = await c.get("/chat/api/remna/pablo/tokens", headers=auth)
+            assert r.status_code == 404
+            r = await c.get("/chat/api/remna/pablo/nodes")
+            assert r.status_code == 401
+
+    asyncio.run(go())
+    hint = with_panel("что с нодами?", "pablo")
+    assert "remna_*" in hint and 'panel="pablo"' in hint and hint.endswith("что с нодами?")

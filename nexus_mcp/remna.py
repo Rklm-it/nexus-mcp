@@ -103,7 +103,7 @@ def resolve(name: str = "") -> dict:
     for p in panels:
         if p["name"].lower() == name.lower():
             return p
-    raise RemnaError(f"панели Remnawave «{name}» нет. Есть: {', '.join(p['name'] for p in panels)}")
+    raise RemnaError(f"панели Remnawave «{name}» нет. Есть: {', '.join(p['name'] for p in panels)}", 404)
 
 
 def public_view(p: dict) -> dict:

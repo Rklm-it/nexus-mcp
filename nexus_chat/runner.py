@@ -97,10 +97,24 @@ def panel_names() -> list[str]:
         return []
 
 
+def remna_names() -> list[str]:
+    """Панели Remnawave хаба — те же, что видит Claude в remna_panels."""
+    from nexus_mcp import remna
+
+    try:
+        return [p["name"] for p in remna.all_panels()]
+    except Exception:  # noqa: BLE001 — битый remnawave.json не должен ронять чат
+        return []
+
+
 def with_panel(text: str, panel: str) -> str:
     """Выбранная в приложении панель — указанием для Claude перед вопросом."""
     if not panel:
         return text
+    if panel not in panel_names() and panel in remna_names():
+        return (f"[Выбрана панель Remnawave «{panel}»: работай с ней инструментами remna_* "
+                f"(panel=\"{panel}\"; в SIM-проверке и замере скорости нода — «remna:{panel}/имя»). "
+                f"Панели Nexus и другие панели Remnawave не трогай, если вопрос прямо не про них.]\n\n{text}")
     return (f"[Выбрана панель «{panel}»: работай с ней — panel=\"{panel}\" у инструментов панели; "
             f"при нескольких панелях её ноды называются «{panel}/имя». Другие панели не трогай, "
             f"если вопрос прямо не про них.]\n\n{text}")
@@ -342,7 +356,7 @@ class Runner:
             raise StoreError("пустое сообщение")
         panel = (panel or "").strip()
         if panel:
-            names = panel_names()
+            names = panel_names() + remna_names()
             if panel not in names:
                 raise StoreError(f"на хабе нет панели «{panel}». Есть: {', '.join(names) or 'ни одной'}")
         chat = self.store.get_chat(chat_id)
