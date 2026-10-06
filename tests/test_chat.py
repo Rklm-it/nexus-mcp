@@ -864,3 +864,14 @@ def test_remna_titles():
     assert t == "Remnawave pablo: ru01s3 · вход каскада RU → CF → EU · exit=nl01s1, sni=ads.x5.ru"
     assert "nl05s1" in runner.describe_action("remna_node_install", {"name": "nl05s1", "country": "NL",
                                                                      "domain": "nl05s1.pablo.support"})
+
+
+def test_remna_maintenance_titles():
+    from nexus_chat import runner
+
+    assert runner.describe_action("remna_node_action", {"panel": "pablo", "node": "nl01s1", "action": "delete"}) \
+        == "Remnawave pablo: nl01s1 · УДАЛИТЬ из панели"
+    assert runner.describe_action("remna_call", {"method": "patch", "path": "/api/hosts"}) == \
+        "Remnawave: PATCH /api/hosts"
+    assert "hub-probe" in runner.describe_action("remna_probe_user", {"panel": "pablo"})
+    assert "снять вход" in runner.describe_action("remna_node_edit", {"node": "ru01s3", "op": "cascade_remove"})

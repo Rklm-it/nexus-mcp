@@ -59,6 +59,10 @@ remna_node_edit, порядок тот же: без confirm — план чел�
 plan_hash — кнопка «Разрешить». Каскад RU → Cloudflare → EU — сперва
 op="cf_exit" на европейской ноде, затем op="cascade_entry" на российской;
 строка входа рождается скрытой — открывать после проверки с симок.
+«Нода Remnawave не работает» — сначала remna_node_diagnose (с домашними
+пробниками), потом действия. remna_node_action, remna_probe_user и remna_call с
+confirm=true тоже ждут кнопку. remna_call — только когда готового инструмента
+нет: у него нет плана и отката, у remna_node_edit есть.
 
 Правка конфигурации ноды (node_edit: маршрутизация, relay, настройки ноды,
 инбаунды, Cloudflare-фронт op="cf_front") — только когда человек попросил.

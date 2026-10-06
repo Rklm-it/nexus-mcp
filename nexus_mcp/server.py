@@ -64,7 +64,11 @@ Remnawave: часть клиентов живёт не на Nexus, а на Remna
 remna_user, конфиг ноды — remna_profile. Новая нода на чистом сервере —
 remna_node_install (без confirm — план человеку, с confirm=true и plan_hash — установка).
 Перенастройка ноды и каскад RU → Cloudflare → EU — remna_node_edit (op: reality_sni,
-host, squad, cf_exit на европейской ноде, затем cascade_entry на российской).
+host, squad, cf_exit на европейской ноде, затем cascade_entry на российской;
+снять — cascade_remove, cf_exit_remove). «Нода не работает» — remna_node_diagnose;
+перезапуск/вкл/выкл — remna_node_action; подписка глазами клиента — remna_sub_check
+(служебный юзер — remna_probe_user); SIM-проверка ноды — sim_vless(node=
+'remna:<панель>/<нода>'). Чего нет в инструментах — remna_get / remna_call.
 
 Как разбирать ноды:
 1. nodes_list(only_problems=True) — какие ноды красные/без heartbeat.
@@ -457,7 +461,14 @@ def _bs_err(e: Exception) -> dict:
 
 async def _node_targets(node: str) -> dict:
     """Что проверять у ноды: IP:порты клиентов, адрес CF-фронта, SNI и ссылки
-    тестовой подписки — то же, что смотрит node_diagnose."""
+    тестовой подписки — то же, что смотрит node_diagnose.
+    «remna:<панель>/<нода>» — нода Remnawave: ссылки служебного юзера hub-probe
+    на её строки, включая скрытые (вход каскада до проверки с симок)."""
+    from nexus_mcp import remna_ops
+
+    rn = remna_ops.parse_remna_node(node)
+    if rn:
+        return await remna_ops.node_links(rn[0], rn[1])
     n = await inventory.find_node(node)
     node_links: list[str] = []
     cf_links: list[str] = []
@@ -1459,7 +1470,11 @@ async def remna_node_edit(node: str, op: str, args: dict | None = None, panel: s
     * cascade_entry {exit: нода с cf_exit, sni, port?, remark?, squad?, hidden?} —
       на РОССИЙСКОЙ ноде: Reality-вход (firefox, minClientVer 1.0.0), реле на
       фронт выхода с mux, udp/53 и Рунет — напрямую, строка (скрыта, пока не
-      проверена с симок).
+      проверена с симок);
+    * cascade_remove {exit?} — на российской: снять вход каскада (инбаунд,
+      его правила, реле без других входов, строки, из сквадов);
+    * cf_exit_remove {} — на европейской: снять фронт (отказ, пока на него
+      смотрят входы), реле-юзера и его сквад, A-запись в Cloudflare.
 
     Без confirm — план: что изменится, на каких нодах перезапустится xray,
     проблемы, plan_hash. План — человеку. С confirm=true и plan_hash —
@@ -1488,6 +1503,129 @@ async def remna_node_edit(node: str, op: str, args: dict | None = None, panel: s
         return res
 
     return await _job(f"remna_node_edit {node} {op}", work())
+
+
+@mcp.tool()
+async def remna_node_diagnose(node: str, panel: str = "", probes: list[str] | None = None,
+                              ssh_port: int = 22, ssh_user: str = "") -> dict:
+    """Почему нода Remnawave не работает — разбор одной ручкой.
+
+    Панель (на связи, выключена, xray недавно перезапускался), профиль (у
+    инбаунда нет строки или сквада, Reality без minClientVer 1.0.0, отпечаток
+    chrome), сервер по SSH (контейнер, перезапуски, ошибки xray за 6 ч,
+    слушаются ли порты, срок сертификатов, диск), доступность TCP-входов с хаба
+    и домашних пробников (probes=[имена из probes_list]), фронт Cloudflare и
+    выходы каскада (WebSocket через Cloudflare). verdict + findings: bad → warn.
+    """
+    from nexus_mcp import remna_ops
+
+    try:
+        return await remna_ops.diagnose(panel, node, list(probes or []), ssh_port, ssh_user)
+    except (remna_ops.OpsError, remna.RemnaError, remna_ops.re_.EditError) as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def remna_node_action(node: str, action: str, panel: str = "", confirm: bool = False,
+                            ssh_port: int = 22, ssh_user: str = "") -> dict:
+    """Действие с нодой Remnawave. Только по просьбе человека.
+
+    action: restart (xray через панель), restart_container (docker restart
+    remnanode по SSH — когда панель до ноды не достаёт), enable, disable,
+    delete (удалить из панели, необратимо). Без confirm — что произойдёт и кого
+    заденет; с confirm=true — выполнить.
+    """
+    from nexus_mcp import remna_ops
+
+    try:
+        if not confirm:
+            return {"preview": True, **(await remna_ops.action_plan(panel, node, action))}
+        if off := _actions_off():
+            return off
+        res = await remna_ops.action_run(panel, node, action, ssh_port, ssh_user)
+    except (remna_ops.OpsError, remna.RemnaError, remna_ops.re_.EditError) as e:
+        res = _err(e)
+    audit.record("remna_node_action", {"panel": panel, "node": node, "action": action},
+                 res.get("ok", False), res.get("detail", "") or res.get("error", ""))
+    return res
+
+
+@mcp.tool()
+async def remna_probe_user(panel: str = "", confirm: bool = False) -> dict:
+    """Служебный юзер hub-probe в Remnawave — для проверок подписки и нод.
+
+    Во всех сквадах клиентов (кроме реле каскада), без срока и лимита. Его
+    подписка — то, что видит клиент; его ссылки на ноду (в том числе на
+    скрытые строки) хаб отдаёт пробникам и SIM-проверкам сам, в ответы они не
+    попадают. Без confirm — что будет сделано; confirm=true — завести или
+    досыпать сквады.
+    """
+    from nexus_mcp import remna_ops
+
+    try:
+        if not confirm:
+            return {"preview": True, **(await remna_ops.probe_plan(panel))}
+        if off := _actions_off():
+            return off
+        res = await remna_ops.ensure_probe_user(panel)
+    except (remna_ops.OpsError, remna.RemnaError, remna_ops.re_.EditError) as e:
+        res = _err(e)
+    audit.record("remna_probe_user", {"panel": panel}, res.get("ok", False), res.get("detail", ""))
+    return res
+
+
+@mcp.tool()
+async def remna_sub_check(panel: str = "", probe: str = "hub") -> dict:
+    """Каждая строка подписки клиента Remnawave — открывается ли с точки обзора.
+
+    Подписка служебного юзера hub-probe берётся так же, как у клиентов: со
+    страницы бота 3XUIStore (sub_url реестра), без неё — у Remnawave. probe —
+    hub или домашний пробник (probes_list). Статусы: reachable, filtered,
+    down, refused, dns; UDP (Hysteria2) по TCP не проверить — сквозная:
+    sim_vless(node='remna:<панель>/<нода>').
+    """
+    from nexus_mcp import remna_ops
+
+    try:
+        return await remna_ops.sub_check(panel, probe)
+    except (remna_ops.OpsError, remna.RemnaError) as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def remna_get(path: str, panel: str = "", params: dict | None = None) -> dict:
+    """Чтение любой ручки Remnawave (GET /api/…) — когда готового инструмента нет.
+    Секреты, ссылки подписок и ключи юзеров замаскированы, длинные списки
+    обрезаны до 50 (листайте start/size). Токены и вход панели — закрыты."""
+    from nexus_mcp import remna_ops
+
+    try:
+        return {"ok": True, "response": await remna_ops.get(panel, path, params)}
+    except (remna_ops.OpsError, remna.RemnaError) as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def remna_call(method: str, path: str, body: dict | list | None = None, panel: str = "",
+                     confirm: bool = False) -> dict:
+    """Изменение через любую ручку Remnawave (POST/PATCH/PUT/DELETE /api/…) —
+    запасной путь, когда готового инструмента нет. Только по просьбе человека.
+    Без confirm — предпросмотр (что и куда уйдёт); confirm=true — выполнить.
+    Токены и вход панели — закрыты. Ноды и каскад — через remna_node_edit:
+    там план, проверка и откат, здесь их нет."""
+    from nexus_mcp import remna_ops
+
+    try:
+        if not confirm:
+            return {"preview": True, **(await remna_ops.call_plan(panel, method, path, body))}
+        if off := _actions_off():
+            return off
+        res = await remna_ops.call_run(panel, method, path, body)
+    except (remna_ops.OpsError, remna.RemnaError) as e:
+        res = _err(e)
+    audit.record("remna_call", {"panel": panel, "method": method, "path": path},
+                 res.get("ok", False), res.get("detail", "") or res.get("error", ""))
+    return res
 
 
 # ── Правка конфигурации ноды ───────────────────────────────────────────────

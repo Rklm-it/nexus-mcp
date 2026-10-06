@@ -51,7 +51,7 @@ import httpx
 from nexus_mcp import config, remna, ssh
 from nexus_mcp.node_install import parse_kv, scrub
 
-OPS = ("reality_sni", "host", "squad", "cf_exit", "cascade_entry")
+OPS = ("reality_sni", "host", "squad", "cf_exit", "cascade_entry", "cascade_remove", "cf_exit_remove")
 
 # Порты, которые Cloudflare проксирует по HTTPS без Spectrum: edge-порт =
 # порт на ноде. Как у фронта Nexus (vgx3d services/cf_front.HTTPS_PORTS).
@@ -274,11 +274,18 @@ class Change:
     ssh_script: str = ""
     verify: dict | None = None       # {"host", "port", "path"}
     extra: dict = field(default_factory=dict)
+    # Снятие (cascade_remove, cf_exit_remove): что выключить на ноде, из каких
+    # сквадов убрать инбаунд (uuid сквада, uuid инбаунда) — с откатом; уборка
+    # после проверки нод (хосты, юзер и сквад реле, запись Cloudflare) — без
+    # отката: она безвредна, а её «вернуть» означало бы новые uuid.
+    deactivate: list[str] = field(default_factory=list)
+    squad_remove_uuid: list[tuple[str, str]] = field(default_factory=list)
+    cleanup: list[tuple] = field(default_factory=list)
 
     def restarts(self, st: State) -> list[str]:
         if self.new_config is not None:
             return [st.node.get("name"), *st.sharing]
-        return [st.node.get("name")] if self.activate else []
+        return [st.node.get("name")] if self.activate or self.deactivate else []
 
 
 def _pick_squad(squads: list[dict], name: str) -> dict | None:
@@ -853,6 +860,112 @@ async def op_cascade_entry(st: State, args: dict) -> Change:
     return ch
 
 
+# ── Снятие каскада ────────────────────────────────────────────────────────
+
+def _remove_inbound_parts(st: State, ch: Change, tag: str) -> None:
+    """Инбаунд уходит с ноды: из сквадов (с откатом), его строки — уборкой."""
+    uid = st.inbound_uuid(tag)
+    for sq in st.squads:
+        if uid and uid in [_uuid_of(i) for i in sq.get("inbounds") or []]:
+            ch.squad_remove_uuid.append((sq["uuid"], uid))
+            ch.summary.append(f"{tag} — из сквада «{sq.get('name')}»")
+    for h in st.all_hosts:
+        if ((h.get("inbound") or {}).get("configProfileInboundUuid")) == uid:
+            ch.cleanup.append(("host", h["uuid"]))
+            ch.summary.append(f"строка {_host_ref(h)} — удалить")
+    ch.deactivate.append(tag)
+
+
+def op_cascade_remove(st: State, args: dict) -> Change:
+    ch = Change()
+    exit_name = str(args.get("exit") or "")
+    entries = [t for t in st.active_tags if t.startswith(ENTRY_TAG)]
+    in_tag = ENTRY_TAG + _slug(exit_name) if exit_name else (entries[0] if len(entries) == 1 else "")
+    if not in_tag or in_tag not in st.active_tags:
+        ch.problems.append("входа каскада с таким выходом на ноде нет. Есть: " + (", ".join(entries) or "—")
+                           + ("" if exit_name or len(entries) < 2 else " — укажите args.exit"))
+        return ch
+    ib = st.inbound(in_tag) or {}
+    out_tags = {r.get("outboundTag") for r in (st.config.get("routing") or {}).get("rules") or []
+                if r.get("inboundTag") == [in_tag] and str(r.get("outboundTag", "")).startswith(RELAY_TAG)}
+    cfg = copy.deepcopy(st.config)
+    cfg["inbounds"] = [i for i in cfg.get("inbounds") or [] if i.get("tag") != in_tag]
+    rules = [r for r in (cfg.get("routing") or {}).get("rules") or [] if r.get("inboundTag") != [in_tag]]
+    cfg.setdefault("routing", {})["rules"] = rules
+    used = {r.get("outboundTag") for r in rules}
+    dropped = [t for t in out_tags if t not in used]
+    cfg["outbounds"] = [o for o in cfg.get("outbounds") or [] if o.get("tag") not in dropped]
+    ch.new_config = cfg
+    ch.summary.append(f"профиль {st.profile.get('name')}: убрать вход {in_tag} (:{ib.get('port')}), его правила"
+                      + (f" и реле {', '.join(sorted(dropped))}" if dropped else ""))
+    _remove_inbound_parts(st, ch, in_tag)
+    ch.warnings.append("у клиентов строка входа пропадёт со следующего обновления подписки; до него "
+                       "она перестанет работать сразу")
+    return ch
+
+
+async def _profiles(p: dict) -> list[dict]:
+    rows = remna._list(await remna.request(p, "GET", "/api/config-profiles"), "configProfiles")
+    out = []
+    for r in rows:
+        if "config" not in r and r.get("uuid"):
+            r = await remna.request(p, "GET", f"/api/config-profiles/{r['uuid']}")
+        out.append(r)
+    return out
+
+
+async def op_cf_exit_remove(st: State, args: dict) -> Change:
+    ch = Change()
+    front = cf_front_of(st)
+    if not front:
+        ch.problems.append("фронта Cloudflare (HUB_CF_*) на ноде нет")
+        return ch
+    # Входы каскада, смотрящие на этот фронт, иначе молча лишатся выхода.
+    users_of = []
+    for pr in await _profiles(st.panel):
+        for o in (pr.get("config") or {}).get("outbounds") or []:
+            vn = ((o.get("settings") or {}).get("vnext") or [{}])[0]
+            if vn.get("address") == front["host"]:
+                nodes = [n.get("name") for n in st.nodes
+                         if (n.get("configProfile") or {}).get("activeConfigProfileUuid") == pr.get("uuid")]
+                users_of.append(f"{pr.get('name')} ({', '.join(nodes) or 'без нод'}): {o.get('tag')}")
+    if users_of:
+        ch.problems.append("на фронт ещё смотрят входы каскада — сперва op=cascade_remove на их нодах: "
+                           + "; ".join(users_of))
+    cfg = copy.deepcopy(st.config)
+    cfg["inbounds"] = [i for i in cfg.get("inbounds") or [] if i.get("tag") != front["tag"]]
+    ch.new_config = cfg
+    ch.summary.append(f"профиль {st.profile.get('name')}: убрать фронт {front['tag']} (:{front['port']})")
+    _remove_inbound_parts(st, ch, front["tag"])
+    uname = relay_username(st.node.get("name") or "")
+    user = await _find_user(st.panel, uname)
+    if user:
+        ch.cleanup.append(("user", user["uuid"]))
+        ch.summary.append(f"реле-юзер {uname} — удалить")
+    for sq in st.squads:
+        if (sq.get("name") or "").lower() == uname:
+            ch.cleanup.append(("squad", sq["uuid"]))
+            ch.summary.append(f"сквад {uname} — удалить")
+    p = st.panel
+    ip = _node_ip(st)
+    if p.get("cf_token") and p.get("cf_zone") and front["host"].endswith("." + p["cf_zone"]):
+        try:
+            zones = await _cf(p, "GET", "/zones", params={"name": p["cf_zone"]})
+            recs = await _cf(p, "GET", f"/zones/{zones[0]['id']}/dns_records",
+                             params={"name": front["host"]}) if zones else []
+        except EditError as e:
+            recs = []
+            ch.warnings.append(f"Cloudflare: {e} — запись {front['host']} уберите руками")
+        for r in recs:
+            if r.get("type") == "A" and r.get("content") == ip:
+                ch.cleanup.append(("cf", zones[0]["id"], r["id"]))
+                ch.summary.append(f"Cloudflare: удалить A {front['host']} → {ip}")
+    else:
+        ch.warnings.append(f"запись Cloudflare {front['host']} хаб не уберёт (нет токена зоны) — уберите руками")
+    ch.warnings.append(f"правило ufw для порта {front['port']} на ноде остаётся (безвредно)")
+    return ch
+
+
 def remark_flag(cc: str) -> str:
     cc = (cc or "").upper()
     return "".join(chr(0x1F1E6 + ord(c) - 65) for c in cc) if re.match(r"^[A-Z]{2}$", cc) else ""
@@ -871,6 +984,10 @@ async def _change(st: State, op: str, args: dict) -> Change:
         return await op_cf_exit(st, args)
     if op == "cascade_entry":
         return await op_cascade_entry(st, args)
+    if op == "cascade_remove":
+        return op_cascade_remove(st, args)
+    if op == "cf_exit_remove":
+        return await op_cf_exit_remove(st, args)
     raise EditError(f"op: {', '.join(OPS)}")
 
 
@@ -878,7 +995,7 @@ def _plan_hash(st: State, op: str, args: dict, ch: Change) -> str:
     safe_args = {k: v for k, v in args.items() if k not in ("ssh_user",)}
     return _hash({"op": op, "args": safe_args, "state": st.fingerprint(),
                   "config": ch.new_config, "hosts": ch.host_creates, "patches": ch.host_patches,
-                  "cf": ch.cf, "ssh": ch.ssh_script})
+                  "cf": ch.cf, "ssh": ch.ssh_script, "cleanup": ch.cleanup})
 
 
 async def plan(panel_name: str, node: str, op: str, args: dict | None = None) -> dict:
@@ -1048,6 +1165,32 @@ async def apply(panel_name: str, node: str, op: str, args: dict | None, plan_has
         log.append("нода: " + (", ".join(f"{k} {kv[k]}" for k in ("cert", "ufw") if kv.get(k)) or "ok"))
 
     try:
+        # 2а. Снятие: сперва убрать инбаунд из сквадов и выключить на ноде —
+        # профиль без инбаунда, который нода ещё держит включённым, панель
+        # может не принять.
+        if ch.squad_remove_uuid:
+            squads = remna._list(await remna.request(p, "GET", "/api/internal-squads"), "internalSquads")
+            for sq_uuid in dict.fromkeys(s_ for s_, _ in ch.squad_remove_uuid):
+                sq = next((x for x in squads if x.get("uuid") == sq_uuid), None)
+                if sq is None:
+                    continue
+                cur = [_uuid_of(i) for i in sq.get("inbounds") or []]
+                rem = {u for s_, u in ch.squad_remove_uuid if s_ == sq_uuid}
+                await remna.request(p, "PATCH", "/api/internal-squads",
+                                    body={"uuid": sq_uuid, "inbounds": [u for u in cur if u not in rem]})
+                undo.append(("squad", {"uuid": sq_uuid, "inbounds": cur}))
+                log.append(f"сквад «{sq.get('name')}»: −{len(rem)}")
+        if ch.deactivate:
+            old_active = [a["uuid"] for a in st.active]
+            gone = {a["uuid"] for a in st.active if a["tag"] in ch.deactivate}
+            await remna.request(p, "PATCH", "/api/nodes", body={
+                "uuid": st.node["uuid"],
+                "configProfile": {"activeConfigProfileUuid": st.profile["uuid"],
+                                  "activeInbounds": [u for u in old_active if u not in gone]}})
+            undo.append(("node", {"uuid": st.node["uuid"], "configProfile": {
+                "activeConfigProfileUuid": st.profile["uuid"], "activeInbounds": old_active}}))
+            log.append(f"на {st.node.get('name')} выключены: {', '.join(ch.deactivate)}")
+
         # 2. Cloudflare.
         if ch.cf and ch.cf.get("create"):
             rec = await _cf(p, "POST", f"/zones/{ch.cf['zone_id']}/dns_records",
@@ -1137,7 +1280,7 @@ async def apply(panel_name: str, node: str, op: str, args: dict | None, plan_has
     # 8. Проверка: ноды профиля на связи, фронт отвечает через Cloudflare.
     watch = [n["uuid"] for n in st.nodes if n.get("isConnected") and (
         n["uuid"] == st.node["uuid"] or (ch.new_config is not None and n.get("name") in st.sharing))]
-    if ch.new_config is not None or ch.activate:
+    if ch.new_config is not None or ch.activate or ch.deactivate:
         bad = await _wait_healthy(p, watch)
         if bad:
             return await rollback(f"после правки не на связи: {', '.join(bad)} — профиль, вероятно, "
@@ -1149,7 +1292,26 @@ async def apply(panel_name: str, node: str, op: str, args: dict | None, plan_has
             return await rollback(f"фронт {ch.verify['host']}:{ch.verify['port']} не отвечает через "
                                   f"Cloudflare: {v.get('error')}")
         log.append(f"фронт {ch.verify['host']}:{ch.verify['port']}: WebSocket через Cloudflare — 101")
+    # 9. Уборка после снятия: безвредна, отката не требует; 404 — уже убрано
+    # самой панелью (строки удалённого инбаунда она чистит сама).
+    left: list[str] = []
+    for item in ch.cleanup:
+        kind = item[0]
+        try:
+            if kind == "cf":
+                await _cf(p, "DELETE", f"/zones/{item[1]}/dns_records/{item[2]}")
+            else:
+                path = {"host": "/api/hosts/", "user": "/api/users/", "squad": "/api/internal-squads/"}[kind]
+                await remna.request(p, "DELETE", path + item[1])
+            log.append(f"удалено: {kind}")
+        except remna.RemnaError as e:
+            if e.status != 404:
+                left.append(f"{kind} {item[-1][:8]}: {e}")
+        except EditError as e:
+            left.append(f"{kind}: {e}")
     out = {"ok": True, "node": st.node.get("name"), "op": op, "log": log}
+    if left:
+        out["cleanup_left"] = left
     if op == "cf_exit":
         out["next"] = (f"вход каскада: remna_node_edit(<RU-нода>, op='cascade_entry', "
                        f"args={{'exit': '{st.node.get('name')}', 'sni': <SNI из белого списка>}})")

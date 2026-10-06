@@ -46,11 +46,21 @@ EDIT_TOOLS = ("node_edit",)
 # (без confirm) идёт сразу, выполнение (confirm=true) ждёт кнопки.
 PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance", "probe_subscription",
                      "master_job", "master_clients_update", "panel_update", "node_install",
-                     "remna_node_install", "remna_node_edit")
+                     "remna_node_install", "remna_node_edit", "remna_node_action", "remna_probe_user",
+                     "remna_call")
+
+def _rw(inp: dict) -> str:
+    return f"Remnawave {inp['panel']}" if inp.get("panel") else "Remnawave"
+
 
 REMNA_EDIT_OPS = {
     "reality_sni": "SNI Reality", "host": "строка подписки", "squad": "сквад",
     "cf_exit": "выход каскада за Cloudflare", "cascade_entry": "вход каскада RU → CF → EU",
+    "cascade_remove": "снять вход каскада", "cf_exit_remove": "снять выход каскада",
+}
+REMNA_ACTIONS = {
+    "restart": "перезапустить xray", "restart_container": "перезапустить контейнер remnanode",
+    "enable": "включить", "disable": "выключить", "delete": "УДАЛИТЬ из панели",
 }
 
 MASTER_JOB_TITLES = {
@@ -204,14 +214,21 @@ def describe_action(tool: str, inp: dict) -> str:
                 f"и добавить в панель {inp.get('panel', '?')}{route}{cdn} (5–15 мин)")
     if tool == "remna_node_install":
         where = inp.get("domain") or inp.get("ip", "?")
-        return (f"Remnawave {inp.get('panel') or ''}: поставить ноду {inp.get('name', '?')} "
-                f"({inp.get('country', '?')}, {inp.get('template') or 'hysteria2'}) на {where} (3–10 мин)").replace("  ", " ")
+        return (f"{_rw(inp)}: поставить ноду {inp.get('name', '?')} "
+                f"({inp.get('country', '?')}, {inp.get('template') or 'hysteria2'}) на {where} (3–10 мин)")
     if tool == "remna_node_edit":
         op = inp.get("op", "?")
         args = inp.get("args") or {}
         detail = ", ".join(f"{k}={v}" for k, v in args.items() if k not in ("ssh_user",))[:160]
-        return (f"Remnawave {inp.get('panel') or ''}: {inp.get('node', '?')} · {REMNA_EDIT_OPS.get(op, op)}"
-                + (f" · {detail}" if detail else "")).replace("  ", " ")
+        return (f"{_rw(inp)}: {inp.get('node', '?')} · {REMNA_EDIT_OPS.get(op, op)}"
+                + (f" · {detail}" if detail else ""))
+    if tool == "remna_node_action":
+        act = inp.get("action", "?")
+        return f"{_rw(inp)}: {inp.get('node', '?')} · {REMNA_ACTIONS.get(act, act)}"
+    if tool == "remna_probe_user":
+        return f"{_rw(inp)}: завести/обновить служебного юзера hub-probe"
+    if tool == "remna_call":
+        return f"{_rw(inp)}: {str(inp.get('method', '?')).upper()} {inp.get('path', '?')}"
     if tool == "panel_update":
         return f"Обновить панель {inp.get('panel', '?')} образами мастера (3–10 мин, панель перезапустится)"
     if tool == "panel_maintenance":

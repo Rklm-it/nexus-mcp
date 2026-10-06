@@ -24,7 +24,9 @@ from nexus_mcp import remna, ssh
 from nexus_mcp import remna_edit as re_
 
 RELAY_VLESS = "9f1c2d3e-aaaa-4bbb-8ccc-0123456789ab"
-PRIV = "PRIVATE-X25519-KEY-abcdef"
+PROBE_VLESS = "1e2d3c4b-bbbb-4ccc-8ddd-abcdefabcdef"
+PRIV = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"  # настоящий по форме: из него считается pbk
+OLD_PK = "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"
 EXIT_IP = "45.141.118.7"
 ENTRY_IP = "185.22.1.10"
 
@@ -46,7 +48,7 @@ def re_inbound(tag, sni, port=443):
     return {"tag": tag, "port": port, "protocol": "vless",
             "settings": {"clients": [], "decryption": "none"},
             "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
-                "privateKey": "OLD-PK", "serverNames": [sni], "dest": f"{sni}:443",
+                "privateKey": OLD_PK, "serverNames": [sni], "dest": f"{sni}:443",
                 "shortIds": ["ab"], "minClientVer": "1.0.0"}}}
 
 
@@ -126,6 +128,17 @@ class Panel:
         nf = httpx.Response(404, json={"message": "not found"})
         if m == "GET" and path == "/api/nodes":
             return w(list(copy.deepcopy(self.nodes).values()))
+        if m == "POST" and path.startswith("/api/nodes/") and "/actions/" in path:
+            uid, _, act = path[len("/api/nodes/"):].partition("/actions/")
+            if act in ("enable", "disable"):
+                self.nodes[uid]["isDisabled"] = act == "disable"
+            return w(copy.deepcopy(self.nodes[uid]))
+        if m == "DELETE" and path.startswith("/api/nodes/"):
+            self.nodes.pop(path.rsplit("/", 1)[1], None)
+            return w({"isDeleted": True})
+        if m == "GET" and path == "/api/config-profiles":
+            return w({"total": len(self.profiles),
+                      "configProfiles": [self.profile_view(u) for u in self.profiles]})
         if m == "GET" and path.startswith("/api/nodes/"):
             n = self.nodes.get(path.rsplit("/", 1)[1])
             return w(copy.deepcopy(n)) if n else nf
@@ -171,8 +184,20 @@ class Panel:
             return w(copy.deepcopy(u)) if u else nf
         if m == "POST" and path == "/api/users":
             uid = self.new_id("user")
-            self.users[uid] = {"uuid": uid, "vlessUuid": RELAY_VLESS, **body}
+            vless = RELAY_VLESS if body["username"].startswith("hub-relay-") else PROBE_VLESS
+            self.users[uid] = {"uuid": uid, "vlessUuid": vless, "shortUuid": f"short-{uid}",
+                               "status": "ACTIVE", **body,
+                               "activeInternalSquads": [{"uuid": u, "name": self.squads[u]["name"]}
+                                                        for u in body.get("activeInternalSquads") or []]}
             return w(copy.deepcopy(self.users[uid]))
+        if m == "PATCH" and path == "/api/users":
+            u = self.users[body["uuid"]]
+            for k, v in body.items():
+                if k == "activeInternalSquads":
+                    v = [{"uuid": x, "name": self.squads[x]["name"]} for x in v]
+                if k != "uuid":
+                    u[k] = v
+            return w(copy.deepcopy(u))
         if m == "GET" and path == "/api/system/tools/x25519/generate":
             return w({"keypairs": [{"publicKey": "PUB", "privateKey": PRIV}]})
         if m == "DELETE":
@@ -217,6 +242,11 @@ PRECHECK_OK = ("mounts=/etc/letsencrypt,/opt/remnanode,\ncontainer=Up 2 days\nhu
 
 @pytest.fixture
 def env(monkeypatch, hub_settings):
+    return make_env(monkeypatch, hub_settings)
+
+
+def make_env(monkeypatch, hub_settings):
+    """Мок Remnawave + Cloudflare + SSH + рукопожатие (зовут и test_remna_ops)."""
     remna.add("pablo", "https://panelpablo.mooo.com", "tok", "https://auth.pablovpn.com/sub/")
     remna.set_cf("pablo", "pablo.stream", "CF-TOKEN-SECRET")
     panel, cf = Panel(), Cloudflare()
@@ -264,7 +294,7 @@ def test_reality_sni_profile_and_hosts(env):
     assert any("ru02s3" in w for w in pl["warnings"])        # общий профиль — правка у обеих
     rs = panel.profiles["p-ru"]["config"]["inbounds"][0]["streamSettings"]["realitySettings"]
     assert rs["serverNames"] == ["dl.google.com"] and rs["dest"] == "dl.google.com:443"
-    assert rs["privateKey"] == "OLD-PK" and rs["minClientVer"] == "1.0.0"
+    assert rs["privateKey"] == OLD_PK and rs["minClientVer"] == "1.0.0"
     assert panel.hosts["h-ru"]["sni"] == "dl.google.com"
 
 
@@ -336,7 +366,8 @@ def test_cf_exit_builds_front_and_relay(env):
     relay_sq = next(s for s in panel.squads.values() if s["name"] == "hub-relay-nl01s1")
     assert [i["uuid"] for i in relay_sq["inbounds"]] == [panel.iu(ib["tag"])]
     user = next(iter(panel.users.values()))
-    assert user["username"] == "hub-relay-nl01s1" and user["activeInternalSquads"] == [relay_sq["uuid"]]
+    assert user["username"] == "hub-relay-nl01s1"
+    assert [x["uuid"] for x in user["activeInternalSquads"]] == [relay_sq["uuid"]]
     assert user["trafficLimitBytes"] == 0 and user["expireAt"].startswith("2099")
     # Публичной строки не просили — главный сквад и хосты не тронуты.
     assert [i["uuid"] for i in panel.squads["sq-main"]["inbounds"]] == ["inb-hy_nl", "inb-re_ru"]
@@ -433,6 +464,54 @@ def test_cascade_entry_failure_restores_entry_profile(env):
     after["nodes"] = {k: {**v, "isConnected": True} for k, v in after["nodes"].items()}
     assert after == before
     assert PRIV not in json.dumps(res, ensure_ascii=False)
+
+
+# ── снятие каскада ────────────────────────────────────────────────────────
+
+def test_cascade_remove_then_cf_exit_remove_restore_panel(env):
+    """Снятие возвращает панель к виду до каскада; выход не снимается, пока на
+    него смотрит вход; Cloudflare и реле убираются."""
+    panel, cf, sent = env
+    ru_before = copy.deepcopy(panel.profiles["p-ru"]["config"])
+    nl_before = copy.deepcopy(panel.profiles["p-nl"]["config"])
+    hosts_before, main_before = set(panel.hosts), copy.deepcopy(panel.squads["sq-main"])
+    do("nl01s1", "cf_exit", {})
+    do("ru01s3", "cascade_entry", {"exit": "nl01s1", "sni": "ads.x5.ru"})
+
+    pl = run(re_.plan("pablo", "nl01s1", "cf_exit_remove", {}))
+    assert not pl["ok"] and "cascade_remove" in pl["problems"][0] and "ru01s3" in pl["problems"][0]
+
+    _, res = do("ru01s3", "cascade_remove", {"exit": "nl01s1"})
+    assert res["ok"], res
+    cfg = panel.profiles["p-ru"]["config"]
+    # Всё каскадное ушло; DNS-правило (безвредное) может остаться.
+    cfg_rules = [r for r in cfg["routing"]["rules"] if r.get("port") != "53"]
+    assert cfg["inbounds"] == ru_before["inbounds"] and cfg["outbounds"] == ru_before["outbounds"]
+    assert cfg_rules == ru_before["routing"]["rules"]
+    assert [a["tag"] for a in panel.nodes["n-ru"]["configProfile"]["activeInbounds"]] == ["RE_RU"]
+    assert set(panel.hosts) == hosts_before
+    assert panel.squads["sq-main"] == main_before
+
+    _, res = do("nl01s1", "cf_exit_remove", {})
+    assert res["ok"], res
+    assert panel.profiles["p-nl"]["config"] == nl_before
+    assert [a["tag"] for a in panel.nodes["n-nl"]["configProfile"]["activeInbounds"]] == ["HY_NL"]
+    assert panel.users == {} and set(panel.squads) == {"sq-main"}
+    assert cf.records == {}
+
+
+def test_cascade_remove_rolls_back_when_node_drops(env):
+    panel, cf, sent = env
+    do("nl01s1", "cf_exit", {})
+    do("ru01s3", "cascade_entry", {"exit": "nl01s1", "sni": "ads.x5.ru"})
+    before = panel.snapshot()
+    panel.connected_after_patch = False
+    pl = run(re_.plan("pablo", "ru01s3", "cascade_remove", {}))
+    res = run(re_.apply("pablo", "ru01s3", "cascade_remove", {}, pl["plan_hash"]))
+    assert not res["ok"]
+    after = panel.snapshot()
+    after["nodes"] = {k: {**v, "isConnected": True} for k, v in after["nodes"].items()}
+    assert after == before                       # строки не удалены: уборка — только после проверки
 
 
 # ── сторож копии (инвариант 25) ───────────────────────────────────────────
