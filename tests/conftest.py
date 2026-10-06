@@ -38,6 +38,7 @@ def hub_settings(tmp_path, monkeypatch):
     s.probe_tokens = ["probe-token"]
     s.state_dir = tmp_path / "state"
     s.inventory_file = tmp_path / "nodes.json"
+    s.remna_file = tmp_path / "remnawave.json"
     s.brain_url = ""
     s.brain_admin_token = ""
     s.test_sub_url = ""

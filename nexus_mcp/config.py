@@ -48,6 +48,12 @@ class Settings:
     panels_file: Path = field(
         default_factory=lambda: Path(_env("NEXUS_PANELS", "/etc/nexus-mcp/panels.json")))
 
+    # Панели Remnawave (связка «Remnawave + бот-продавец поверх него», 3XUIStore):
+    # отдельно от panels.json — остальные инструменты хаба ходят по тому
+    # реестру и ждут API Nexus. См. remna.py.
+    remna_file: Path = field(
+        default_factory=lambda: Path(_env("NEXUS_REMNA", "/etc/nexus-mcp/remnawave.json")))
+
     # Файл с нодами и поправками (ssh-порт, пользователь, ноды вне панели).
     inventory_file: Path = field(
         default_factory=lambda: Path(_env("NEXUS_INVENTORY", "/etc/nexus-mcp/nodes.json")))

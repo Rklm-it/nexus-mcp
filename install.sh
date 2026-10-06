@@ -467,6 +467,7 @@ fi
 # ── Итог ─────────────────────────────────────────────────────────────────────
 install -m 0755 "$APP/bin/nexus-mcp-info" /usr/local/bin/nexus-mcp-info
 install -m 0755 "$APP/bin/nexus-mcp-panels" /usr/local/bin/nexus-mcp-panels
+install -m 0755 "$APP/bin/nexus-mcp-remna" /usr/local/bin/nexus-mcp-remna
 install -m 0755 "$APP/bin/nexus-chat-login" /usr/local/bin/nexus-chat-login
 install -m 0755 "$APP/bin/nexus-hub" /usr/local/bin/nexus-hub
 echo

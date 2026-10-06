@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 
 from urllib.parse import urlparse
 
-from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbook, recipes, ssh
+from nexus_mcp import audit, bsbord, config, diagnose, inventory, panels, playbook, recipes, remna, ssh
 from nexus_mcp import node_edit as edits
 from nexus_mcp import links as sublinks
 from nexus_mcp import relay
@@ -57,6 +57,11 @@ Redis. panel_call и panel_maintenance — только по просьбе че
 confirm — предпросмотр (что за ручка, чем рискует), с confirm=true — выполнить.
 Панелей может быть несколько (panels_list): тогда у инструментов панели указывай
 panel=<имя>, а ноды называются «панель/имя».
+
+Remnawave: часть клиентов живёт не на Nexus, а на Remnawave с ботом-продавцом
+3XUIStore поверх (подписку клиенты берут с SUBPAGE бота). Их панели — remna_panels;
+обзор — remna_overview, ноды — remna_nodes, клиент по Telegram ID/UUID/логину —
+remna_user, конфиг ноды — remna_profile.
 
 Как разбирать ноды:
 1. nodes_list(only_problems=True) — какие ноды красные/без heartbeat.
@@ -636,6 +641,79 @@ async def panels_list() -> dict:
         return {"ok": True, "panels": [panels.public_view(p) for p in panels.all_panels()]}
     except panels.PanelConfigError as e:
         return _err(e)
+
+
+# ── Remnawave (+ бот 3XUIStore поверх) ────────────────────────────────────
+# Клиенты не на панели Nexus, а на Remnawave: свой реестр (remna.py), свои
+# инструменты. Подписку клиенты берут с SUBPAGE бота (sub_url панели).
+
+def _remna(fn):
+    async def run(*a, **kw):
+        try:
+            return {"ok": True, **(await fn(*a, **kw))}
+        except remna.RemnaError as e:
+            return _err(e)
+    return run
+
+
+@mcp.tool()
+async def remna_panels() -> dict:
+    """Панели Remnawave, подключённые к хабу (без токенов): имя, адрес,
+    адрес подписки клиентов (SUBPAGE бота 3XUIStore)."""
+    try:
+        return {"ok": True, "panels": [remna.public_view(p) for p in remna.all_panels()]}
+    except remna.RemnaError as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def remna_overview(panel: str = "") -> dict:
+    """Обзор панели Remnawave: версия, юзеры по статусам, онлайн, ноды
+    (сколько на связи, какие упали). panel — имя из remna_panels."""
+    @_remna
+    async def go():
+        return await remna.overview(remna.resolve(panel))
+    return await go()
+
+
+@mcp.tool()
+async def remna_nodes(panel: str = "", only_problems: bool = False) -> dict:
+    """Ноды Remnawave: адрес, страна, на связи ли, онлайн, трафик, последняя
+    ошибка, конфиг-профиль и инбаунды. only_problems — только не на связи."""
+    @_remna
+    async def go():
+        ns = await remna.nodes(remna.resolve(panel))
+        if only_problems:
+            ns = [n for n in ns if not n["connected"] and not n["disabled"]]
+        return {"count": len(ns), "nodes": ns}
+    return await go()
+
+
+@mcp.tool()
+async def remna_user(query: str, panel: str = "") -> dict:
+    """Клиент Remnawave по Telegram ID, shortUuid/UUID или логину: статус,
+    срок, лимит и список устройств, трафик, последняя нода, сквады и ссылка
+    подписки (SUBPAGE бота). Ключ входа не показывается."""
+    @_remna
+    async def go():
+        p = remna.resolve(panel)
+        users = await remna.find_user(p, query)
+        for u in users[:3]:
+            if u.get("id") is not None:
+                u["devices"] = await remna.user_devices(p, u["id"])
+        return {"count": len(users), "users": users}
+    return await go()
+
+
+@mcp.tool()
+async def remna_profile(node: str, panel: str = "") -> dict:
+    """Конфиг-профиль ноды Remnawave: инбаунды (протокол, порт, транспорт,
+    SNI/dest Reality, домен сертификата), outbounds, правила маршрутизации,
+    DNS. Ключи и пароли замаскированы."""
+    @_remna
+    async def go():
+        return await remna.profile(remna.resolve(panel), node)
+    return await go()
 
 
 @mcp.tool()

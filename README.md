@@ -25,6 +25,21 @@ Brain стоит на российском IP, и **путь от него к н
      домашний пробник ──┘ (long-poll: проверки из домашней сети)
 ```
 
+## Панели Remnawave (бот 3XUIStore поверх)
+
+Часть клиентов живёт не на Nexus, а на Remnawave с ботом-продавцом 3XUIStore
+поверх — подписку они берут с SUBPAGE бота. Такие панели — в отдельном
+реестре `/etc/nexus-mcp/remnawave.json` (0600):
+
+```bash
+nexus-mcp-remna add pablo https://panelpablo.mooo.com <API-токен Remnawave> --sub https://auth.pablovpn.com/sub/
+nexus-mcp-remna list
+```
+
+Инструменты: `remna_panels`, `remna_overview`, `remna_nodes`, `remna_user`
+(по Telegram ID / UUID / логину, с ссылкой подписки бота), `remna_profile`
+(конфиг ноды, ключи замаскированы). Модуль — `nexus_mcp/remna.py`.
+
 ## Чат в приложении администратора
 
 Рядом с хабом ставится `nexus-chat`: Claude на подписке владельца, с
