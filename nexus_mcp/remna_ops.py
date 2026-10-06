@@ -145,7 +145,8 @@ async def ensure_probe_user(panel: str) -> dict:
             "trafficLimitStrategy": "NO_RESET", "activeInternalSquads": want, "description": PROBE_NOTE})
         return {"ok": True, "panel": p["name"], "detail": f"{PROBE_USER} заведён, сквадов: {len(want)}"}
     have = [_sq_uuid(x) for x in u.get("activeInternalSquads") or []]
-    body: dict = {"uuid": u["uuid"], "activeInternalSquads": list(dict.fromkeys([*have, *want]))}
+    k, v = remna.user_key(u)
+    body: dict = {k: v, "activeInternalSquads": list(dict.fromkeys([*have, *want]))}
     if u.get("status") != "ACTIVE":
         body.update({"status": "ACTIVE", "expireAt": FAR_FUTURE})
     await remna.request(p, "PATCH", "/api/users", body=body)

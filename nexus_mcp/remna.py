@@ -249,6 +249,26 @@ def mask(obj: Any) -> Any:
     return obj
 
 
+# ── Пользователь: чем его адресовать ──────────────────────────────────────
+
+def user_key(u: dict) -> tuple[str, Any]:
+    """Как адресовать пользователя в ручках изменения и удаления.
+
+    Remnawave 3.x отдаёт числовой `id` и не отдаёт `uuid` (pablo 3.2.1, ilya
+    3.2.3): PATCH /api/users ждёт `{"id": …}`, DELETE — /api/users/<id>.
+    Ранние версии адресовали по `uuid`. Берём то, что панель прислала."""
+    if u.get("id") is not None:
+        return "id", u["id"]
+    if u.get("uuid"):
+        return "uuid", u["uuid"]
+    raise RemnaError("панель не отдала ни id, ни uuid пользователя")
+
+
+def user_ref(u: dict) -> str:
+    """Значение для пути /api/users/<…>."""
+    return str(user_key(u)[1])
+
+
 # ── Чтение ─────────────────────────────────────────────────────────────────
 
 def _gb(value: Any) -> float:

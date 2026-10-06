@@ -940,7 +940,7 @@ async def op_cf_exit_remove(st: State, args: dict) -> Change:
     uname = relay_username(st.node.get("name") or "")
     user = await _find_user(st.panel, uname)
     if user:
-        ch.cleanup.append(("user", user["uuid"]))
+        ch.cleanup.append(("user", remna.user_ref(user)))
         ch.summary.append(f"реле-юзер {uname} — удалить")
     for sq in st.squads:
         if (sq.get("name") or "").lower() == uname:
@@ -1244,7 +1244,7 @@ async def apply(panel_name: str, node: str, op: str, args: dict | None, plan_has
                 "username": ch.relay["username"], "expireAt": FAR_FUTURE, "trafficLimitBytes": 0,
                 "trafficLimitStrategy": "NO_RESET", "activeInternalSquads": [sq["uuid"]],
                 "description": "реле каскада (хаб nexus-mcp): не удалять, не продлевать"})
-            undo.append(("user_delete", user["uuid"]))
+            undo.append(("user_delete", remna.user_ref(user)))
             secrets_seen.append(user.get("vlessUuid") or "")
             log.append(f"реле: сквад и юзер {ch.relay['username']}")
 

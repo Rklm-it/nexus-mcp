@@ -183,19 +183,23 @@ class Panel:
             u = next((u for u in self.users.values() if u["username"] == name), None)
             return w(copy.deepcopy(u)) if u else nf
         if m == "POST" and path == "/api/users":
-            uid = self.new_id("user")
+            # Как Remnawave 3.x (pablo 3.2.1): у пользователя числовой id, uuid нет.
+            self.n += 1
+            uid = str(1000 + self.n)
             vless = RELAY_VLESS if body["username"].startswith("hub-relay-") else PROBE_VLESS
-            self.users[uid] = {"uuid": uid, "vlessUuid": vless, "shortUuid": f"short-{uid}",
+            self.users[uid] = {"id": int(uid), "vlessUuid": vless, "shortUuid": f"short-{uid}",
                                "status": "ACTIVE", **body,
                                "activeInternalSquads": [{"uuid": u, "name": self.squads[u]["name"]}
                                                         for u in body.get("activeInternalSquads") or []]}
             return w(copy.deepcopy(self.users[uid]))
         if m == "PATCH" and path == "/api/users":
-            u = self.users[body["uuid"]]
+            if "id" not in body:
+                return httpx.Response(400, json={"message": "id: Required"})
+            u = self.users[str(body["id"])]
             for k, v in body.items():
                 if k == "activeInternalSquads":
                     v = [{"uuid": x, "name": self.squads[x]["name"]} for x in v]
-                if k != "uuid":
+                if k != "id":
                     u[k] = v
             return w(copy.deepcopy(u))
         if m == "GET" and path == "/api/system/tools/x25519/generate":
