@@ -128,6 +128,8 @@ class Panel:
         nf = httpx.Response(404, json={"message": "not found"})
         if m == "GET" and path == "/api/nodes":
             return w(list(copy.deepcopy(self.nodes).values()))
+        if m == "GET" and path == "/api/system/stats":
+            return w(getattr(self, "stats", {}))
         if m == "POST" and path.startswith("/api/nodes/") and "/actions/" in path:
             uid, _, act = path[len("/api/nodes/"):].partition("/actions/")
             if act in ("enable", "disable"):

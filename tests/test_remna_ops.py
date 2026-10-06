@@ -272,3 +272,25 @@ def test_app_sees_remna_panels_through_chat(env, monkeypatch, hub_settings, tmp_
     asyncio.run(go())
     hint = with_panel("что с нодами?", "pablo")
     assert "remna_*" in hint and 'panel="pablo"' in hint and hint.endswith("что с нодами?")
+
+
+def test_app_fields_contract(env):
+    """Поля, которые читает приложение (admin_app/.../chat/RemnaModels.kt в
+    vgx3d, сторож там — RemnaModelsTest). Переименование здесь не падает
+    нигде: экран просто покажет прочерки (инвариант 25 vgx3d)."""
+    from nexus_mcp import remna
+
+    node = remna.node_view({"name": "x", "configProfile": {}})
+    assert {"name", "address", "country", "connected", "disabled", "users_online",
+            "traffic_used_gb", "status_message", "inbounds"} <= set(node)
+    user = remna.user_view({"username": "u", "shortUuid": "s"}, "https://sub/")
+    assert {"username", "telegram_id", "status", "expire_at", "device_limit", "traffic_used_gb",
+            "traffic_limit_gb", "online_at", "squads", "sub_link"} <= set(user)
+    assert {"name", "url", "sub_url", "cf_zone"} <= set(remna.public_view(
+        {"name": "p", "url": "https://p", "token": "t"}))
+    panel, cf, sent = env
+    panel.stats = {"users": {"statusCounts": {"ACTIVE": 1}, "totalUsers": 1},
+                   "onlineStats": {"onlineNow": 0, "lastDay": 1}}
+    ov = run(remna.overview(remna.resolve("pablo")))
+    assert {"panel", "version", "users", "users_total", "online_now", "online_day",
+            "nodes_total", "nodes_online", "nodes_down"} <= set(ov)
