@@ -294,3 +294,20 @@ def test_app_fields_contract(env):
     ov = run(remna.overview(remna.resolve("pablo")))
     assert {"panel", "version", "users", "users_total", "online_now", "online_day",
             "nodes_total", "nodes_online", "nodes_down"} <= set(ov)
+
+
+def test_panel_findings_folds_per_client_items():
+    """Сотня «клиент не подключался» — одна строка со счётчиком: иначе ответ
+    центра состояния не влезает в контекст Claude (63–87 КБ на живых панелях)."""
+    from nexus_mcp.server import compact_findings
+
+    data = {"findings": [{"code": "node.offline", "scope": "node", "target_name": "nl"}],
+            "signals": [{"code": "client.zero_traffic", "scope": "client", "severity": "warning",
+                         "title": f"«u{i}» ни разу не подключился", "target_name": f"u{i}"} for i in range(70)]
+            + [{"code": "node.rf_blocked", "scope": "node", "target_name": "fi"}],
+            "nodes": [{"name": "nl", "link_history": [1] * 500, "stats": {"disk_percent": 40}}]}
+    out = compact_findings(data)
+    assert out["findings"] == data["findings"]
+    folded = [s for s in out["signals"] if s.get("scope") == "clients"]
+    assert len(out["signals"]) == 2 and folded[0]["count"] == 70 and len(folded[0]["examples"]) == 5
+    assert "link_history" not in out["nodes"][0] and out["nodes"][0]["stats"]

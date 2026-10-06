@@ -763,13 +763,56 @@ async def panel_overview(panel: str = "") -> dict:
     return await _panel(panel_api.get, "/api/v1/admin/app/overview", panel_name=panel)
 
 
+def compact_findings(data: dict) -> dict:
+    """Ответ центра состояния — под контекст Claude.
+
+    Находки по клиентам — по одной на юзера (на импортированной базе их
+    сотни): сворачиваем по коду в «сколько + 5 примеров». История канала нод
+    — сотни точек, для разбора хватает последнего замера.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    def fold(items):
+        if not isinstance(items, list):
+            return items
+        out, groups = [], {}
+        for f in items:
+            if isinstance(f, dict) and f.get("scope") == "client":
+                g = groups.setdefault(f.get("code"), {"code": f.get("code"), "severity": f.get("severity"),
+                                                      "title": f.get("title"), "hint": f.get("hint"),
+                                                      "count": 0, "examples": []})
+                g["count"] += 1
+                if len(g["examples"]) < 5:
+                    g["examples"].append(f.get("target_name"))
+            else:
+                out.append(f)
+        return out + [{"scope": "clients", **g} for g in groups.values()]
+
+    data = dict(data)
+    for key in ("findings", "signals", "muted"):
+        if key in data:
+            data[key] = fold(data[key])
+    if isinstance(data.get("nodes"), list):
+        data["nodes"] = [{k: v for k, v in n.items() if k != "link_history"} if isinstance(n, dict) else n
+                         for n in data["nodes"]]
+    return data
+
+
 @mcp.tool()
 async def panel_findings(fresh: bool = False, panel: str = "") -> dict:
-    """Находки центра состояния (что панель сама считает проблемой) с
-    объяснениями. Требует фичу monitoring_pro в лицензии.
+    """Центр состояния панели. findings — ТРЕВОГИ (короткий список: нода
+    лежит, диск полон, нет живых нод, клиенты без нод, счёт пуст, лицензия…),
+    signals — СИГНАЛЫ без тревоги (качество канала, регионы, check-host из РФ,
+    клиенты, прогнозы): их разбирает аудит — что из этого настоящее, сверяя с
+    трафиком, журналом подключений и пробниками. Клиентские — свёрнуты по
+    коду. Требует фичу monitoring_pro в лицензии.
     panel — имя панели (panels_list); при одной панели можно не указывать.
     """
-    return await _panel(panel_api.get, "/api/v1/admin/monitoring/overview", {"fresh": fresh or None}, panel_name=panel)
+    res = await _panel(panel_api.get, "/api/v1/admin/monitoring/overview", {"fresh": fresh or None}, panel_name=panel)
+    if res.get("ok"):
+        res["data"] = compact_findings(res["data"])
+    return res
 
 
 @mcp.tool()
