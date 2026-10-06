@@ -61,7 +61,8 @@ panel=<имя>, а ноды называются «панель/имя».
 Remnawave: часть клиентов живёт не на Nexus, а на Remnawave с ботом-продавцом
 3XUIStore поверх (подписку клиенты берут с SUBPAGE бота). Их панели — remna_panels;
 обзор — remna_overview, ноды — remna_nodes, клиент по Telegram ID/UUID/логину —
-remna_user, конфиг ноды — remna_profile.
+remna_user, конфиг ноды — remna_profile. Новая нода на чистом сервере —
+remna_node_install (без confirm — план человеку, с confirm=true и plan_hash — установка).
 
 Как разбирать ноды:
 1. nodes_list(only_problems=True) — какие ноды красные/без heartbeat.
@@ -1385,6 +1386,57 @@ async def node_install(panel: str, ip: str, name: str, country: str, confirm: bo
         return res
 
     return await _job(f"node_install {params['name']} ({params['ip']})", work())
+
+
+@mcp.tool()
+async def remna_node_install(ip: str, name: str, country: str, template: str = "hysteria2",
+                             domain: str = "", reality_sni: str = "", panel: str = "",
+                             squad: str = "", remark: str = "", node_port: int = 2222,
+                             ssh_port: int = 22, ssh_user: str = "", confirm: bool = False,
+                             plan_hash: str = "") -> dict:
+    """Новая нода Remnawave на ЧИСТОМ сервере — сервер + панель одним вызовом.
+    Только по просьбе человека.
+
+    Нужно заранее: ключ хаба в authorized_keys сервера (nexus-mcp-info); для
+    hysteria2 — домен ноды с A-записью на IP сервера (без прокси Cloudflare).
+    template: hysteria2 (как рабочие ноды клиента: TLS на домен, h3, BBR) или
+    reality (VLESS Reality; reality_sni — для мобильных только из белого
+    списка ТСПУ). squad — куда добавить инбаунд (по умолчанию — сквад, где
+    больше всего клиентов); remark — подпись строки в подписке.
+
+    Без confirm — план: SSH (ОС, Docker, занятые 80/443/порт ноды, нет ли
+    remnanode/агента Nexus), DNS домена, конфликты в панели, что будет
+    создано, plan_hash. План — человеку.
+    С confirm=true и plan_hash — установка (Docker, remnanode, сертификат,
+    файрвол; профиль, нода, хост, сквад) задачей: итог — action_status.
+    Упало посреди — созданное в панели удаляется.
+    """
+    from nexus_mcp import remna_install as ri
+
+    try:
+        params = ri.check_params(ip, name, country, template=template, domain=domain,
+                                 reality_sni=reality_sni, node_port=node_port, ssh_port=ssh_port,
+                                 remark=remark, squad=squad)
+        if not confirm:
+            return {"preview": True, **(await ri.plan(panel, params, ssh_user))}
+    except (ri.InstallError, remna.RemnaError) as e:
+        return _err(e)
+    if off := _actions_off():
+        return off
+
+    async def work() -> dict:
+        try:
+            res = await ri.install(panel, params, plan_hash, ssh_user)
+        except (ri.InstallError, remna.RemnaError) as e:
+            res = _err(e)
+        audit.record("remna_node_install", {"panel": panel, "ip": params["ip"], "name": params["name"],
+                                            "template": params["template"], "domain": params["domain"]},
+                     res.get("ok", False), res.get("detail", "") or res.get("error", ""))
+        if res.get("ok"):
+            res["next"] = f"remna_nodes(panel='{panel}') — нода на связи; remna_profile('{params['name']}')"
+        return res
+
+    return await _job(f"remna_node_install {params['name']} ({params['ip']})", work())
 
 
 # ── Правка конфигурации ноды ───────────────────────────────────────────────
