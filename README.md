@@ -40,6 +40,24 @@ nexus-mcp-remna list
 (по Telegram ID / UUID / логину, с ссылкой подписки бота), `remna_profile`
 (конфиг ноды, ключи замаскированы). Модуль — `nexus_mcp/remna.py`.
 
+Ноды — без захода в панель, всё с планом (`plan_hash`) и откатом:
+
+* `remna_node_install` — новая нода на чистом сервере: Docker, remnanode,
+  сертификат, профиль, нода, строка, сквад (`remna_install.py`);
+* `remna_node_edit` — перенастройка (`remna_edit.py`): `reality_sni`, `host`,
+  `squad` и каскад RU → Cloudflare → EU по рецепту ru-enter (vgx3d
+  `docs/journal/CDN.md`): `cf_exit` на европейской ноде (VLESS+WS+TLS за
+  Cloudflare + реле-юзер `hub-relay-<нода>`), затем `cascade_entry` на
+  российской (Reality-вход, реле с mux, Рунет и DNS — напрямую, строка скрыта
+  до проверки с симок).
+
+Каскаду нужна зона Cloudflare (режим TLS «Full») и токен с правами
+Zone:DNS:Edit + Zone Settings:Read:
+
+```bash
+nexus-mcp-remna cf pablo pablo.stream <токен Cloudflare>
+```
+
 ## Чат в приложении администратора
 
 Рядом с хабом ставится `nexus-chat`: Claude на подписке владельца, с

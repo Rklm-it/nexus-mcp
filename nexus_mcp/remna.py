@@ -108,7 +108,8 @@ def resolve(name: str = "") -> dict:
 
 def public_view(p: dict) -> dict:
     return {"name": p["name"], "url": p["url"], "token": bool(p.get("token")),
-            "sub_url": p.get("sub_url", "")}
+            "sub_url": p.get("sub_url", ""), "cf_zone": p.get("cf_zone", ""),
+            "cf_token": bool(p.get("cf_token"))}
 
 
 def add(name: str, url: str, token: str, sub_url: str = "") -> dict:
@@ -121,13 +122,37 @@ def add(name: str, url: str, token: str, sub_url: str = "") -> dict:
         raise RemnaError("нужен API-токен Remnawave (Настройки → API-токены)")
     if sub_url and not URL_RE.match(sub_url.rstrip("/")):
         raise RemnaError(f"«{sub_url}» — не адрес подписки (https://домен/sub/)")
+    old = next((p for p in _read() if p["name"].lower() == name.lower()), {})
     panels = [p for p in _read() if p["name"].lower() != name.lower()]
     entry = {"name": name, "url": url, "token": token.strip()}
     if sub_url:
         entry["sub_url"] = sub_url.rstrip("/") + "/"
+    # Смена токена панели не должна стирать заданный раньше Cloudflare.
+    for k in ("cf_zone", "cf_token"):
+        if old.get(k):
+            entry[k] = old[k]
     panels.append(entry)
     _write(panels)
     return public_view(entry)
+
+
+def set_cf(name: str, zone: str, token: str) -> dict:
+    """Зона Cloudflare для фронтов нод этой панели (каскад, remna_edit).
+
+    Токен — с правами Zone:DNS:Edit и Zone:Zone Settings:Read на эту зону.
+    Хранится здесь же (0600), наружу не отдаётся."""
+    zone = (zone or "").strip().lower().rstrip(".")
+    if not re.match(r"^([a-z0-9-]+\.)+[a-z]{2,63}$", zone):
+        raise RemnaError(f"«{zone}» — не зона Cloudflare (домен вида pablo.stream)")
+    if not (token or "").strip():
+        raise RemnaError("нужен API-токен Cloudflare (Zone:DNS:Edit + Zone Settings:Read)")
+    panels = _read()
+    p = next((x for x in panels if x["name"].lower() == (name or "").lower()), None)
+    if p is None:
+        raise RemnaError(f"панели Remnawave «{name}» нет")
+    p["cf_zone"], p["cf_token"] = zone, token.strip()
+    _write(panels)
+    return public_view(p)
 
 
 def remove(name: str) -> bool:
@@ -431,15 +456,23 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--sub", default="", help="адрес подписки клиентов (SUBPAGE бота), https://домен/sub/")
     r = sub.add_parser("remove")
     r.add_argument("name")
+    c = sub.add_parser("cf", help="зона и токен Cloudflare для каскада/фронтов нод")
+    c.add_argument("name")
+    c.add_argument("zone")
+    c.add_argument("token")
     args = ap.parse_args(argv)
     try:
         if args.cmd == "list":
             for p in all_panels():
                 v = public_view(p)
-                print(f"{v['name']:<16} {v['url']}  подписка: {v['sub_url'] or '—'}")
+                print(f"{v['name']:<16} {v['url']}  подписка: {v['sub_url'] or '—'}  "
+                      f"cloudflare: {v['cf_zone'] or '—'}")
         elif args.cmd == "add":
             v = add(args.name, args.url, args.token, args.sub)
             print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
+        elif args.cmd == "cf":
+            v = set_cf(args.name, args.zone, args.token)
+            print(f"{v['name']}: зона Cloudflare {v['cf_zone']}")
         elif args.cmd == "remove":
             if not remove(args.name):
                 print(f"панели «{args.name}» нет", file=sys.stderr)

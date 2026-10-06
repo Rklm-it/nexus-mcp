@@ -63,6 +63,8 @@ Remnawave: часть клиентов живёт не на Nexus, а на Remna
 обзор — remna_overview, ноды — remna_nodes, клиент по Telegram ID/UUID/логину —
 remna_user, конфиг ноды — remna_profile. Новая нода на чистом сервере —
 remna_node_install (без confirm — план человеку, с confirm=true и plan_hash — установка).
+Перенастройка ноды и каскад RU → Cloudflare → EU — remna_node_edit (op: reality_sni,
+host, squad, cf_exit на европейской ноде, затем cascade_entry на российской).
 
 Как разбирать ноды:
 1. nodes_list(only_problems=True) — какие ноды красные/без heartbeat.
@@ -1437,6 +1439,55 @@ async def remna_node_install(ip: str, name: str, country: str, template: str = "
         return res
 
     return await _job(f"remna_node_install {params['name']} ({params['ip']})", work())
+
+
+@mcp.tool()
+async def remna_node_edit(node: str, op: str, args: dict | None = None, panel: str = "",
+                          confirm: bool = False, plan_hash: str = "") -> dict:
+    """Перенастройка ноды Remnawave и каскад RU → Cloudflare → EU. Только по просьбе человека.
+
+    op и args:
+    * reality_sni   {sni, inbound?} — SNI/dest Reality + SNI его строк (для
+      мобильных — только из белого списка ТСПУ);
+    * host          {host: подпись|uuid, set: {remark|address|port|sni|host|path|
+      fingerprint|alpn|isDisabled|securityLayer}} — строка подписки;
+    * squad         {inbound: тег, squad?, action: add|remove};
+    * cf_exit       {zone?, cf_host?, port?, public?, remark?, ssh_user?} — на
+      ЕВРОПЕЙСКОЙ ноде: VLESS+WS+TLS за Cloudflare (A-запись с облаком, порт —
+      только сетям Cloudflare) + реле-юзер hub-relay-<нода> со своим сквадом.
+      public=true — ещё и CF-строка в подписку (для Wi-Fi);
+    * cascade_entry {exit: нода с cf_exit, sni, port?, remark?, squad?, hidden?} —
+      на РОССИЙСКОЙ ноде: Reality-вход (firefox, minClientVer 1.0.0), реле на
+      фронт выхода с mux, udp/53 и Рунет — напрямую, строка (скрыта, пока не
+      проверена с симок).
+
+    Без confirm — план: что изменится, на каких нодах перезапустится xray,
+    проблемы, plan_hash. План — человеку. С confirm=true и plan_hash —
+    применение задачей (итог — action_status). Нода после правки не на связи
+    или фронт не отвечает через Cloudflare — всё созданное откатывается.
+    Зона и токен Cloudflare: nexus-mcp-remna cf <панель> <зона> <токен>.
+    """
+    from nexus_mcp import remna_edit as re_
+
+    try:
+        if not confirm:
+            return {"preview": True, **(await re_.plan(panel, node, op, args))}
+    except (re_.EditError, remna.RemnaError) as e:
+        return _err(e)
+    if off := _actions_off():
+        return off
+
+    async def work() -> dict:
+        try:
+            res = await re_.apply(panel, node, op, args, plan_hash)
+        except (re_.EditError, remna.RemnaError) as e:
+            res = _err(e)
+        safe = {k: v for k, v in (args or {}).items() if k != "ssh_user"}
+        audit.record("remna_node_edit", {"panel": panel, "node": node, "op": op, "args": safe},
+                     res.get("ok", False), res.get("detail", "") or res.get("error", ""))
+        return res
+
+    return await _job(f"remna_node_edit {node} {op}", work())
 
 
 # ── Правка конфигурации ноды ───────────────────────────────────────────────

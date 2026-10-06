@@ -102,7 +102,7 @@ def run(coro):
 def test_registry_file_private_and_no_token_in_view(hub_settings):
     v = remna.add("pablo", "https://panelpablo.mooo.com/", "SECRET-TOKEN-123", "https://auth.pablovpn.com/sub")
     assert v == {"name": "pablo", "url": "https://panelpablo.mooo.com", "token": True,
-                 "sub_url": "https://auth.pablovpn.com/sub/"}
+                 "sub_url": "https://auth.pablovpn.com/sub/", "cf_zone": "", "cf_token": False}
     mode = stat.S_IMODE(os.stat(hub_settings.remna_file).st_mode)
     assert mode == 0o600
     assert "SECRET-TOKEN-123" not in json.dumps(remna.public_view(remna.resolve("pablo")))
