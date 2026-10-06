@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Бэкап хаба: nexus-mcp-backup create [--label x] | list | restore <архив или имя из list>
+set -a
+# shellcheck disable=SC1091
+. /etc/nexus-mcp.env
+set +a
+cd /opt/nexus-mcp/app && exec /opt/nexus-mcp/venv/bin/python -m nexus_mcp.backup "$@"

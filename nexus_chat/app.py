@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
 from nexus_chat import config, devices, usage
@@ -262,6 +262,31 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         return await _hub("GET", f"/hub/remna/{quote(name, safe='')}/{quote(view, safe='')}",
                           timeout=40, params=params)
 
+    # ── Бэкапы хаба: список, «сейчас», скачать копию на телефон ──
+    # Восстановление — только с консоли (nexus-hub): оно останавливает хаб и
+    # чат, а из чата это обрубило бы сам запрос на полпути.
+
+    async def backups(request: Request):
+        from nexus_mcp import backup
+
+        if request.method == "POST":
+            try:
+                res = await asyncio.to_thread(backup.create, "app")
+            except backup.BackupError as e:
+                raise StoreError(str(e), 409) from None
+            return JSONResponse({"ok": True, "backup": res, "backups": backup.listing()})
+        return JSONResponse({"ok": True, "backups": backup.listing(), "keep": backup.KEEP,
+                             "dir": str(backup.backup_dir())})
+
+    async def backup_file(request: Request):
+        from nexus_mcp import backup
+
+        try:
+            path = backup.path_of(request.path_params["name"])
+        except backup.BackupError as e:
+            raise StoreError(str(e), 404) from None
+        return FileResponse(path, media_type="application/gzip", filename=path.name)
+
     async def healthz(request: Request):
         return JSONResponse({"ok": True, "service": "nexus-chat", "logged_in": s.logged_in})
 
@@ -290,6 +315,8 @@ def build_app(runner: Runner | None = None, *, start_background: bool = True) ->
         Route("/chat/api/probes/sweep", guarded(probe_sweep), methods=["GET", "POST"]),
         Route("/chat/api/probes/setup", guarded(probe_setup), methods=["GET"]),
         Route("/chat/api/probes/subs", guarded(probe_subs), methods=["GET", "POST"]),
+        Route("/chat/api/backups", guarded(backups), methods=["GET", "POST"]),
+        Route("/chat/api/backups/{name}", guarded(backup_file), methods=["GET"]),
         Route("/chat/api/remna", guarded(remna_panels), methods=["GET"]),
         Route("/chat/api/remna/{name}/{view}", guarded(remna_view), methods=["GET"]),
     ]

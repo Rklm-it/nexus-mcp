@@ -334,6 +334,36 @@ else
     die "хаб не поднялся — лог выше"
 fi
 
+# ── Бэкап хаба каждую ночь ───────────────────────────────────────────────────
+# Реестры панелей, ключ SSH, секреты, база чата — в /var/backups/nexus-mcp
+# (последние 14, nexus_mcp/backup.py). Копию вне сервера скачивает приложение.
+log "Бэкап хаба по ночам (nexus-mcp-backup.timer)"
+cat > /etc/systemd/system/nexus-mcp-backup.service <<EOF
+[Unit]
+Description=Nexus MCP — бэкап хаба
+
+[Service]
+Type=oneshot
+EnvironmentFile=$ENVF
+WorkingDirectory=$APP
+ExecStart=$BASE/venv/bin/python -m nexus_mcp.backup create --quiet
+EOF
+cat > /etc/systemd/system/nexus-mcp-backup.timer <<EOF
+[Unit]
+Description=Nexus MCP — бэкап хаба каждую ночь
+
+[Timer]
+OnCalendar=*-*-* 03:40:00
+RandomizedDelaySec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now nexus-mcp-backup.timer >/dev/null 2>&1 \
+    || warn "таймер бэкапа не включился — бэкап руками: nexus-mcp-backup create"
+
 # ── Чат с Claude для приложения ──────────────────────────────────────────────
 if [ "$WITH_CHAT" = "1" ]; then
     log "systemd-юнит nexus-chat"
@@ -468,6 +498,7 @@ fi
 install -m 0755 "$APP/bin/nexus-mcp-info" /usr/local/bin/nexus-mcp-info
 install -m 0755 "$APP/bin/nexus-mcp-panels" /usr/local/bin/nexus-mcp-panels
 install -m 0755 "$APP/bin/nexus-mcp-remna" /usr/local/bin/nexus-mcp-remna
+install -m 0755 "$APP/bin/nexus-mcp-backup" /usr/local/bin/nexus-mcp-backup
 install -m 0755 "$APP/bin/nexus-chat-login" /usr/local/bin/nexus-chat-login
 install -m 0755 "$APP/bin/nexus-hub" /usr/local/bin/nexus-hub
 echo
