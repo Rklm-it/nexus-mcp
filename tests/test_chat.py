@@ -837,3 +837,30 @@ def test_panel_write_needs_button_only_to_apply(chat_settings):
         assert not ok
 
     asyncio.run(go())
+
+
+def test_every_hub_tool_with_confirm_waits_for_button():
+    """Инструмент хаба с confirm что-то меняет: в чате он обязан ждать кнопку.
+    remna_node_install/remna_node_edit сперва сюда не попали — с confirm=true
+    они выполнились бы без «Разрешить». Сторож — по сигнатурам server.py."""
+    import inspect
+
+    from nexus_chat import runner
+    from nexus_mcp import server
+
+    gated = set(runner.ACTION_TOOLS + runner.PAID_TOOLS + runner.EDIT_TOOLS + runner.PANEL_WRITE_TOOLS)
+    with_confirm = {name for name, fn in vars(server).items()
+                    if inspect.iscoroutinefunction(fn) and not name.startswith("_")
+                    and "confirm" in inspect.signature(fn).parameters}
+    assert with_confirm, "не нашёл инструментов с confirm — сторож ослеп"
+    assert with_confirm - gated == set()
+
+
+def test_remna_titles():
+    from nexus_chat import runner
+
+    t = runner.describe_action("remna_node_edit", {"panel": "pablo", "node": "ru01s3", "op": "cascade_entry",
+                                                   "args": {"exit": "nl01s1", "sni": "ads.x5.ru"}})
+    assert t == "Remnawave pablo: ru01s3 · вход каскада RU → CF → EU · exit=nl01s1, sni=ads.x5.ru"
+    assert "nl05s1" in runner.describe_action("remna_node_install", {"name": "nl05s1", "country": "NL",
+                                                                     "domain": "nl05s1.pablo.support"})

@@ -45,7 +45,13 @@ EDIT_TOOLS = ("node_edit",)
 # Изменения через админ-API панели и обслуживание базы/Redis: предпросмотр
 # (без confirm) идёт сразу, выполнение (confirm=true) ждёт кнопки.
 PANEL_WRITE_TOOLS = ("panel_call", "panel_maintenance", "probe_subscription",
-                     "master_job", "master_clients_update", "panel_update", "node_install")
+                     "master_job", "master_clients_update", "panel_update", "node_install",
+                     "remna_node_install", "remna_node_edit")
+
+REMNA_EDIT_OPS = {
+    "reality_sni": "SNI Reality", "host": "строка подписки", "squad": "сквад",
+    "cf_exit": "выход каскада за Cloudflare", "cascade_entry": "вход каскада RU → CF → EU",
+}
 
 MASTER_JOB_TITLES = {
     "brain": "обновить brain мастера (git pull и пересборка)",
@@ -196,6 +202,16 @@ def describe_action(tool: str, inp: dict) -> str:
         cdn = f" · CDN {inp['cdn_domain']}" if inp.get("cdn_domain") else ""
         return (f"Поставить ноду {inp.get('name', '?')} ({inp.get('country', '?')}) на сервер {where} "
                 f"и добавить в панель {inp.get('panel', '?')}{route}{cdn} (5–15 мин)")
+    if tool == "remna_node_install":
+        where = inp.get("domain") or inp.get("ip", "?")
+        return (f"Remnawave {inp.get('panel') or ''}: поставить ноду {inp.get('name', '?')} "
+                f"({inp.get('country', '?')}, {inp.get('template') or 'hysteria2'}) на {where} (3–10 мин)").replace("  ", " ")
+    if tool == "remna_node_edit":
+        op = inp.get("op", "?")
+        args = inp.get("args") or {}
+        detail = ", ".join(f"{k}={v}" for k, v in args.items() if k not in ("ssh_user",))[:160]
+        return (f"Remnawave {inp.get('panel') or ''}: {inp.get('node', '?')} · {REMNA_EDIT_OPS.get(op, op)}"
+                + (f" · {detail}" if detail else "")).replace("  ", " ")
     if tool == "panel_update":
         return f"Обновить панель {inp.get('panel', '?')} образами мастера (3–10 мин, панель перезапустится)"
     if tool == "panel_maintenance":

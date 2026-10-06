@@ -441,6 +441,48 @@ async def profile(p: dict, node_name: str) -> dict:
     }
 
 
+# ── Проверка перед добавлением ─────────────────────────────────────────────
+
+async def check(url: str, token: str) -> str:
+    """Строка для меню хаба: «✓ Remnawave 3.2.1 · нод 23, на связи 21» или «✗ причина»."""
+    p = {"name": "check", "url": (url or "").rstrip("/"), "token": (token or "").strip()}
+    if not URL_RE.match(p["url"]):
+        return f"✗ «{url}» — не адрес панели (https://домен)"
+    try:
+        ns = _list(await request(p, "GET", "/api/nodes", timeout=20))
+    except RemnaError as e:
+        return f"✗ {e}"
+    try:
+        ver = (await request(p, "GET", "/api/system/metadata", timeout=20)).get("version") or "?"
+    except (RemnaError, AttributeError):
+        ver = "?"
+    up = sum(1 for n in ns if n.get("isConnected"))
+    return f"✓ Remnawave {ver} · нод {len(ns)}, на связи {up}"
+
+
+async def cf_check(zone: str, token: str) -> str:
+    """Токен Cloudflare видит зону, и её режим TLS годится фронтам нод (Full)."""
+    from nexus_mcp import remna_edit
+
+    p = {"cf_token": (token or "").strip()}
+    try:
+        zones = await remna_edit._cf(p, "GET", "/zones", params={"name": zone})
+        if not zones:
+            return f"✗ токен не видит зону {zone}"
+        mode = (await remna_edit._cf(p, "GET", f"/zones/{zones[0]['id']}/settings/ssl") or {}).get("value")
+    except remna_edit.EditError as e:
+        return f"✗ {e}"
+    if mode != "full":
+        return (f"⚠ зона {zone} видна, но режим TLS «{mode}» — фронтам нужен «Full» "
+                "(SSL/TLS → Overview в Cloudflare)")
+    return f"✓ зона {zone}, режим TLS Full"
+
+
+def _secret_arg(value: str) -> str:
+    """«-» вместо секрета — прочитать из stdin: меню хаба не светит токен в ps."""
+    return sys.stdin.readline().strip() if value == "-" else value
+
+
 # ── Команда управления ─────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,7 +502,16 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("name")
     c.add_argument("zone")
     c.add_argument("token")
+    k = sub.add_parser("check", help="проверить адрес и токен Remnawave (токен «-» — из stdin)")
+    k.add_argument("url")
+    k.add_argument("token")
+    kc = sub.add_parser("cf-check", help="проверить зону и токен Cloudflare (токен «-» — из stdin)")
+    kc.add_argument("zone")
+    kc.add_argument("token")
+    sub.add_parser("count")
     args = ap.parse_args(argv)
+    if hasattr(args, "token"):
+        args.token = _secret_arg(args.token)
     try:
         if args.cmd == "list":
             for p in all_panels():
@@ -470,6 +521,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "add":
             v = add(args.name, args.url, args.token, args.sub)
             print(f"добавлена {v['name']} → {v['url']} (хаб подхватит сразу)")
+        elif args.cmd == "check":
+            import asyncio
+            line = asyncio.run(check(args.url, args.token))
+            print(line)
+            return 0 if line.startswith("✓") else 1
+        elif args.cmd == "cf-check":
+            import asyncio
+            line = asyncio.run(cf_check(args.zone, args.token))
+            print(line)
+            return 0 if line.startswith("✓") else 1
+        elif args.cmd == "count":
+            print(len(all_panels()))
         elif args.cmd == "cf":
             v = set_cf(args.name, args.zone, args.token)
             print(f"{v['name']}: зона Cloudflare {v['cf_zone']}")

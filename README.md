@@ -31,8 +31,12 @@ Brain стоит на российском IP, и **путь от него к н
 поверх — подписку они берут с SUBPAGE бота. Такие панели — в отдельном
 реестре `/etc/nexus-mcp/remnawave.json` (0600):
 
+Проще всего — меню хаба `nexus-hub`, раздел «Панели Remnawave»: токен
+вводится скрыто, панель проверяется до добавления. То же командой (токен `-`
+— читать из stdin, чтобы не светить его в `ps`):
+
 ```bash
-nexus-mcp-remna add pablo https://panelpablo.mooo.com <API-токен Remnawave> --sub https://auth.pablovpn.com/sub/
+nexus-mcp-remna add pablo https://panelpablo.mooo.com - --sub https://auth.pablovpn.com/sub/
 nexus-mcp-remna list
 ```
 

@@ -19,6 +19,14 @@ def _run(tmp: Path, keys: str, *args: str) -> tuple[subprocess.CompletedProcess,
     (bin_ / "systemctl").write_text('#!/bin/bash\n[ "$1" = is-active ] && exit 0\necho "[systemctl $*]"\n')
     (bin_ / "curl").write_text('#!/bin/bash\necho \'{"ok":true,"logged_in":true}\'\n')
     (bin_ / "nexus-mcp-panels").write_text('#!/bin/bash\necho "main  https://panel.example.ru"\n')
+    # Заглушка реестра Remnawave: пишет аргументы и stdin — проверить, что
+    # токен ушёл через stdin, а не в командную строку (видна в ps).
+    (bin_ / "nexus-mcp-remna").write_text(
+        '#!/bin/bash\n'
+        f'echo "ARGS $*" >> "{tmp}/remna.log"\n'
+        'case "$*" in *" -"|*" - "*) IFS= read -r t; echo "STDIN $t" >> "' + str(tmp) + '/remna.log" ;; esac\n'
+        'case "$1" in check) echo "✓ Remnawave 3.2.1 · нод 2, на связи 2" ;; cf-check) echo "✓ зона ok" ;;\n'
+        '  count) echo 1 ;; list) echo "pablo  https://panelpablo.mooo.com" ;; *) echo "ok $1" ;; esac\n')
     (bin_ / "clear").write_text("#!/bin/bash\n")
     for f in bin_.iterdir():
         f.chmod(0o755)
@@ -150,3 +158,23 @@ def test_shell_item_runs_command_with_hub_key(tmp_path):
     assert args[args.index("-i") + 1].endswith("etc/id_ed25519")             # ключ хаба
     assert "root@203.0.113.9" in args and args[-1] == "apt-get update"
     assert "BatchMode=yes" in args and "команда выполнена" in r.stdout
+
+
+def test_remna_panel_add_keeps_token_off_argv_and_screen(tmp_path):
+    """Панель Remnawave из меню: токен скрыт при вводе, в командную строку
+    (ps) не попадает — только через stdin; проверка перед добавлением."""
+    (tmp_path / "env").write_text(ENV)
+    keys = (f"{_num('a_remna_add')}\npablo\nhttps://panelpablo.mooo.com\nRW-SECRET-TOKEN\n"
+            "https://auth.pablovpn.com/sub/\n\n"
+            f"{_num('a_remna_cf')}\npablo\npablo.stream\nCF-SECRET-TOKEN\n\n0\n")
+    r, _ = _run(tmp_path, keys)
+    assert r.returncode == 0, r.stderr
+    log = (tmp_path / "remna.log").read_text()
+    args = [ln for ln in log.splitlines() if ln.startswith("ARGS")]
+    assert "ARGS check https://panelpablo.mooo.com -" in args
+    assert "ARGS add pablo https://panelpablo.mooo.com - --sub https://auth.pablovpn.com/sub/" in args
+    assert "ARGS cf-check pablo.stream -" in args and "ARGS cf pablo pablo.stream -" in args
+    assert "STDIN RW-SECRET-TOKEN" in log and "STDIN CF-SECRET-TOKEN" in log
+    assert not any("SECRET" in a for a in args)
+    assert "SECRET" not in r.stdout + r.stderr
+    assert "✓ Remnawave 3.2.1" in r.stdout and "+ Remnawave" in r.stdout

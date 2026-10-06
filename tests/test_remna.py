@@ -191,3 +191,21 @@ def test_profile_masks_secrets(fake):
 def test_node_lookup_errors(fake):
     with pytest.raises(remna.RemnaError, match="нет"):
         run(remna.profile(remna.resolve(), "zz"))
+
+
+def test_check_and_cli_token_from_stdin(fake, monkeypatch, capsys):
+    """Меню хаба шлёт токен через stdin («-»): проверка и добавление его читают."""
+    import io
+
+    assert run(remna.check("https://panelpablo.mooo.com", "tok")).startswith("✓ Remnawave 3.2.1 · нод 2, на связи 1")
+    assert "401" in run(remna.check("https://panelpablo.mooo.com", "wrong"))
+    monkeypatch.setattr("sys.stdin", io.StringIO("tok\n"))
+    assert remna.main(["check", "https://panelpablo.mooo.com", "-"]) == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO("tok2\n"))
+    assert remna.main(["add", "other", "https://other.example.com", "-"]) == 0
+    assert remna.resolve("other")["token"] == "tok2"
+    remna.set_cf("pablo", "pablo.stream", "CF")
+    remna.add("pablo", "https://panelpablo.mooo.com", "tok-new")      # смена токена не стирает Cloudflare
+    assert remna.resolve("pablo")["cf_zone"] == "pablo.stream"
+    out = capsys.readouterr().out
+    assert "tok2" not in out

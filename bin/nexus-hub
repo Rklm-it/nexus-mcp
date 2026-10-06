@@ -75,6 +75,10 @@ ITEMS=(
     "Панели|a_panel_add|Добавить панель|с проверкой, что отвечает"
     "Панели|a_panel_rename|Переименовать панель|ноды на реле связь не теряют"
     "Панели|a_panel_remove|Удалить панель|"
+    "Панели Remnawave|a_remna_list|Список панелей Remnawave|+ зона Cloudflare"
+    "Панели Remnawave|a_remna_add|Добавить панель Remnawave|токен скрыт, с проверкой"
+    "Панели Remnawave|a_remna_cf|Cloudflare для каскада|зона и токен, с проверкой"
+    "Панели Remnawave|a_remna_remove|Удалить панель Remnawave|"
     "Ноды и серверы|a_nodes|Ноды всех панелей|статус и heartbeat"
     "Ноды и серверы|a_key_to_node|Положить ключ хаба на сервер|напрямую или через живую ноду"
     "Ноды и серверы|a_ssh_check|Проверить SSH до сервера|"
@@ -130,7 +134,7 @@ box() {
 
 # ── Шапка ────────────────────────────────────────────────────────────────────
 header() {
-    local claude sim acts audit np chat tokens
+    local claude sim acts audit np nr chat tokens
     chat="$(curl -fsS --connect-timeout 2 -m 4 http://127.0.0.1:8766/chat/healthz 2>/dev/null || true)"
     if [ -z "$chat" ]; then claude="$BAD чат не отвечает"
     elif echo "$chat" | grep -q '"logged_in":true'; then claude="$OK вошёл в подписку"
@@ -140,6 +144,7 @@ header() {
     [ "$(envget NEXUS_ALLOW_ACTIONS)" = "1" ] && acts="${G}включены${N}" || acts="${D}выключены${N}"
     audit="$(envget NEXUS_CHAT_AUDIT_AT)"; [ -n "$audit" ] || audit="${D}нет${N}"
     np="$(hubpy panels-count | tail -1)"
+    nr="$(nexus-mcp-remna count 2>/dev/null | tail -1)"; nr="${nr:-0}"
     tokens="$(usagepy --short | tail -1)"
     box "Nexus Hub" "$(hub_version)" \
         "${D}Адрес  ${N} $(hub_url)" \
@@ -147,7 +152,7 @@ header() {
         "${D}Claude ${N} $claude" \
         "${D}Токены ${N} $tokens" \
         "${D}SIM    ${N} $sim" \
-        "${D}Панели ${N} ${B}$np${N}   ${D}действия из чата${N} $acts   ${D}аудит${N} $audit"
+        "${D}Панели ${N} ${B}$np${N} ${D}+ Remnawave${N} ${B}$nr${N}   ${D}действия${N} $acts   ${D}аудит${N} $audit"
 }
 
 menu() {
@@ -215,6 +220,57 @@ a_panel_remove() {
     [ "$name" = "main" ] && [ -n "$(envget NEXUS_BRAIN_URL)" ] && {
         bad "main задана при установке (NEXUS_BRAIN_URL в $ENVF) — её убирают правкой файла"; return; }
     yes_no "Удалить панель «$name» из хаба?" && nexus-mcp-panels remove "$name"
+}
+
+# Панели Remnawave (бот 3XUIStore поверх) — свой реестр remnawave.json:
+# остальные пункты ждут API Nexus. Токены — только через stdin («-»).
+a_remna_list() {
+    title "Панели Remnawave"
+    nexus-mcp-remna list 2>&1 | sed 's/^/  /'
+}
+
+a_remna_add() {
+    title "Добавить панель Remnawave"
+    echo "${D}Токен — в Remnawave: Настройки → API-токены → создать. Адрес — как в браузере.${N}"
+    local name url token sub chk
+    name="$(ask "Имя (латиница, цифры, - и _, например pablo):")"
+    [ -n "$name" ] || { bad "пустое имя"; return; }
+    url="$(ask "Адрес панели (https://домен):")"
+    token="$(ask_s "API-токен Remnawave (ввод скрыт):")"
+    [ -n "$token" ] || { bad "пустой токен"; return; }
+    sub="$(ask "Адрес подписки клиентов (страница бота, https://домен/sub/; Enter — нет):")"
+    echo "… проверяю панель"
+    chk="$(printf '%s\n' "$token" | nexus-mcp-remna check "$url" - 2>&1 | tail -1)"
+    echo "  $chk"
+    case "$chk" in ✓*) ;; *) yes_no "Панель не прошла проверку. Всё равно добавить?" || return ;; esac
+    if [ -n "$sub" ]; then printf '%s\n' "$token" | nexus-mcp-remna add "$name" "$url" - --sub "$sub"
+    else printf '%s\n' "$token" | nexus-mcp-remna add "$name" "$url" -; fi
+}
+
+a_remna_cf() {
+    title "Cloudflare для каскада Remnawave"
+    echo "${D}Токен Cloudflare: My Profile → API Tokens → Create → права Zone:DNS:Edit и"
+    echo "Zone:Zone Settings:Read на одну зону. Режим TLS зоны — Full.${N}"
+    nexus-mcp-remna list 2>&1 | sed 's/^/  /'
+    local name zone token chk
+    name="$(ask "Панель Remnawave:")"; [ -n "$name" ] || return
+    zone="$(ask "Зона Cloudflare (например pablo.stream):")"; [ -n "$zone" ] || return
+    token="$(ask_s "API-токен Cloudflare (ввод скрыт):")"
+    [ -n "$token" ] || { bad "пустой токен"; return; }
+    echo "… проверяю зону"
+    chk="$(printf '%s\n' "$token" | nexus-mcp-remna cf-check "$zone" - 2>&1 | tail -1)"
+    echo "  $chk"
+    case "$chk" in ✓*) ;; *) yes_no "Зона не прошла проверку. Всё равно сохранить?" || return ;; esac
+    printf '%s\n' "$token" | nexus-mcp-remna cf "$name" "$zone" -
+}
+
+a_remna_remove() {
+    title "Удалить панель Remnawave"
+    nexus-mcp-remna list 2>&1 | sed 's/^/  /'
+    local name; name="$(ask "Имя панели для удаления:")"
+    [ -n "$name" ] || return
+    yes_no "Удалить панель Remnawave «$name» из хаба (ноды и клиенты в ней не трогаются)?" \
+        && nexus-mcp-remna remove "$name"
 }
 
 a_nodes() {

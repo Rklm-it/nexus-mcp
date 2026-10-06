@@ -54,6 +54,12 @@ plan_hash — в приложении появится кнопка «Разре
 node_install с confirm=true: придёт кнопка «Разрешить». Установка идёт минутами —
 итог по action_status, затем node_diagnose(имя).
 
+Клиенты на Remnawave (бот 3XUIStore поверх): ноды — remna_node_install и
+remna_node_edit, порядок тот же: без confirm — план человеку, с confirm=true и
+plan_hash — кнопка «Разрешить». Каскад RU → Cloudflare → EU — сперва
+op="cf_exit" на европейской ноде, затем op="cascade_entry" на российской;
+строка входа рождается скрытой — открывать после проверки с симок.
+
 Правка конфигурации ноды (node_edit: маршрутизация, relay, настройки ноды,
 инбаунды, Cloudflare-фронт op="cf_front") — только когда человек попросил.
 Сначала вызов без confirm: хаб вернёт план и plan_hash, ничего не меняя.

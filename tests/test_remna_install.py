@@ -17,7 +17,7 @@ import subprocess
 import httpx
 import pytest
 
-from nexus_mcp import config, remna, ssh
+from nexus_mcp import remna, ssh
 from nexus_mcp import remna_install as ri
 
 SECRET = "SECRETKEY-abcdef-0123456789"
